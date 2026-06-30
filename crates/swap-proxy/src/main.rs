@@ -24,6 +24,10 @@ use std::sync::Arc;
 
 use animaksm_common::config::AnimaksmConfig;
 use clap::{Parser, Subcommand};
+use libc::{
+    mlockall, prctl, sched_param, sched_setscheduler, MCL_CURRENT, MCL_FUTURE, PR_SET_THP_DISABLE,
+    SCHED_FIFO,
+};
 use parking_lot::Mutex;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -350,12 +354,67 @@ fn normalize_page(data: &[u8]) -> [u8; PAGE_SIZE] {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Self-hardening: run before I/O so log lines reach stderr first.
+    process_hardening();
+
     let cli = Cli::parse();
     let config = match &cli.config {
         Some(path) => AnimaksmConfig::load(path)?,
         None => AnimaksmConfig::default(),
     };
     run_command(cli.command, config)
+}
+
+/// Best-effort self-hardening so the proxy cannot be OOM-killed or
+/// swapped itself while managing a live ublk swap device.
+fn process_hardening() {
+    // 1. Lock all current and future pages into RAM (mlockall).
+    // Prevents the kernel from paging out the proxy's own heap while
+    // it's serving block I/O.
+    unsafe {
+        let ret = mlockall(MCL_CURRENT | MCL_FUTURE);
+        if ret != 0 {
+            let errno = *libc::__errno_location();
+            warn!(errno, "mlockall failed — proxy pages may be swapped");
+            warn!("Hint: set LimitMEMLOCK=-1 in systemd, or raise RLIMIT_MEMLOCK");
+        } else {
+            info!("mlockall(MCL_CURRENT|MCL_FUTURE) ok");
+        }
+    }
+
+    // 2. Set /proc/self/oom_score_adj = -1000 → never chosen as OOM victim.
+    // Best-effort: if /proc isn't writable we continue with default score.
+    if let Err(e) = std::fs::write("/proc/self/oom_score_adj", b"-1000\n") {
+        warn!(error = %e, "failed to set oom_score_adj — proxy stays OOM-vulnerable");
+    } else {
+        info!("oom_score_adj = -1000 (never OOM-killed)");
+    }
+
+    // 3. Set SCHED_FIFO with priority 50 so we aren't preempted by normal
+    // userspace tasks while serving ublk I/O. This mutates the calling
+    // process — works for the main and any blocking I/O worker threads.
+    unsafe {
+        let param = sched_param { sched_priority: 50 };
+        let ret = sched_setscheduler(0, SCHED_FIFO, &param); // pid 0 = self
+        if ret != 0 {
+            let errno = *libc::__errno_location();
+            warn!(errno, "SCHED_FIFO failed — proxy runs at SCHED_OTHER");
+            warn!("Hint: set CAP_SYS_NICE or raise RLIMIT_RTPRIO");
+        } else {
+            info!("SCHED_FIFO prio 50 enabled");
+        }
+    }
+
+    // 4. Disable THP for this process only. THP defrag latency spikes are
+    // unacceptable on a realtime block I/O path.
+    unsafe {
+        let ret = prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+        if ret != 0 {
+            warn!("PR_SET_THP_DISABLE failed — THP may introduce latency spikes");
+        } else {
+            info!("THP disabled for this process");
+        }
+    }
 }
 
 /// Resolved swap-proxy runtime parameters: TOML defaults merged with CLI overrides.

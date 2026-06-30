@@ -11,12 +11,21 @@ ExecStopPost=-/usr/local/bin/animaksm-swap-proxy cleanup
 Restart=no
 
 # Security hardening
-AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_IPC_LOCK
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_IPC_LOCK
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_IPC_LOCK CAP_SYS_NICE
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_IPC_LOCK CAP_SYS_NICE
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/var/lib/animaksm
+
+# Self-hardening: memory, OOM, scheduling
+MemoryDenyWriteExecute=yes
+PrivateTmp=yes
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=50
+IOchedulingClass=realtime
+IOchedulingPriority=0
+OOMPolicy=continue
 
 [Install]
 WantedBy=multi-user.target
