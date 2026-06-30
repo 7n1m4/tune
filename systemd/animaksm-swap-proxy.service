@@ -16,8 +16,8 @@ Restart=on-failure
 RestartSec=5s
 
 # Security hardening
-AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_IPC_LOCK CAP_SYS_NICE
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_IPC_LOCK CAP_SYS_NICE
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_IPC_LOCK CAP_SYS_NICE CAP_SYS_RESOURCE
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_IPC_LOCK CAP_SYS_NICE CAP_SYS_RESOURCE
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
@@ -28,8 +28,8 @@ MemoryDenyWriteExecute=yes
 PrivateTmp=yes
 CPUSchedulingPolicy=fifo
 CPUSchedulingPriority=50
-IOchedulingClass=realtime
-IOchedulingPriority=0
+IOSchedulingClass=realtime
+IOSchedulingPriority=0
 OOMPolicy=continue
 
 [Install]

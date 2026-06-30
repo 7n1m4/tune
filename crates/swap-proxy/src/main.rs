@@ -388,7 +388,7 @@ fn process_hardening() {
     // 2. Set /proc/self/oom_score_adj = -1000 → never chosen as OOM victim.
     // Best-effort: if /proc isn't writable we continue with default score.
     if let Err(e) = std::fs::write("/proc/self/oom_score_adj", b"-1000\n") {
-        eprintln!("HARDEN[warn] oom_score_adj write failed ({e}) — proxy stays OOM-vulnerable");
+        eprintln!("HARDEN[warn] oom_score_adj write failed ({e}) — proxy stays OOM-vulnerable; add CAP_SYS_RESOURCE");
     } else {
         eprintln!("HARDEN[ok] oom_score_adj = -1000 (never OOM-killed)");
     }
