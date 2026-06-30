@@ -6,9 +6,14 @@ After=animaksm.service
 
 [Service]
 Type=simple
+ExecStartPre=-/usr/bin/swapoff -a
+ExecStartPre=-/usr/bin/swapon -a
+ExecStartPre=-/sbin/modprobe ublk_drv
+ExecStartPre=-/usr/local/bin/animaksm-swap-proxy cleanup
 ExecStart=/usr/local/bin/animaksm-swap-proxy run --store-path /var/lib/animaksm/pagestore.dat
 ExecStopPost=-/usr/local/bin/animaksm-swap-proxy cleanup
-Restart=no
+Restart=on-failure
+RestartSec=5s
 
 # Security hardening
 AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_RAWIO CAP_IPC_LOCK CAP_SYS_NICE

@@ -1,7 +1,9 @@
 //! ublk block-device frontend for the swap proxy.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use libublk::ctrl::UblkCtrlBuilder;
 use libublk::io::{BufDescList, UblkDev, UblkQueue};
@@ -17,6 +19,9 @@ const UBLK_CONTROL_PATH: &str = "/dev/ublk-control";
 
 /// Maximum consecutive I/O completion failures before stopping the queue.
 const MAX_COMPLETION_FAILURES: u32 = 10;
+
+/// How often the watchdog polls the shutdown flag (ms).
+const SHUTDOWN_POLL_MS: u64 = 250;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UblkOp {
@@ -69,15 +74,43 @@ impl BlockRequest {
     }
 }
 
-/// Run the ublk frontend. Blocks until the device is stopped (external
-/// `ublk_del_dev`, SIGTERM, etc.).
+/// Raw pointer wrapper so the watchdog thread can issue `kill_dev()`.
 ///
-/// `bootstrap` fires once when the kernel has created the block device; it
-/// receives the `/dev/ubd*` path so callers can `mkswap` and `swapon` it.
+/// `UblkCtrl` is Send + Sync but not Clone. We need shared ownership
+/// between the queue-loop thread (which calls `run_target`) and the
+/// watchdog thread (which calls `kill_dev` on SIGTERM).
+struct SharedCtrl(*mut libublk::ctrl::UblkCtrl);
+
+unsafe impl Send for SharedCtrl {}
+unsafe impl Sync for SharedCtrl {}
+
+impl std::ops::Deref for SharedCtrl {
+    type Target = libublk::ctrl::UblkCtrl;
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.0 }
+    }
+}
+
+impl Drop for SharedCtrl {
+    fn drop(&mut self) {
+        // NO: actual drop happens when Box is consumed
+    }
+}
+
+/// Run the ublk frontend. Blocks until the device is stopped.
+///
+/// `bootstrap` fires once when the kernel has created the block device.
+///
+/// `shutdown` is set by the caller's signal handler. When toggled, a
+/// watchdog thread issues `kill_dev()` to unblock `run_target` so the
+/// process exits cleanly via the normal Drop path. This clears the
+/// ghost-swap-entry problem: during Drop, libublk sends DEL_DEV which
+/// synchronously removes the kernel-side swap entry.
 pub(crate) fn run(
     engine: Arc<ProxyEngine>,
     size_gb: u64,
     bootstrap: impl FnOnce(&Path) + Send + 'static,
+    shutdown: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let total_bytes = size_gb
         .checked_mul(1024 * 1024 * 1024)
@@ -86,10 +119,7 @@ pub(crate) fn run(
         .map(|n| n.get().min(4) as u16)
         .unwrap_or(1);
 
-    // Shared state for queue initialization errors
     let init_errors = Arc::new(Mutex::new(Vec::<anyhow::Error>::new()));
-    // One-shot wrapper for the bootstrap callback; device_fn (called by
-    // run_target on ublk-add) hands ownership to the inner FnOnce.
     let bootstrap = Arc::new(Mutex::new(Some(bootstrap)));
 
     let ctrl = UblkCtrlBuilder::default()
@@ -101,6 +131,21 @@ pub(crate) fn run(
         .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV | UblkFlags::UBLK_DEV_F_MLOCK_IO_BUFFER)
         .build()
         .map_err(map_ublk_error)?;
+
+    // Heap-allocate the controller and share via raw pointer.
+    let ctrl = Box::into_raw(Box::new(ctrl));
+    let shared = SharedCtrl(ctrl);
+
+    let shutdown_for_watchdog = Arc::clone(&shutdown);
+    let watchdog = std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(SHUTDOWN_POLL_MS));
+        if shutdown_for_watchdog.load(Ordering::Relaxed) {
+            let _ = shared.kill_dev();
+            break;
+        }
+    });
+
+    let ctrl = unsafe { Box::from_raw(ctrl) };
 
     let tgt_init = move |dev: &mut UblkDev| {
         init_target(dev, total_bytes);
@@ -127,8 +172,6 @@ pub(crate) fn run(
             "ublk swap proxy device is live"
         );
         if let Some(cb) = bootstrap_for_device_fn.lock().unwrap().take() {
-            // Run the bootstrap (mkswap + swapon) on a background thread so a
-            // slow or hung command cannot block the ublk control loop.
             let bdev = std::path::PathBuf::from(&bdev);
             std::thread::spawn(move || {
                 cb(&bdev);
@@ -136,12 +179,16 @@ pub(crate) fn run(
         }
     };
 
-    // run_target blocks until the device is stopped
-    ctrl.run_target(tgt_init, queue_fn, device_fn)
+    let result = ctrl
+        .run_target(tgt_init, queue_fn, device_fn)
         .map(|_| ())
-        .map_err(map_ublk_error)?;
+        .map_err(map_ublk_error);
 
-    // After device stops, check for any queue initialization errors
+    // Signal the watchdog to exit (harmless if already exited).
+    let _ = watchdog.join();
+
+    result?;
+
     let errors = init_errors.lock().unwrap();
     if let Some(first_err) = errors.first() {
         Err(anyhow::anyhow!(

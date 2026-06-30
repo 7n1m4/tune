@@ -357,6 +357,10 @@ fn main() -> anyhow::Result<()> {
     // Self-hardening: run before I/O so log lines reach stderr first.
     process_hardening();
 
+    // Install signal handler *after* hardening (mlockall the handler stack,
+    // oom_score_adj protects it, SCHED_FIFO polls it).
+    install_signal_handler()?;
+
     let cli = Cli::parse();
     let config = match &cli.config {
         Some(path) => AnimaksmConfig::load(path)?,
@@ -584,6 +588,20 @@ fn run_proxy_v2(run: RunConfig, dry_run: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Global shutdown flag, toggled by the ctrlc handler.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Install a SIGINT/SIGTERM handler that flips SHUTDOWN. Second signal
+/// hard-exits so a stuck process terminates promptly.
+fn install_signal_handler() -> anyhow::Result<()> {
+    ctrlc::set_handler(|| {
+        if SHUTDOWN.swap(true, Ordering::SeqCst) {
+            std::process::exit(0x80 + libc::SIGTERM);
+        }
+    })?;
+    Ok(())
+}
+
 fn run_real_proxy(
     page_store_path: PathBuf,
     size_gb: u64,
@@ -599,19 +617,42 @@ fn run_real_proxy(
         max_entries,
         bloom_capacity,
     )?);
-    if bootstrap {
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Bridge the static SHUTDOWN flag to the Arc<AtomicBool> used by run().
+    // The signal handler only sees the static; run() only sees the Arc.
+    // This thread copies the polarity once per tick and also handles
+    // the edge case where the signal arrives before run() starts.
+    let shutdown_bridge = Arc::clone(&shutdown);
+    let bridge = std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if SHUTDOWN.load(Ordering::Relaxed) {
+            shutdown_bridge.store(true, Ordering::Relaxed);
+            break;
+        }
+    });
+
+    let result = if bootstrap {
         info!("Bootstrapping ublk device as swap (mkswap + swapon)");
-        ublk_frontend::run(engine, size_gb, |bdev| {
-            if let Err(err) = bootstrap_swap(bdev) {
-                // Bootstrap failure is NOT fatal: the ublk device remains usable
-                // as a regular block device, operator can mkswap/swapon manually.
-                warn!(bdev = %bdev.display(), %err, "skipping swap bootstrap");
-            }
-        })
+        ublk_frontend::run(
+            engine,
+            size_gb,
+            |bdev| {
+                if let Err(err) = bootstrap_swap(bdev) {
+                    warn!(bdev = %bdev.display(), %err, "skipping swap bootstrap");
+                }
+            },
+            shutdown,
+        )
     } else {
         info!("Swap bootstrap disabled (--no-bootstrap)");
-        ublk_frontend::run(engine, size_gb, |_bdev| {})
-    }
+        ublk_frontend::run(engine, size_gb, |_bdev| {}, shutdown)
+    };
+
+    // Ensure the bridge thread exits — should already be dead.
+    let _ = bridge.join();
+    result
 }
 
 /// Best-effort mkswap + swapon on a freshly-created ublk block device.
