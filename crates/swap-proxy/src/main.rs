@@ -375,19 +375,18 @@ fn process_hardening() {
         let ret = mlockall(MCL_CURRENT | MCL_FUTURE);
         if ret != 0 {
             let errno = *libc::__errno_location();
-            warn!(errno, "mlockall failed — proxy pages may be swapped");
-            warn!("Hint: set LimitMEMLOCK=-1 in systemd, or raise RLIMIT_MEMLOCK");
+            eprintln!("HARDEN[warn] mlockall failed (errno {errno}) — proxy pages may be swapped; set LimitMEMLOCK=-1 in systemd");
         } else {
-            info!("mlockall(MCL_CURRENT|MCL_FUTURE) ok");
+            eprintln!("HARDEN[ok] mlockall(MCL_CURRENT|MCL_FUTURE)");
         }
     }
 
     // 2. Set /proc/self/oom_score_adj = -1000 → never chosen as OOM victim.
     // Best-effort: if /proc isn't writable we continue with default score.
     if let Err(e) = std::fs::write("/proc/self/oom_score_adj", b"-1000\n") {
-        warn!(error = %e, "failed to set oom_score_adj — proxy stays OOM-vulnerable");
+        eprintln!("HARDEN[warn] oom_score_adj write failed ({e}) — proxy stays OOM-vulnerable");
     } else {
-        info!("oom_score_adj = -1000 (never OOM-killed)");
+        eprintln!("HARDEN[ok] oom_score_adj = -1000 (never OOM-killed)");
     }
 
     // 3. Set SCHED_FIFO with priority 50 so we aren't preempted by normal
@@ -398,10 +397,9 @@ fn process_hardening() {
         let ret = sched_setscheduler(0, SCHED_FIFO, &param); // pid 0 = self
         if ret != 0 {
             let errno = *libc::__errno_location();
-            warn!(errno, "SCHED_FIFO failed — proxy runs at SCHED_OTHER");
-            warn!("Hint: set CAP_SYS_NICE or raise RLIMIT_RTPRIO");
+            eprintln!("HARDEN[warn] sched_setscheduler failed (errno {errno}) — proxy runs at SCHED_OTHER; need CAP_SYS_NICE");
         } else {
-            info!("SCHED_FIFO prio 50 enabled");
+            eprintln!("HARDEN[ok] SCHED_FIFO prio 50");
         }
     }
 
@@ -410,9 +408,9 @@ fn process_hardening() {
     unsafe {
         let ret = prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
         if ret != 0 {
-            warn!("PR_SET_THP_DISABLE failed — THP may introduce latency spikes");
+            eprintln!("HARDEN[warn] PR_SET_THP_DISABLE failed — THP may introduce latency spikes");
         } else {
-            info!("THP disabled for this process");
+            eprintln!("HARDEN[ok] THP disabled");
         }
     }
 }
