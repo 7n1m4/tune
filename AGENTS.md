@@ -4,7 +4,7 @@
 - **Universal rules** — project structure, branching, architecture, and security patterns that apply regardless of what tooling you have.
 - **Workflow recommendations** — tool-specific tips that are helpful when the relevant tools are available, but not required to complete tasks. Use whatever tools you have access to.
 
-**Tool-Precedence Pledge (binding):** Whenever Serena and/or jcodemunch are available, the agent MUST use them for every symbol/intent/impact operation. Native tools (`Read`, `Grep`, `Glob`, `Edit`, `Create`, `LS`) are reserved for side-effects, raw-text editing, and OS-level operations (git, cargo, systemctl, kernel files). A native tool marked "forbidden" in §3.5 may only run after the specialized tool returned an error or empty result AND the fallback reason is recorded in the active TodoWrite entry.
+**Tool-Precedence Pledge (binding):** Whenever jcodemunch or other specialized tools are available, the agent MUST use them for every symbol/intent/impact operation. Native tools (`Read`, `Grep`, `Glob`, `Edit`, `Create`, `LS`) are reserved for side-effects, raw-text editing, and OS-level operations (git, cargo, systemctl, kernel files). A native tool marked "forbidden" in §3.5 may only run after the specialized tool returned an error or empty result AND the fallback reason is recorded in the active TodoWrite entry.
 
 ## 1. What is this repo?
 `animaksm` is a Rust-based userspace daemon that drives Linux's Kernel Samepage Merging (KSM) subsystem with a PSI-aware governor, deduplicates compressed swap pages, and exports Prometheus metrics. It reduces memory pressure in cloud, container, and embedded workloads.
@@ -15,8 +15,7 @@ animaksm/
 ├── Cargo.toml [workspace]
 ├── crates/
 │   ├── common/      # Shared: config, procfs, PSI, KSM, error
-│   ├── daemon/      # animaksm main binary
-│   └── swap-proxy/  # Experimental deduplicating store
+│   └── daemon/      # animaksm main binary
 ├── config/
 │   └── animaksm.toml  # Runtime configuration
 ├── systemd/            # Service units
@@ -42,20 +41,20 @@ The order in which the agent attempts tools is **binding**. "Forbidden" native t
 
 | Intent | First tool | Fallback (only if first errors/empty) | Forbidden native |
 |---|---|---|---|
-| Locate a symbol (fn/struct/enum/trait) by name or signature | Serena `find_symbol` | jcodemunch `search_symbols` | `Grep` on source |
-| Show a symbol's body, params, docs | Serena `get_symbol_contents` | jcodemunch `get_symbol_source` | `Read` of the whole file |
-| Find callers / references of a symbol | Serena `find_referencing_symbols` | jcodemunch `get_blast_radius` | `Grep` for the name |
-| Rename / move / extract / edit a symbol with line anchor | Serena `perform_rename` + Serena `replace_content` via `find_symbol` output | jcodemunch `plan_refactoring` for diff hints | Bulk `Edit` without line anchor from Serena |
+| Locate a symbol (fn/struct/enum/trait) by name or signature | jcodemunch `search_symbols` | native `Grep` (literal or regex) | `Grep` on source when index is warm |
+| Show a symbol's body, params, docs | jcodemunch `get_symbol_source` | native `Read` (targeted to symbol location) | `Read` of the whole file |
+| Find callers / references of a symbol | jcodemunch `get_blast_radius` | native `Grep` (literal or regex) | `Grep` for the name when index is warm |
+| Rename / move / extract / edit a symbol with line anchor | jcodemunch `plan_refactoring` for diff hints | native `Edit` with exact line anchor | Bulk `Edit` without verification |
 | Full-text / comment / config / string-literal search (non-symbol) | jcodemunch `search_text` | native `Grep` (literal or regex) | native `Grep` when index is warm |
 | Repo topology / top-N hot paths / dead-code triage | jcodemunch `get_repo_map` / `find_hot_paths` / `get_dead_code_v2` | jcodemunch `assemble_task_context` | nested `LS`/`Read` traversal |
 | Cross-file context bundle for N symbols | jcodemunch `get_context_bundle` | `get_symbol_source` | Serial `Read` per file |
-| Create a brand-new file | Serena `create_text_file` (when available) else native `Create` | — | — |
-| Delete / trash a file or directory | native tool (careful!). Serena delete if available | — | — |
+| Create a brand-new file | native `Create` | — | — |
+| Delete / trash a file or directory | native tool (careful!) | — | — |
 | Run cargo / make / systemctl / edit kernel pseudo-files | native `Execute` | — | — |
 | Interact with a TUI / browser / desktop app | `droid-control` / `agent-browser` skill tools | native `Execute` only as last resort | — |
 | Test assertions in existing tests, non-symbolic Cargo.toml/config/unit edits | native `Edit` (allowed: no symbol anchor needed) | — | — |
 
-> **Service-level rule:** "If you can name a symbol, Serena owns it. If you need a bag of symbols or repo intel, jcodemunch owns it. Native tools only for side effects, raw-text editing, and OS-level commands."
+> **Service-level rule:** "If you can name a symbol, the indexed tools own it. Native tools only for side effects, raw-text editing, and OS-level commands."
 
 ## 4. jcodemunch — Symbol Intelligence
 
@@ -119,10 +118,8 @@ Repo: `animaksm` (indexed). Symbol ID: `{file_path}::{qualified_name}#{kind}`
 
 ### 4.5 Code Exploration Policy
 
-**Always use the specialized toolbox (Serena + jcodemunch) for code navigation. Never fall back to native tools for exploration unless the matrix in §3.5 explicitly permits it.**
+**Always use the specialized toolbox (jcodemunch) for code navigation. Never fall back to native tools for exploration unless the matrix in §3.5 explicitly permits it.**
 
-- Use Serena `find_symbol` + `get_symbol_contents` for reading/editing any symbol (owning symbol-level edits).
-- Use Serena `create_text_file` / `replace_content` / `perform_rename` for symbol-safe writes.
 - Use jcodemunch `search_symbols`, `get_context_bundle`, `get_symbol_source` for indexed symbol retrieval.
 - Use jcodemunch `assemble_task_context` as your opening move — it auto-classifies intent and returns ranked context.
 - Use jcodemunch `search_text` only for non-symbol content (string literals, comments, config values).
@@ -150,10 +147,10 @@ After every jCodemunch tool call, check the response envelope before deciding wh
 
 ### 4.7 After Editing Files
 
-**VERBATIM RULE — run after EVERY edit (Serena or native):**
+**VERBATIM RULE — run after EVERY edit:**
 
 1. jcodemunch `register_edit` invalidates the BM25 cache + search result cache so subsequent `search_symbols` / `search_text` calls see the new content.
-2. Serena's LSP already tracks edits; you MUST re-issue `get_symbol_contents` / `find_symbol` if you need the edited body again later — never reuse the pre-edit Serena output captured earlier in the session.
+2. Re-issue targeted reads if you need to verify the edited content — never trust pre-edit cached data.
 
 ```
 register_edit(repo="animaksm", file_paths=["crates/common/src/foo.rs"], reindex=true)
@@ -164,21 +161,7 @@ For surgical reindex of a single file (lighter than full `register_edit`):
 index_file(path="/absolute/path/to/crates/common/src/foo.rs")
 ```
 
-### 4.8 Serena tool surface
 
-Serena is configured for this project (Rust LSP). It owns **all symbol-level read/write operations**. Native `Edit`/`Create` is only for non-symbolic bulk fixes and OS-level commands.
-
-| Serena tool | When to use |
-|---|---|
-| `list_dir`, `find_file` | Orientation and path discovery (vscode-style globs for `find_file`) |
-| `find_symbol` | Locate a symbol by name/sig with line anchor — the required first step before any edit |
-| `get_symbol_contents` | Read one symbol's body + docs + params; used for verification after edits |
-| `find_referencing_symbols` | Caller / reference analysis (mirrors `get_blast_radius`) |
-| `create_text_file`, `replace_content`, `perform_rename` | Symbol-safe writes with LSP diagnostics; prefer over native `Edit` for Rust code |
-| `read_memory` / `write_memory` | Episodic memory across activation (preferred over re-deriving context) |
-| `search_for_pattern` | Repo-wide regex scan when `search_symbols` is not specific enough |
-
-> **Invariant:** once you edit a file (via any tool), ALL prior Serena outputs for that file are considered stale. Re-issue Serena reads to get fresh structure.
 
 ### 4.9 Tool-Precedence Compliance
 
@@ -186,7 +169,6 @@ A task step is **incomplete** until:
 1. The fallback chain in the §3.5 matrix is exhausted in order.
 2. Every fallback reason is recorded in the active TodoWrite entry.
 3. `register_edit` (§4.7) has been run if a file was modified.
-4. Serena has been re-queried for any symbol whose body you will reason about post-edit.
 
 Failure to follow the matrix without documenting the reason is a compliance violation in code review.
 
@@ -292,15 +274,14 @@ search_ast(repo="animaksm", pattern="string:/password/i")      # custom pattern
 | `resolve_repo` | `path` | First call in new workspace — confirm repo is indexed |
 
 #### Anti-patterns to Avoid
-- ❌ Reading full files with native tools — use Serena `get_symbol_contents` or jcodemunch `get_context_bundle` / `get_symbol_source`
-- ❌ Grep-first lookup of symbols — Serena `find_symbol` owns it; native `Grep` is forbidden until Serena + jcodemunch both error/empty
-- ❌ Serial `Read` per file — batch with `symbol_ids[]` in `get_context_bundle`; for symbol groups, `find_symbol` + `get_symbol_contents` pattern
-- ❌ Reusing pre-edit Serena output after an edit — re-issue `get_symbol_contents` (invariant in §4.8)
+- ❌ Reading full files with native tools — use jcodemunch `get_context_bundle` / `get_symbol_source`
+- ❌ Grep-first lookup of symbols — jcodemunch `search_symbols` owns it; native `Grep` is forbidden until index is warm
+- ❌ Serial `Read` per file — batch with `symbol_ids[]` in `get_context_bundle`
 - ❌ Skipping `check_safe` before edits/deletes — 5s call prevents hours of revert
 - ❌ Not verifying with `verify=true` — index can drift from working tree
-- ❌ Manual blast radius tracing — `find_referencing_symbols` or `get_blast_radius(depth=2, include_source=true)` is instant
+- ❌ Manual blast radius tracing — `get_blast_radius(depth=2, include_source=true)` is instant
 - ❌ Ignoring `_meta.confidence` < 0.4 — low confidence means widen the search or report a gap, not proceed as-is
-- ❌ Editing without the §3.5 matrix anchor — you must have a Serena line anchor before any edit to a symbol
+- ❌ Editing without verification — you must have confirmation before any edit to a symbol
 - ❌ Forgetting `register_edit` after any file change — invalidates BM25 + search caches (§4.7)
 
 #### Pro Tips
@@ -317,38 +298,57 @@ search_ast(repo="animaksm", pattern="string:/password/i")      # custom pattern
 - `search_symbols(token_budget=3000)` with `detail_level="compact"` for broad discovery (15 tokens/row)
 - Always check `_meta.tokens_used` / `_meta.tokens_remaining` in responses
 
-## 5. ❗ Agent SOP — Serena+jcodemunch Delegate-Verify Loop
+## 5. Standard Operating Procedure — Local Helper Scripts
 
-**Follow this workflow for every code-change task. The order is binding — every intent flows through the §3.5 precedence matrix.**
+The following scripts are installed at `~/.agents/skills/`. Use them when the situation calls for it. Soft guidance — apply judgment, not dogma.
 
-### Step 1: Analyze & Plan
-1. `assemble_task_context(repo="animaksm", task="…")` — auto-classifies intent, returns ranked symbols + context.
-2. Pin line anchors: Serena `find_symbol(name, scope)` + `get_symbol_contents` for each candidate. Do not reason about a symbol you haven't anchored through Serena/index.
-3. Map blast radius: Serena `find_referencing_symbols` or jcodemunch `get_blast_radius`. Use `get_call_hierarchy` for chains.
-4. Break into **atomic TodoWrite steps** — one symbol/file per step. Record the target symbol ID (`{file}::{qualified_name}#{kind}`) in each step.
+### auto-execute (plan runner)
 
-### Step 2: Delegate ONE Step
-- **Serena owns the edit.** Delegate writes to Serena `replace_content` / `create_text_file` / `perform_rename` with the line anchors from Step 1. Sub-agents MUST continue calling Serena until the write is done or they record a documented fallback reason in TodoWrite.
-- Native `Edit` allowed ONLY for non-symbolic bulk fixes (tests, Cargo.toml, systemd units, config). Sub-agents must still mark the TodoWrite reason.
-- Read-only steps (exploration, blast radius) use Serena + jcodemunch; never native full-file reads while anchored on a known symbol.
-- Include full context in the delegation: repo (`animaksm`), target symbol ID, §3.5 matrix reference, §4.7 cache-invalidation requirement.
+`~/.agents/skills/auto-execute/auto-execute.sh`
 
-### Step 3: **❗ Verify the Result (CRITICAL)**
+Use when the user has an implementation plan (Markdown with `### Task N:` headers) and wants it executed task-by-task in isolated sessions.
 
-**Subagents routinely claim success while omitting changes.** After every delegated task:
+CLI binaries: any `claude`-prefixed command name. Pass 1-5 for failover redundancy.
 
-1. **Serena re-read:** `get_symbol_contents` for every symbol the sub-agent claimed to touch. Confirm the new body matches expectation; never trust the pre-edit Serena output captured earlier in the session (invariant in §4.8).
-2. **Index cache invalidation (§4.7):** run `register_edit(repo="animaksm", file_paths=[…], reindex=true)` for every modified file. Without this, later `search_symbols` / `search_text` return stale data.
-3. **Call hierarchy check:** `find_referencing_symbols` or `get_call_hierarchy` to confirm impact matches Step 1.
-4. **Build/TYPECHECK:** `make check` first (cheap surface: cargo check + clippy + fmt).
-5. **Run tests:** `make test` (whole workspace) or targeted `cargo test -p <crate>`.
-6. **Coverage before PR:** `make coverage` + `make coverage-ci`.
-7. **If wrong/missing:** re-delegate the specific failing anchor with the §3.5 fallback-reason line and the exact diff expected — never fix yourself silently.
+```
+auto-execute.sh [--max-turns 80] [--task-timeout 600] [--context-limit 100000]
+                [--start-task N] [--log-dir logs/auto-execute]
+                <claude-binary> [claude-binary-2..5] <plan-input>
+```
 
-**Compliance gate (§4.9):** a step is incomplete until the matrix fallback chain is exhausted, the fallback reason is recorded in TodoWrite, `register_edit` has been run, and Serena has been re-queried for post-edit bodies.
+Plan input: path to plan file, partial match against `docs/plans/`, or `latest` for most recent.
 
-**Lesson learned — Coverage CI flake:**
-The subagent for `TestFetchSubscriptionTimeout` claimed to add a `tokio::time::timeout` but only wrapped a subset of the futures. Missing coverage assertions were discovered during `make coverage-ci` — we now **Serena-re-read the test body** after every delegated test.
+Behavior: runs each task as `claude -p "/auto-execute task-N.md"`, monitors for timeout/context-limit, verifies exit+commit+tree-clean after each step, retries with next binary on failure. Ctrl+C is trapped cleanly.
+
+Do not use for single-shot tasks, exploratory work, or when the user wants to review each step manually.
+
+### commit (git committer)
+
+`~/.agents/skills/commit/SKILL.md` — Claude Code skill, triggered via `/commit`
+
+Use when the user says "commit" or "save this" or asks for a commit message. Generates `type: description` format, runs `git diff --staged`, prompts for staging if nothing staged.
+
+Alternative without skill invocation:
+
+```
+git diff --staged → git add . → git commit -m "type: description"
+```
+
+### humanizer (writer)
+
+`~/.agents/skills/humanizer/SKILL.md` — Claude Code skill, triggered via `/humanizer`
+
+Use when the user asks to "clean up" writing, "make this sound natural", "de-AI this", or similar. Applies 25 pattern replacements (significance inflation, copula avoidance, chatbot artifacts, em dash overuse, etc.) with personality-injection pass. Repo-agnostic — works on any prose.
+
+### When to invoke automatically
+
+| User says | Invoke |
+|-----------|--------|
+| "run the plan" / "execute tasks from <file>" | auto-execute |
+| "commit this" / "commit changes" | commit skill or manual |
+| "fix this text" / "make it sound human" / "de-AI" | humanizer skill |
+
+Platform check: these scripts assume Linux/macOS. On Windows, use PowerShell equivalents (not yet ported).
 
 ## 6. Git Rules
 
