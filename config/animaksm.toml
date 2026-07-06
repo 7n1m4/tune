@@ -27,13 +27,3 @@ max_mergeable_per_process_mb = 512  # cap per-process to avoid over-marking
 max_candidates_per_cycle = 5    # top K by RSS only (avoid O(n*m) cost)
 blocklist = ["animaksm", "ksmd", "systemd", "sshd", "journald", "udevd"]
 target_cgroups = []             # empty = scan all user processes
-
-[swap_proxy]
-enabled = false                 # EXPERIMENTAL - set to true to enable
-device_size_gb = 8
-fingerprint = "xxh3-128"
-dedup_table_max_entries = 1000000
-zram_backend = "/dev/zram0"
-bloom_capacity = 1000000
-bloom_false_positive_rate = 0.01
-page_store_path = "/var/lib/animaksm/pagestore.dat"

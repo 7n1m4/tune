@@ -121,39 +121,6 @@ sudo systemctl enable --now animaksm
 animaksm run --dry-run
 ```
 
-### Swap proxy (experimental)
-
-A separate `animaksm-swap-proxy` binary deduplicates pages written to a swap device by exposing a ublk block device. Configure its TOML section and run it:
-
-```toml
-# /etc/animaksm.toml — animaksm-swap-proxy reads the same config file
-[swap_proxy]
-enabled = false                     # EXPERIMENTAL: needs the ublk_drv kernel module
-device_size_gb = 8
-fingerprint = "xxh3-128"
-dedup_table_max_entries = 1000000
-bloom_capacity = 1000000
-bloom_false_positive_rate = 0.01
-page_store_path = "/var/lib/animaksm/pagestore.dat"
-zram_backend = "/dev/zram0"
-```
-
-```bash
-# Real mode: creates /dev/ubdN, mkswap+swapon on it, then serves deduplicated I/O
-sudo animaksm-swap-proxy --config /etc/animaksm.toml run
-
-# Dry-run the dedup engine without needing ublk_drv:
-animaksm-swap-proxy run --dry-run
-
-# Skip auto mkswap+swapon (e.g. operator wants a different swap config):
-animaksm-swap-proxy run --no-bootstrap
-
-# Crash recovery: swapoff our ublk device and re-enable zram0
-sudo animaksm-swap-proxy cleanup
-```
-
-All TOML keys are also available as CLI flags (`--size-gb`, `--max-entries`, `--bloom-capacity`, etc.) that override the config file.
-
 ---
 
 ## Example Output
@@ -275,7 +242,7 @@ animaksm_psi_pressure{level="low"} 1
 Yes! The scanner finds processes by PID namespace. For container workloads, run AnimaKSMD on the host — it sees all container processes and can inject MADV_MERGEABLE into them.
 
 ### What about ZRAM / zswap?
-AnimaKSMD includes an experimental companion **animaksm-swap-proxy**. It exposes the deduplicating storage layer through Linux ublk in real mode and keeps a dry-run workload for validation. In real mode, the proxy creates a `/dev/ubd*` block device, runs `mkswap` + `swapon` on it, and the kernel swap subsystem pages into deduplicated storage. See `crates/swap-proxy/` for details.
+AnimaKSMD does not implement its own swap device. For compressed, deduplicated swap, use zram's built-in same-page merging — forking zram itself is the better path than a hacky userspace swap layer.
 
 ### Is it safe to run on production?
 Yes. AnimaKSMD:

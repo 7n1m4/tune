@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/common", "crates/daemon", "crates/swap-proxy"]
+members = ["crates/common", "crates/daemon"]
 resolver = "2"
 
 [workspace.dependencies]

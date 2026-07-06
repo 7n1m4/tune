@@ -28,9 +28,6 @@ pub enum AnimaksmError {
     #[error("syscall injection failed for PID {pid}: {detail}")]
     Injection { pid: u32, detail: String },
 
-    #[error("swap proxy error: {detail}")]
-    SwapProxy { detail: String },
-
     #[error("KSM snapshot error: {0}")]
     Snapshot(String),
 

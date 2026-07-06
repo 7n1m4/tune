@@ -10,7 +10,6 @@ pub struct AnimaksmConfig {
     pub general: GeneralConfig,
     pub governor: GovernorConfig,
     pub scanner: ScannerConfig,
-    pub swap_proxy: SwapProxyConfig,
 }
 
 impl AnimaksmConfig {
@@ -46,14 +45,6 @@ impl AnimaksmConfig {
             || self.scanner.duplicate_ratio_threshold > 1.0
         {
             anyhow::bail!("scanner.duplicate_ratio_threshold must be in (0, 1]");
-        }
-
-        // Swap proxy validation
-        if self.swap_proxy.device_size_gb == 0 {
-            anyhow::bail!("swap_proxy.device_size_gb must be > 0");
-        }
-        if self.swap_proxy.dedup_table_max_entries == 0 {
-            anyhow::bail!("swap_proxy.dedup_table_max_entries must be > 0");
         }
 
         Ok(())
@@ -152,34 +143,6 @@ impl Default for ScannerConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct SwapProxyConfig {
-    pub enabled: bool,
-    pub device_size_gb: u64,
-    pub fingerprint: String,
-    pub dedup_table_max_entries: u64,
-    pub zram_backend: String,
-    pub bloom_capacity: usize,
-    pub bloom_false_positive_rate: f64,
-    pub page_store_path: String,
-}
-
-impl Default for SwapProxyConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            device_size_gb: 8,
-            fingerprint: "xxh3-128".to_string(),
-            dedup_table_max_entries: 1_000_000,
-            zram_backend: "/dev/zram0".to_string(),
-            bloom_capacity: 1_000_000,
-            bloom_false_positive_rate: 0.01,
-            page_store_path: "/var/lib/animaksm/pagestore.dat".to_string(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,9 +165,6 @@ enabled = true
 use_advisor = true
 
 [scanner]
-enabled = false
-
-[swap_proxy]
 enabled = false
 "#;
         let cfg: AnimaksmConfig = toml::from_str(toml_str).unwrap();
@@ -269,70 +229,5 @@ enabled = false
             .unwrap_err()
             .to_string()
             .contains("duplicate_ratio_threshold"));
-    }
-
-    #[test]
-    fn test_validate_rejects_invalid_swap_proxy_values() {
-        let mut cfg = AnimaksmConfig::default();
-        cfg.swap_proxy.device_size_gb = 0;
-        assert!(cfg
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("device_size_gb"));
-
-        cfg = AnimaksmConfig::default();
-        cfg.swap_proxy.dedup_table_max_entries = 0;
-        assert!(cfg
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("dedup_table_max_entries"));
-    }
-
-    #[test]
-    fn test_parse_swap_proxy_from_toml() {
-        let toml_str = r#"
-[general]
-state_dir = "/tmp/animaksm-test"
-
-[swap_proxy]
-enabled = true
-device_size_gb = 4
-fingerprint = "xxh3-128"
-dedup_table_max_entries = 100
-zram_backend = "/dev/zram1"
-bloom_capacity = 500
-bloom_false_positive_rate = 0.05
-page_store_path = "/tmp/store.dat"
-"#;
-        let cfg: AnimaksmConfig = toml::from_str(toml_str).unwrap();
-        assert!(cfg.swap_proxy.enabled);
-        assert_eq!(cfg.swap_proxy.device_size_gb, 4);
-        assert_eq!(cfg.swap_proxy.fingerprint, "xxh3-128");
-        assert_eq!(cfg.swap_proxy.dedup_table_max_entries, 100);
-        assert_eq!(cfg.swap_proxy.zram_backend, "/dev/zram1");
-        assert_eq!(cfg.swap_proxy.bloom_capacity, 500);
-        assert_eq!(cfg.swap_proxy.bloom_false_positive_rate, 0.05);
-        assert_eq!(cfg.swap_proxy.page_store_path, "/tmp/store.dat");
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn test_parse_swap_proxy_missing_section_uses_defaults() {
-        // A TOML without [swap_proxy] still parses using the struct defaults.
-        let toml_str = r#"
-[general]
-state_dir = "/tmp/animaksm-test"
-
-[governor]
-enabled = true
-"#;
-        let cfg: AnimaksmConfig = toml::from_str(toml_str).unwrap();
-        assert!(!cfg.swap_proxy.enabled);
-        assert_eq!(cfg.swap_proxy.device_size_gb, 8);
-        assert_eq!(cfg.swap_proxy.dedup_table_max_entries, 1_000_000);
-        assert_eq!(cfg.swap_proxy.bloom_capacity, 1_000_000);
-        assert!(cfg.validate().is_ok());
     }
 }
