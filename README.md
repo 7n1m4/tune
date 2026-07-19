@@ -1,6 +1,6 @@
 <div align=center>
 
-# [Anima](https://github.com/animaios/animacore)KSMD
+# [A](https://github.com/animaios/anima)KSMD
 
 <img width="256" height="384" alt="AnimAIOS mascot" src="https://github.com/user-attachments/assets/8d548058-3363-481b-90d6-09f4620f70f7" />
 
@@ -13,13 +13,13 @@
 [![Build Status](https://github.com/animaios/animaksm/workflows/CI/badge.svg)](https://github.com/animaios/animaksm/actions)
 -->
 
-[![DeepSource](https://app.deepsource.com/gh/animaios/animaksmd.svg/?label=code+coverage&show_trend=true&token=iBvsQ1aAT0R9zi6jTngKW_VR)](https://app.deepsource.com/gh/animaios/animaksmd/)
-[![DeepSource](https://app.deepsource.com/gh/animaios/animaksmd.svg/?label=active+issues&show_trend=true&token=iBvsQ1aAT0R9zi6jTngKW_VR)](https://app.deepsource.com/gh/animaios/animaksmd/)
-[![DeepSource](https://app.deepsource.com/gh/animaios/animaksmd.svg/?label=resolved+issues&show_trend=true&token=iBvsQ1aAT0R9zi6jTngKW_VR)](https://app.deepsource.com/gh/animaios/animaksmd/)
+[![DeepSource](https://app.deepsource.com/gh/animaios/aksmd.svg/?label=code+coverage&show_trend=true&token=iBvsQ1aAT0R9zi6jTngKW_VR)](https://app.deepsource.com/gh/animaios/aksmd/)
+[![DeepSource](https://app.deepsource.com/gh/animaios/aksmd.svg/?label=active+issues&show_trend=true&token=iBvsQ1aAT0R9zi6jTngKW_VR)](https://app.deepsource.com/gh/animaios/aksmd/)
+[![DeepSource](https://app.deepsource.com/gh/animaios/aksmd.svg/?label=resolved+issues&show_trend=true&token=iBvsQ1aAT0R9zi6jTngKW_VR)](https://app.deepsource.com/gh/animaios/aksmd/)
 
 ---
 
-## Why AnimaKSMD?
+## Why AKSMD?
 
 I used to run **uksmd** (the userspace KSM daemon from the CachyOS project) on my desktop. It was brilliant — a userspace daemon that proactively scanned processes and marked their anonymous memory as `MADV_MERGEABLE` so the kernel's KSM (Kernel Samepage Merging) could deduplicate identical pages. It traded a little CPU for massive RAM savings.
 
@@ -27,7 +27,7 @@ Then uksmd went unmaintained. The repo was archived. The kernel evolved — `pro
 
 I missed uksmd. I wanted it back — but modernized, safer, and with features the original never had.
 
-**AnimaKSMD is that revival.**
+**AKSMD is that revival.**
 
 ---
 
@@ -48,7 +48,7 @@ I missed uksmd. I wanted it back — but modernized, safer, and with features th
 
 ## How It Works (The PTrace Magic)
 
-Since Linux's `process_madvise(2)` **does not support `MADV_MERGEABLE`** for cross-process operations (only `MADV_COLD`, `MADV_COLLAPSE`, `MADV_PAGEOUT`, `MADV_WILLNEED`), AnimaKSMD uses `ptrace(2)` to inject the syscall directly:
+Since Linux's `process_madvise(2)` **does not support `MADV_MERGEABLE`** for cross-process operations (only `MADV_COLD`, `MADV_COLLAPSE`, `MADV_PAGEOUT`, `MADV_WILLNEED`), AKSMD uses `ptrace(2)` to inject the syscall directly:
 
 ```
 1. PTRACE_ATTACH to target PID → waitpid(WSTOPPED)
@@ -60,7 +60,7 @@ Since Linux's `process_madvise(2)` **does not support `MADV_MERGEABLE`** for cro
 6. Restore ALL original registers → PTRACE_DETACH
 ```
 
-This is the **only way** to mark another process's memory as `MADV_MERGEABLE` from userspace. AnimaKSMD does it safely: full register save/restore, SIGTRAP verification, vDSO syscall instruction discovery per-PID, and graceful error handling.
+This is the **only way** to mark another process's memory as `MADV_MERGEABLE` from userspace. AKSMD does it safely: full register save/restore, SIGTRAP verification, vDSO syscall instruction discovery per-PID, and graceful error handling.
 
 ---
 
@@ -128,7 +128,7 @@ animaksm run --dry-run
 ```bash
 $ animaksm stats
 ======================================================
-AnimaKSMD with KSM statistics support
+AKSMD with KSM statistics support
 ======================================================
 Full scans:                 175864
 Interval:                   100 ms
@@ -152,7 +152,7 @@ General profit:             0.4 MiB
 
 ## Metrics & Dashboards
 
-AnimaKSMD exposes Prometheus metrics at `http://localhost:9090/metrics`:
+AKSMD exposes Prometheus metrics at `http://localhost:9090/metrics`:
 
 ```prometheus
 # HELP animaksm_ksm_pages_shared Total pages shared by KSM
@@ -176,7 +176,7 @@ animaksm_governor_level 1
 animaksm_psi_pressure{level="low"} 1
 ```
 <!--
-**Grafana Dashboard**: Import [AnimaKSMD Dashboard](https://grafana.com/grafana/dashboards/animaksm) (JSON available in `grafana/animaksm-dashboard.json`)
+**Grafana Dashboard**: Import [AKSMD Dashboard](https://grafana.com/grafana/dashboards/animaksm) (JSON available in `grafana/animaksm-dashboard.json`)
 -->
 ---
 
@@ -184,7 +184,7 @@ animaksm_psi_pressure{level="low"} 1
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      AnimaKSMD Daemon                       │
+│                      AKSMD Daemon                       │
 ├─────────────────────────────────────────────────────────────┤
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
 │  │ PSI Monitor  │  │   Governor   │  │    Scanner       │  │
@@ -219,7 +219,7 @@ animaksm_psi_pressure{level="low"} 1
 
 ## Comparison
 
-| Feature | uksmd (original) | AnimaKSMD |
+| Feature | uksmd (original) | AKSMD |
 |---------|------------------|-----------|
 | Language | C | **Rust** (memory safe) |
 | MADV_MERGEABLE | pidfd + process_madvise (broken) | **PTrace injection (works)** |
@@ -236,16 +236,16 @@ animaksm_psi_pressure{level="low"} 1
 ## FAQ
 
 ### Why not just use `ksmtuned`?
-`ksmtuned` is deprecated and only adjusts KSM parameters reactively. AnimaKSMD **proactively hunts processes** and **injects MADV_MERGEABLE** via ptrace — something `ksmtuned` never did.
+`ksmtuned` is deprecated and only adjusts KSM parameters reactively. AKSMD **proactively hunts processes** and **injects MADV_MERGEABLE** via ptrace — something `ksmtuned` never did.
 
 ### Does it work with containers (Docker/Podman)?
-Yes! The scanner finds processes by PID namespace. For container workloads, run AnimaKSMD on the host — it sees all container processes and can inject MADV_MERGEABLE into them.
+Yes! The scanner finds processes by PID namespace. For container workloads, run AKSMD on the host — it sees all container processes and can inject MADV_MERGEABLE into them.
 
 ### What about ZRAM / zswap?
-AnimaKSMD does not implement its own swap device. For compressed, deduplicated swap, use zram's built-in same-page merging — forking zram itself is the better path than a hacky userspace swap layer.
+AKSMD does not implement its own swap device. For compressed, deduplicated swap, use zram's built-in same-page merging — forking zram itself is the better path than a hacky userspace swap layer.
 
 ### Is it safe to run on production?
-Yes. AnimaKSMD:
+Yes. AKSMD:
 - Runs with minimal capabilities (CAP_SYS_PTRACE, CAP_DAC_READ_SEARCH)
 - Uses `ProtectSystem=strict`, `NoNewPrivileges=yes`
 - Snapshots KSM state on startup, restores on shutdown
@@ -296,10 +296,10 @@ Dual-licensed under **MIT** or **Apache-2.0** at your option.
 ## Links
 
 - **Repository**: https://github.com/animaios/animaksmd
-- **Issues**: https://github.com/animaios/animaksmd/issues
+- **Issues**: https://github.com/animaios/aksmd/issues
 
 <!--
-- **Discussions**: https://github.com/animaios/animaksmd/discussions
+- **Discussions**: https://github.com/animaios/aksmd/discussions
 - **Matrix Chat**: https://matrix.to/#/#animaksm:matrix.org
 - **Crates.io**: https://crates.io/crates/animaksm-daemon
 - **Documentation**: https://docs.rs/animaksm-daemon
@@ -307,4 +307,4 @@ Dual-licensed under **MIT** or **Apache-2.0** at your option.
 
 ---
 
-*Made with ❤️ by the AnimaKSMD team. Reviving uksmd, one page at a time.*
+*Made with ❤️ by the AKSMD team. Reviving uksmd, one page at a time.*
