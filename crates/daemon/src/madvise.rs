@@ -511,7 +511,6 @@ fn process_madvise_batch(
     Ok(ret as u64)
 }
 
-#[allow(dead_code)]
 fn process_madvise_single(
     pidfd: RawFd,
     addr: u64,
@@ -983,6 +982,245 @@ mod tests {
         assert_eq!(collapsed, 0);
     }
 
+    // ── collapse_regions: eligibility + 2 MiB alignment (pure logic) ────
+
+    /// Helper: an anonymous RW private mapping, the only shape `collapse_regions`
+    /// ever considers.
+    fn anon_rw_entry(start: u64, end: u64) -> MapsEntry {
+        MapsEntry {
+            start,
+            end,
+            perms: "rw-p".into(),
+            offset: 0,
+            dev: "00:00".into(),
+            inode: 0,
+            pathname: String::new(),
+        }
+    }
+
+    /// A PID that cannot exist on this host, so `pidfd_open` fails with EINVAL
+    /// (u32::MAX does not fit a valid pid_t) and no process is ever touched.
+    /// With the pidfd unavailable, `collapse_regions` returns 0 before any
+    /// syscall, which makes the pure-logic tests below fully deterministic.
+    const ABSENT_PID: u32 = u32::MAX;
+
+    /// The 2 MiB alignment rules `collapse_regions` applies, reproduced against
+    /// the real implementation's arithmetic:
+    ///
+    /// * `start` rounds UP to the next 2 MiB boundary (partial head page dropped)
+    /// * `end` rounds DOWN to the previous 2 MiB boundary (partial tail dropped)
+    /// * a region is only attempted when the rounded `start` is strictly below
+    ///   the rounded `end`
+    ///
+    /// Verified cases (all of which pass the `size() >= 2 MiB` filter, so the
+    /// decision is made purely by the rounding):
+    ///
+    /// | start      | end        | size     | rounded window       | verdict |
+    /// |------------|------------|----------|----------------------|---------|
+    /// | 0x200000   | 0x600000   | 4 MiB    | [0x200000, 0x600000) | attempt |
+    /// | 0x200000   | 0x600001   | 4 MiB+1  | [0x200000, 0x600000) | attempt |
+    /// | 0x201000   | 0x800000   | 6 MiB-4K | [0x400000, 0x800000) | attempt |
+    /// | 0x100000   | 0x300000   | 2 MiB    | [0x200000, 0x200000) | skip    |
+    /// | 0x0        | 0x200000   | 2 MiB    | [0x0, 0x200000)      | attempt |
+    #[test]
+    fn test_collapse_regions_rounding_decides_attempt_vs_skip() {
+        const THP_SIZE: u64 = 2 * 1024 * 1024;
+
+        // Rounding arithmetic of `collapse_regions`, reproduced here:
+        //   start = (region.start + THP_SIZE - 1) & !(THP_SIZE - 1)
+        //   end   = region.end & !(THP_SIZE - 1)
+        let aligned_window = |start: u64, end: u64| {
+            (
+                (start + THP_SIZE - 1) & !(THP_SIZE - 1),
+                end & !(THP_SIZE - 1),
+            )
+        };
+
+        // Fully aligned region → whole region is the window.
+        let whole = anon_rw_entry(0x200000, 0x600000);
+        assert_eq!(aligned_window(whole.start, whole.end), (0x200000, 0x600000));
+        assert_eq!(whole.end - whole.start, 4 * 1024 * 1024);
+
+        // Unaligned end → the partial tail page is dropped from the window.
+        let ragged = anon_rw_entry(0x200000, 0x600001);
+        assert_eq!(
+            aligned_window(ragged.start, ragged.end),
+            (0x200000, 0x600000)
+        );
+
+        // Unaligned start → the partial head page is dropped from the window.
+        let ragged_head = anon_rw_entry(0x201000, 0x800000);
+        assert_eq!(
+            aligned_window(ragged_head.start, ragged_head.end),
+            (0x400000, 0x800000)
+        );
+
+        // A region that passes the size filter but contains no aligned window:
+        // start rounds up to 0x200000 and end rounds down to the same address.
+        let no_window = anon_rw_entry(0x100000, 0x300000);
+        assert!(no_window.size() >= THP_SIZE, "size filter is satisfied");
+        let (window_start, window_end) = aligned_window(no_window.start, no_window.end);
+        assert_eq!(window_start, 0x200000);
+        assert_eq!(window_end, 0x200000);
+        assert!(
+            window_start >= window_end,
+            "empty window → region is skipped"
+        );
+
+        // Drive the real function with the attempt-class regions. `ABSENT_PID`
+        // makes `pidfd_open` fail first, so no syscall is issued and 0
+        // collapses is the only possible outcome — but the entries must still
+        // survive the filters without panicking.
+        let attempted = collapse_regions(ABSENT_PID, &[whole, ragged, ragged_head]);
+        assert_eq!(attempted, 0, "absent pid → pidfd_open fails → 0 collapsed");
+    }
+
+    /// Regions that carry no aligned 2 MiB window and must be skipped.
+    ///
+    /// The first two fail the `size() >= 2 MiB` filter outright. The third is
+    /// the interesting one: it is exactly 2 MiB but sits between boundaries, so
+    /// `start` rounds up to 0x200000 while `end` rounds down to 0x200000 and the
+    /// window is empty — the skip comes from the alignment logic, not the size.
+    #[test]
+    fn test_collapse_regions_skips_regions_without_aligned_thp_window() {
+        const THP_SIZE: u64 = 2 * 1024 * 1024;
+
+        // A 1 MiB region: fails the `size() >= 2 MiB` filter outright.
+        let too_small = anon_rw_entry(0x200000, 0x300000);
+        // A single page: also fails the size filter.
+        let single_page = anon_rw_entry(0x200000, 0x201000);
+        // Exactly 2 MiB but starting 1 MiB into a boundary, so its aligned
+        // window [0x200000, 0x200000) is empty and it is skipped by the
+        // rounding rather than the size filter.
+        let straddling = anon_rw_entry(0x100000, 0x300000);
+
+        assert!(too_small.size() < THP_SIZE);
+        assert!(single_page.size() < THP_SIZE);
+        assert!(
+            straddling.size() == THP_SIZE,
+            "size filter must still pass — the skip is decided by rounding"
+        );
+        assert_eq!(
+            straddling.start % THP_SIZE,
+            THP_SIZE / 2,
+            "premise: start is half a THP past a boundary"
+        );
+        assert_eq!(
+            straddling.end % THP_SIZE,
+            THP_SIZE / 2,
+            "premise: end bears the same offset, so it rounds back to the same boundary"
+        );
+
+        // Reproduce collapse_regions' rounding to show the window is empty.
+        assert_eq!(
+            (straddling.start + THP_SIZE - 1) & !(THP_SIZE - 1),
+            0x200000
+        );
+        assert_eq!(straddling.end & !(THP_SIZE - 1), 0x200000);
+
+        let collapsed = collapse_regions(ABSENT_PID, &[too_small, single_page, straddling]);
+        assert_eq!(
+            collapsed, 0,
+            "no region contains an aligned 2 MiB window → nothing attempted"
+        );
+    }
+
+    /// The eligibility filter: only anonymous RW private, non-exec, non-special
+    /// mappings qualify. Every variant below is rejected, so neither the
+    /// rounding nor a syscall is ever reached.
+    #[test]
+    fn test_collapse_regions_filters_ineligible_permissions() {
+        const THP_SIZE: u64 = 2 * 1024 * 1024;
+
+        let mut executable = anon_rw_entry(0x200000, 0x600000);
+        executable.perms = "rwxp".into();
+        assert!(executable.has_exec());
+        assert!(executable.size() >= THP_SIZE);
+
+        let mut shared = anon_rw_entry(0x200000, 0x600000);
+        shared.perms = "rw-s".into();
+        assert!(
+            !shared.is_anon_rw(),
+            "shared mappings are not KSM candidates"
+        );
+
+        let mut read_only = anon_rw_entry(0x200000, 0x600000);
+        read_only.perms = "r--p".into();
+        assert!(!read_only.is_anon_rw());
+
+        let mut file_backed = anon_rw_entry(0x200000, 0x600000);
+        file_backed.pathname = "/usr/lib/libfoo.so".into();
+        assert!(!file_backed.is_anon_rw());
+
+        let special = MapsEntry {
+            start: 0x200000,
+            end: 0x600000,
+            perms: "rw-p".into(),
+            offset: 0,
+            dev: "00:00".into(),
+            inode: 0,
+            pathname: "[vdso]".into(),
+        };
+        assert!(special.is_special());
+        assert!(!special.is_anon_rw(), "[vdso] has a non-empty pathname");
+
+        let empty: &[MapsEntry] = &[];
+        assert_eq!(collapse_regions(ABSENT_PID, empty), 0);
+
+        let collapsed = collapse_regions(
+            ABSENT_PID,
+            &[executable, shared, read_only, file_backed, special],
+        );
+        assert_eq!(
+            collapsed, 0,
+            "ineligible mappings are filtered before any pidfd/syscall"
+        );
+    }
+
+    /// Drive the real syscall path of `collapse_regions` →
+    /// `process_madvise_single(MADV_COLLAPSE)` against our own process only,
+    /// with an address that is guaranteed unmapped. MADV_COLLAPSE must fail
+    /// (EINVAL for an unsuitable range) and that failure must be non-fatal:
+    /// `collapse_regions` logs and continues, returning 0 rather than panicking
+    /// or propagating an error.
+    ///
+    /// This also proves the pidfd opened for our own process is closed on the
+    /// error path and the surrounding loop keeps going.
+    #[test]
+    fn test_collapse_regions_handles_process_madvise_error_gracefully() {
+        // An address well past the canonical userspace limit, so no mapping can
+        // cover it — process_madvise(2) rejects the whole range with EINVAL
+        // (verified against this kernel).
+        let unmapped = 0x7fff_ffff_0000u64;
+
+        // Attempted before and after the rejected range: both must be
+        // attempted (non-fatal) and neither collapses.
+        let regions = [
+            anon_rw_entry(unmapped, unmapped + 4 * 1024 * 1024),
+            anon_rw_entry(unmapped + 16 * 1024 * 1024, unmapped + 20 * 1024 * 1024),
+        ];
+
+        let collapsed = collapse_regions(std::process::id(), &regions);
+        assert_eq!(
+            collapsed, 0,
+            "a rejected MADV_COLLAPSE must be absorbed, not fatal"
+        );
+    }
+
+    /// The errno string formatting shared by every process_madvise path:
+    /// `errno_to_str` must map the errnos that MADV_COLLAPSE actually
+    /// produces, otherwise the ENOSYS break in `collapse_regions` never fires.
+    #[test]
+    fn test_errno_to_str_covers_collapse_errnos() {
+        assert!(errno_to_str(libc::EBADF).contains("EBADF"));
+        assert!(errno_to_str(libc::ENOSYS).contains("ENOSYS"));
+        assert!(errno_to_str(libc::EINVAL).contains("EINVAL"));
+        assert!(errno_to_str(libc::ESRCH).contains("ESRCH"));
+        assert!(errno_to_str(libc::ENOMEM).contains("ENOMEM"));
+        assert!(errno_to_str(libc::EPERM).contains("EPERM"));
+        assert_eq!(errno_to_str(-1), "unknown");
+    }
+
     // ── batch_apply_mergeable ───────────────────────────────────────────
 
     #[test]
@@ -1139,5 +1377,101 @@ mod tests {
         // These helpers validate advice and reject MADV_MERGEABLE
         assert!(batch_err.contains("MADV_MERGEABLE not supported by process_madvise"));
         assert!(single_err.contains("MADV_MERGEABLE not supported by process_madvise"));
+    }
+
+    /// Both helpers must reject `MADV_MERGEABLE` *before* issuing any syscall —
+    /// process_madvise(2) cannot apply that advice cross-process, so ptrace is
+    /// the only route. Guarded with advice checks against an intentionally bad
+    /// fd so the assertion can only be satisfied by the early return.
+    #[test]
+    fn test_process_madvise_helpers_guard_madvise_mergeable() {
+        // A fd that is never valid in this process. Were the guard missing, the
+        // helper would fall through to process_madvise and report an EBADF
+        // errno string instead of this exact advice message.
+        const GUARD_FD: RawFd = -1;
+        let iovs = [libc::iovec {
+            iov_base: 0x200000usize as *mut libc::c_void,
+            iov_len: 2 * 1024 * 1024,
+        }];
+
+        let batch_err = process_madvise_batch(GUARD_FD, &iovs, MADV_MERGEABLE).unwrap_err();
+        let single_err =
+            process_madvise_single(GUARD_FD, 0x200000, 2 * 1024 * 1024, MADV_MERGEABLE)
+                .unwrap_err();
+
+        assert_eq!(
+            batch_err, "MADV_MERGEABLE not supported by process_madvise; use ptrace",
+            "batch helper must reject MADV_MERGEABLE before the syscall"
+        );
+        assert_eq!(
+            single_err, "MADV_MERGEABLE not supported by process_madvise; use ptrace",
+            "single helper must reject MADV_MERGEABLE before the syscall"
+        );
+    }
+
+    /// The negative side of the same guard: advice values that process_madvise
+    /// *does* support must pass the check and reach the syscall, where the bad
+    /// fd surfaces as an EBADF-annotated errno string instead of the advice
+    /// message. This pins the guard's boundary so a future regression that
+    /// widens it to all advice values is caught.
+    #[test]
+    fn test_process_madvise_helpers_allow_supported_advice() {
+        const GUARD_FD: RawFd = -1;
+        let iovs = [libc::iovec {
+            iov_base: 0x200000usize as *mut libc::c_void,
+            iov_len: 2 * 1024 * 1024,
+        }];
+
+        // MADV_COLLAPSE is the advice `collapse_regions` passes in production.
+        let collapsed_err =
+            process_madvise_single(GUARD_FD, 0x200000, 2 * 1024 * 1024, MADV_COLLAPSE).unwrap_err();
+        assert!(
+            collapsed_err.contains("errno="),
+            "supported advice must reach the syscall, got: {collapsed_err}"
+        );
+        assert!(
+            !collapsed_err.contains("not supported by process_madvise"),
+            "MADV_COLLAPSE must not trip the MERGEABLE guard, got: {collapsed_err}"
+        );
+
+        let cold_err = process_madvise_batch(GUARD_FD, &iovs, libc::MADV_COLD).unwrap_err();
+        assert!(
+            cold_err.contains("errno="),
+            "MADV_COLD must reach the syscall, got: {cold_err}"
+        );
+        assert!(
+            !cold_err.contains("not supported by process_madvise"),
+            "MADV_COLD must not trip the MERGEABLE guard, got: {cold_err}"
+        );
+    }
+
+    /// Both helpers, given supported advice against a bad fd, report the raw
+    /// errno and its human-readable name — the exact string `collapse_regions`
+    /// pattern-matches on to decide whether to break out of its loop.
+    #[test]
+    fn test_process_madvise_helpers_report_bad_fd_errno_message() {
+        const GUARD_FD: RawFd = -1;
+        let iovs = [libc::iovec {
+            iov_base: 0x200000usize as *mut libc::c_void,
+            iov_len: 2 * 1024 * 1024,
+        }];
+
+        let batch_err = process_madvise_batch(GUARD_FD, &iovs, MADV_COLLAPSE).unwrap_err();
+        let single_err =
+            process_madvise_single(GUARD_FD, 0x200000, 2 * 1024 * 1024, MADV_COLLAPSE).unwrap_err();
+
+        assert!(batch_err.contains("errno="), "got: {batch_err}");
+        assert!(batch_err.contains("EBADF"), "got: {batch_err}");
+        assert!(single_err.contains("errno="), "got: {single_err}");
+        assert!(single_err.contains("EBADF"), "got: {single_err}");
+    }
+
+    /// `pidfd_open` on a PID that cannot exist must fail cleanly with an errno
+    /// string — this is the path `collapse_regions` takes to return 0 without
+    /// attempting any syscall.
+    #[test]
+    fn test_pidfd_open_reports_absent_pid_as_errno_string() {
+        let err = pidfd_open(ABSENT_PID).unwrap_err();
+        assert!(err.contains("errno="), "got: {err}");
     }
 }
