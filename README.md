@@ -224,13 +224,6 @@ actually earning its CPU.
 ### Does it work with containers (Docker/Podman)?
 Yes! The scanner finds processes by PID namespace. For container workloads, run AKSMD on the host — it sees all container processes and can inject MADV_MERGEABLE into them.
 
-### Where does AKSMD fit alongside zswap and zram?
-Nowhere — deliberately. AKSMD only writes `/sys/kernel/mm/ksm/*` and marks pages
-`MADV_MERGEABLE`; it has never implemented its own swap device and does not
-touch zswap, zram or any swap path. Use zswap/zram for swap compression and
-AKSMD for RAM-side page deduplication: different mechanisms, no shared
-configuration, no interference.
-
 ### Is it safe to run on production?
 Yes. AKSMD:
 - Runs with minimal capabilities (CAP_SYS_PTRACE, CAP_DAC_READ_SEARCH)

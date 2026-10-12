@@ -14,7 +14,6 @@ pub struct ProcessStatus {
     pub name: String,
     pub vm_rss_kb: u64,
     pub anon_rss_kb: u64,
-    pub vm_swap_kb: u64,
 }
 
 /// A single entry from /proc/PID/maps.
@@ -131,8 +130,6 @@ fn read_process_status_from(proc_path: &Path, pid: u32) -> Result<ProcessStatus>
             status.vm_rss_kb = parse_kb_value(value);
         } else if let Some(value) = line.strip_prefix("RssAnon:") {
             status.anon_rss_kb = parse_kb_value(value);
-        } else if let Some(value) = line.strip_prefix("VmSwap:") {
-            status.vm_swap_kb = parse_kb_value(value);
         }
     }
 
@@ -733,7 +730,7 @@ mod tests {
         let pid_dir = proc_pid(dir.path(), 123);
         std::fs::write(
             pid_dir.join("status"),
-            "Name:\tfirefox\nVmRSS:\t  204800 kB\nRssAnon:\t  102400 kB\nVmSwap:\t  4096 kB\n",
+            "Name:\tfirefox\nVmRSS:\t  204800 kB\nRssAnon:\t  102400 kB\n",
         )
         .unwrap();
 
@@ -742,7 +739,6 @@ mod tests {
         assert_eq!(status.name, "firefox");
         assert_eq!(status.vm_rss_kb, 204800);
         assert_eq!(status.anon_rss_kb, 102400);
-        assert_eq!(status.vm_swap_kb, 4096);
     }
 
     #[test]
