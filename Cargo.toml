@@ -1,0 +1,10 @@
+[package]
+name = "zswap-tune"
+version = "0.1.0"
+edition = "2021"
+description = "Live auto-tuner for the kernel zswap max_pool_percent parameter"
+license = "MIT"
+
+[profile.release]
+opt-level = 2
+lto = true
