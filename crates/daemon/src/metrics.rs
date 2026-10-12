@@ -49,7 +49,12 @@ async fn report_metrics(ksm: &KsmController, state: &SharedGovernorState) {
         target = "animaksm::metrics",
         ksm_pages_shared = ksm_stats.pages_shared,
         ksm_pages_sharing = ksm_stats.pages_sharing,
-        ksm_general_profit = ksm_stats.general_profit,
+        // ksm_general_profit is in BYTES per mm/ksm.c:general_profit_show()
+        // (pages_sharing + ksm_zero_pages) * PAGE_SIZE - rmap overhead. Its
+        // neighbours on this line are all page counts, so emitting the raw
+        // value invites reading it as pages and deriving ~64 GiB of "savings"
+        // from a machine where KSM saved 36 MiB. Report MiB and say so.
+        ksm_general_profit_mib = format!("{:.1}", ksm_stats.general_profit as f64 / 1048576.0),
         ksm_full_scans = ksm_stats.full_scans,
         governor_level = s.ksm_level,
         pressure = %s.current_pressure,

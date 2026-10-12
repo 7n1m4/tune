@@ -329,9 +329,10 @@ fn format_stats(stats: &KsmStats, ksm_path: &Path) -> String {
     ));
     out.push('\n');
 
-    // general_profit is in bytes, convert to MiB
+    // general_profit is already in BYTES per mm/ksm.c:general_profit_show():
+    // (pages_sharing + ksm_zero_pages) * PAGE_SIZE minus rmap overhead.
     out.push_str(&format!(
-        "General profit:             {:.1} MiB\n",
+        "General profit (net of rmap): {:.1} MiB\n",
         general_profit as f64 / 1024.0 / 1024.0
     ));
 
@@ -477,7 +478,7 @@ mod tests {
             ("pages_scanned", "1000"),
             ("pages_skipped", "2"),
             ("full_scans", "7"),
-            ("general_profit", "12345"),
+            ("general_profit", "12582912"),
         ] {
             std::fs::write(dir.join(name), value).unwrap();
         }
@@ -1020,9 +1021,9 @@ mod tests {
             output.contains("Pages sharing:              2.0 MiB"),
             "{output}"
         );
-        // 12345 B / 1 MiB
+        // general_profit is bytes; 12582912 B / 1 MiB = 12.0 MiB
         assert!(
-            output.contains("General profit:             0.0 MiB"),
+            output.contains("General profit (net of rmap): 12.0 MiB"),
             "{output}"
         );
         // 512 / 10 = 51.2
