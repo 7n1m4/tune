@@ -11,6 +11,13 @@ ExecStopPost=-/usr/local/bin/animaksm restore-ksm --config /etc/animaksm.toml
 Restart=on-failure
 RestartSec=5
 
+# ProtectSystem=strict makes ReadWritePaths paths a hard requirement: the
+# directory must exist before the unit starts, or systemd fails the whole
+# invocation with 226/NAMESPACE. StateDirectory=animaksm creates /var/lib/animaksm
+# (and the snapshot dir under it) owned by the service user, so a fresh install
+# works with no manual mkdir.
+StateDirectory=animaksm
+
 # Security: limit what the process can do outside KSM tuning.
 NoNewPrivileges=yes
 AmbientCapabilities=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
