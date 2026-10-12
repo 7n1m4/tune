@@ -241,101 +241,111 @@ async fn show_status(config_path: PathBuf) -> anyhow::Result<()> {
 
 async fn show_stats(config_path: PathBuf) -> anyhow::Result<()> {
     init_tracing("info");
+    print!("{}", build_stats_output(&config_path)?);
 
-    let config = load_config_or_default(&config_path)?;
+    Ok(())
+}
+
+/// Print-safe (pure) counterpart of [`show_stats`].
+fn build_stats_output(config_path: &Path) -> anyhow::Result<String> {
+    let config = load_config_or_default(config_path)?;
     let ksm = KsmController::new(&config.governor.ksm_path)?;
     let stats = ksm.read_stats()?;
     let _cfg = ksm.read_config()?;
 
-    println!("======================================================");
-    println!("animaksm with KSM statistics support");
-    println!("======================================================");
+    Ok(format_stats(&stats, Path::new(&config.governor.ksm_path)))
+}
+
+fn format_stats(stats: &KsmStats, ksm_path: &Path) -> String {
+    let mut out = String::new();
+
+    out.push_str("======================================================\n");
+    out.push_str("animaksm with KSM statistics support\n");
+    out.push_str("======================================================\n");
 
     // Read additional KSM stats from sysfs
-    let ksm_path = Path::new(&config.governor.ksm_path);
-
-    let full_scans = fs::read_to_string(ksm_path.join("full_scans"))
-        .unwrap_or_default()
-        .trim()
-        .parse::<u64>()
-        .unwrap_or(0);
-    let sleep_millisecs = fs::read_to_string(ksm_path.join("sleep_millisecs"))
-        .unwrap_or_default()
-        .trim()
-        .parse::<u64>()
-        .unwrap_or(0);
-    let max_page_sharing = fs::read_to_string(ksm_path.join("max_page_sharing"))
-        .unwrap_or_default()
-        .trim()
-        .parse::<u64>()
-        .unwrap_or(0);
-    let pages_to_scan = fs::read_to_string(ksm_path.join("pages_to_scan"))
-        .unwrap_or_default()
-        .trim()
-        .parse::<u64>()
-        .unwrap_or(0);
-    let stable_node_chains = fs::read_to_string(ksm_path.join("stable_node_chains"))
-        .unwrap_or_default()
-        .trim()
-        .parse::<u64>()
-        .unwrap_or(0);
-    let stable_node_dups = fs::read_to_string(ksm_path.join("stable_node_dups"))
-        .unwrap_or_default()
-        .trim()
-        .parse::<u64>()
-        .unwrap_or(0);
-    let use_zero_pages = fs::read_to_string(ksm_path.join("use_zero_pages"))
-        .unwrap_or_default()
-        .trim()
-        .parse::<u64>()
-        .unwrap_or(0);
+    let full_scans = read_sysfs_u64(ksm_path, "full_scans");
+    let sleep_millisecs = read_sysfs_u64(ksm_path, "sleep_millisecs");
+    let max_page_sharing = read_sysfs_u64(ksm_path, "max_page_sharing");
+    let pages_to_scan = read_sysfs_u64(ksm_path, "pages_to_scan");
+    let stable_node_chains = read_sysfs_u64(ksm_path, "stable_node_chains");
+    let stable_node_dups = read_sysfs_u64(ksm_path, "stable_node_dups");
+    let use_zero_pages = read_sysfs_u64(ksm_path, "use_zero_pages");
     let pages_shared = stats.pages_shared;
     let pages_sharing = stats.pages_sharing;
     let pages_unshared = stats.pages_unshared;
     let general_profit = stats.general_profit;
 
-    println!("Full scans:                 {}", full_scans);
-    println!("Interval:                   {} ms", sleep_millisecs);
-    println!("Max page sharing ratio:     {}", max_page_sharing);
-    println!("Pages to scan:              {}", pages_to_scan);
-    println!("Pages over ratio:           {}", stable_node_chains);
-    println!("Duplicated pages:           {}", stable_node_dups);
-    println!("Use zero pages:             {}", use_zero_pages);
-    println!();
+    out.push_str(&format!("Full scans:                 {}\n", full_scans));
+    out.push_str(&format!(
+        "Interval:                   {} ms\n",
+        sleep_millisecs
+    ));
+    out.push_str(&format!(
+        "Max page sharing ratio:     {}\n",
+        max_page_sharing
+    ));
+    out.push_str(&format!("Pages to scan:              {}\n", pages_to_scan));
+    out.push_str(&format!(
+        "Pages over ratio:           {}\n",
+        stable_node_chains
+    ));
+    out.push_str(&format!(
+        "Duplicated pages:           {}\n",
+        stable_node_dups
+    ));
+    out.push_str(&format!("Use zero pages:             {}\n", use_zero_pages));
+    out.push('\n');
 
     if pages_shared > 0 && pages_sharing > 0 {
         let sharing_shared_ratio = pages_sharing as f64 / pages_shared as f64;
         let unshared_sharing_ratio = pages_unshared as f64 / pages_sharing as f64;
-        println!("Sharing/shared ratio:       {:.4}", sharing_shared_ratio);
-        println!("Unshared/sharing ratio:     {:.4}", unshared_sharing_ratio);
+        out.push_str(&format!(
+            "Sharing/shared ratio:       {:.4}\n",
+            sharing_shared_ratio
+        ));
+        out.push_str(&format!(
+            "Unshared/sharing ratio:     {:.4}\n",
+            unshared_sharing_ratio
+        ));
     } else {
-        println!("Sharing/shared ratio:       0");
-        println!("Unshared/sharing ratio:     0");
+        out.push_str("Sharing/shared ratio:       0\n");
+        out.push_str("Unshared/sharing ratio:     0\n");
     }
-    println!();
+    out.push('\n');
 
     // formula MiB: pages * page_size / (1024 * 1024) = pages / 256
-    println!(
-        "Pages sharing:              {:.1} MiB",
+    out.push_str(&format!(
+        "Pages sharing:              {:.1} MiB\n",
         pages_sharing as f64 / 256.0
-    );
-    println!(
-        "Pages shared:               {:.1} MiB",
+    ));
+    out.push_str(&format!(
+        "Pages shared:               {:.1} MiB\n",
         pages_shared as f64 / 256.0
-    );
-    println!(
-        "Pages unshared:             {:.1} MiB",
+    ));
+    out.push_str(&format!(
+        "Pages unshared:             {:.1} MiB\n",
         pages_unshared as f64 / 256.0
-    );
-    println!();
+    ));
+    out.push('\n');
 
     // general_profit is in bytes, convert to MiB
-    println!(
-        "General profit:             {:.1} MiB",
+    out.push_str(&format!(
+        "General profit:             {:.1} MiB\n",
         general_profit as f64 / 1024.0 / 1024.0
-    );
+    ));
 
-    Ok(())
+    out
+}
+
+/// Read a single u64 KSM knob, yielding 0 when absent or unparsable
+/// (knobs do not exist on every kernel).
+fn read_sysfs_u64(ksm_path: &Path, name: &str) -> u64 {
+    fs::read_to_string(ksm_path.join(name))
+        .unwrap_or_default()
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0)
 }
 
 fn build_status_output(config_path: &Path, psi_path: &Path) -> anyhow::Result<String> {
@@ -765,5 +775,325 @@ mod tests {
             Cli::try_parse_from(["animaksm", "restore-ksm", "--config", "/tmp/animaksm.toml"])
                 .unwrap();
         assert!(matches!(restore.command, Commands::RestoreKsm { .. }));
+    }
+
+    #[test]
+    fn test_cli_parses_stats_subcommand_with_short_config_flag() {
+        let stats = Cli::try_parse_from(["animaksm", "stats", "-c", "/tmp/animaksm.toml"]).unwrap();
+        match stats.command {
+            Commands::Stats { config } => assert_eq!(config, PathBuf::from("/tmp/animaksm.toml")),
+            _ => panic!("expected stats command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_config_flag_defaults_to_etc_animaksm_toml() {
+        // The default config path is a user-visible contract: the systemd unit
+        // invokes the daemon without `--config`.
+        let run = Cli::try_parse_from(["animaksm", "run"]).unwrap();
+        match run.command {
+            Commands::Run { config, dry_run } => {
+                assert_eq!(config, PathBuf::from("/etc/animaksm.toml"));
+                assert!(!dry_run, "dry-run must default to off");
+            }
+            _ => panic!("expected run command"),
+        }
+
+        let status = Cli::try_parse_from(["animaksm", "status"]).unwrap();
+        assert_eq!(
+            match status.command {
+                Commands::Status { config } => config,
+                _ => panic!("expected status command"),
+            },
+            PathBuf::from("/etc/animaksm.toml")
+        );
+
+        let stats = Cli::try_parse_from(["animaksm", "stats"]).unwrap();
+        assert_eq!(
+            match stats.command {
+                Commands::Stats { config } => config,
+                _ => panic!("expected stats command"),
+            },
+            PathBuf::from("/etc/animaksm.toml")
+        );
+
+        let restore = Cli::try_parse_from(["animaksm", "restore-ksm"]).unwrap();
+        assert_eq!(
+            match restore.command {
+                Commands::RestoreKsm { config } => config,
+                _ => panic!("expected restore-ksm command"),
+            },
+            PathBuf::from("/etc/animaksm.toml")
+        );
+    }
+
+    #[test]
+    fn test_cli_accepts_equals_form_for_flags() {
+        // `--config=<path>` is the form used by the systemd unit's ExecStart.
+        let run = Cli::try_parse_from(["animaksm", "run", "--config=/tmp/a.toml"]).unwrap();
+        match run.command {
+            Commands::Run { config, dry_run } => {
+                assert_eq!(config, PathBuf::from("/tmp/a.toml"));
+                assert!(!dry_run);
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_rejects_missing_subcommand() {
+        let Err(err) = Cli::try_parse_from(["animaksm"]) else {
+            panic!("expected missing-subcommand error")
+        };
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+    }
+
+    #[test]
+    fn test_cli_rejects_unknown_flag() {
+        let Err(err) = Cli::try_parse_from(["animaksm", "run", "--turbo"]) else {
+            panic!("expected unknown-flag error")
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn test_cli_rejects_unknown_subcommand() {
+        let Err(err) = Cli::try_parse_from(["animaksm", "frobnicate"]) else {
+            panic!("expected invalid-subcommand error")
+        };
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::InvalidSubcommand,
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn test_cli_rejects_non_boolean_dry_run_value() {
+        let Err(err) = Cli::try_parse_from(["animaksm", "run", "--dry-run=maybe"]) else {
+            panic!("expected invalid dry-run value error")
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::TooManyValues);
+        assert!(err.to_string().contains("dry-run"));
+    }
+
+    #[test]
+    fn test_cli_rejects_stray_positional_argument() {
+        let Err(err) = Cli::try_parse_from(["animaksm", "run", "extra"]) else {
+            panic!("expected stray-positional error")
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn test_cli_help_describes_subcommands() {
+        let Err(err) = Cli::try_parse_from(["animaksm", "--help"]) else {
+            panic!("expected help output")
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+        for needle in ["run", "status", "stats", "restore-ksm"] {
+            assert!(err.to_string().contains(needle), "help missing {needle}");
+        }
+    }
+
+    #[test]
+    fn test_cli_run_help_documents_flags_and_default() {
+        let Err(err) = Cli::try_parse_from(["animaksm", "run", "--help"]) else {
+            panic!("expected run help output")
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = err.to_string();
+        for needle in ["--config", "--dry-run", "/etc/animaksm.toml"] {
+            assert!(help.contains(needle), "run help missing {needle}");
+        }
+    }
+
+    #[test]
+    fn test_load_config_or_default_surfaces_malformed_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("animaksm.toml");
+        std::fs::write(&path, "[general\nlog_level = ").unwrap();
+
+        let err = load_config_or_default(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("TOML parse error") || msg.contains("invalid"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_load_config_or_default_surfaces_validation_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("animaksm.toml");
+        std::fs::write(
+            &path,
+            "[governor]\npsi_some_threshold = 250.0\nksm_path = \"/nonexistent/ksm\"\n",
+        )
+        .unwrap();
+
+        let err = load_config_or_default(&path).unwrap_err();
+        assert!(err.to_string().contains("psi_some_threshold"));
+    }
+
+    #[test]
+    fn test_load_config_or_default_propagates_unreadable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory satisfies `exists()` but cannot be read as a file, so the
+        // read error must surface instead of silently falling back to defaults.
+        let err = load_config_or_default(dir.path()).unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn test_load_config_or_default_ignores_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("animaksm.toml");
+        std::fs::write(
+            &path,
+            "[general]\nlog_level = \"warn\"\nfuture_option = 42\n",
+        )
+        .unwrap();
+
+        let config = load_config_or_default(&path).unwrap();
+        assert_eq!(config.general.log_level, "warn");
+    }
+
+    #[test]
+    fn test_load_config_or_default_merges_partial_file_with_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("animaksm.toml");
+        std::fs::write(&path, "[scanner]\nenabled = false\n").unwrap();
+
+        let config = load_config_or_default(&path).unwrap();
+        assert!(!config.scanner.enabled);
+        // Unspecified sections must keep their defaults rather than erroring.
+        assert!(config.validate().is_ok());
+        assert_eq!(config.general.state_dir, "/var/lib/animaksm");
+    }
+
+    #[tokio::test]
+    async fn test_run_daemon_propagates_shutdown_signal_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let ksm_dir = dir.path().join("ksm");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir(&ksm_dir).unwrap();
+        seed_ksm_dir(&ksm_dir);
+
+        let config_path = dir.path().join("animaksm.toml");
+        write_daemon_config(&config_path, &ksm_dir, &state_dir);
+
+        let err = run_daemon_with_shutdown(config_path, true, async {
+            Err(anyhow::anyhow!("signal registration failed"))
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("signal registration failed"));
+    }
+
+    #[tokio::test]
+    async fn test_build_stats_output_reports_knobs_stats_and_mib_conversion() {
+        let dir = tempfile::tempdir().unwrap();
+        let ksm_dir = dir.path().join("ksm");
+        std::fs::create_dir(&ksm_dir).unwrap();
+        seed_ksm_dir(&ksm_dir);
+        // Knobs the kernel does not always expose must render as 0, not fail.
+        // seed_ksm_dir deliberately omits use_zero_pages and stable_node_chains,
+        // so the absent-knob path is exercised without touching real sysfs.
+        std::fs::write(ksm_dir.join("stable_node_chains"), "not-a-number").unwrap();
+
+        let config_path = dir.path().join("animaksm.toml");
+        write_config(&config_path, &ksm_dir, &dir.path().join("state"));
+
+        let output = build_stats_output(&config_path).unwrap();
+        assert!(output.contains("Full scans:                 7"));
+        assert!(output.contains("Interval:                   20 ms"));
+        assert!(output.contains("Max page sharing ratio:     256"));
+        assert!(output.contains("Duplicated pages:           0"), "{output}");
+        assert!(output.contains("Use zero pages:             0"), "{output}");
+        assert!(output.contains("Pages to scan:              500"));
+        // 512 pages * 4096 B / 1 MiB = 2.0 MiB
+        assert!(
+            output.contains("Pages sharing:              2.0 MiB"),
+            "{output}"
+        );
+        // 12345 B / 1 MiB
+        assert!(
+            output.contains("General profit:             0.0 MiB"),
+            "{output}"
+        );
+        // 512 / 10 = 51.2
+        assert!(
+            output.contains("Sharing/shared ratio:       51.2000"),
+            "{output}"
+        );
+        // 3 / 512 = 0.0059
+        assert!(
+            output.contains("Unshared/sharing ratio:     0.0059"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn test_format_stats_zeroes_ratios_when_no_pages_shared() {
+        // Division by pages_shared/pages_sharing would panic; the zero branch
+        // must render literal 0 instead.
+        let stats = KsmStats::default();
+        let dir = tempfile::tempdir().unwrap();
+
+        let output = format_stats(&stats, dir.path());
+        assert!(output.contains("Sharing/shared ratio:       0"), "{output}");
+        assert!(output.contains("Unshared/sharing ratio:     0"), "{output}");
+        assert!(
+            output.contains("Pages sharing:              0.0 MiB"),
+            "{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_stats_output_errors_for_missing_ksm_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("animaksm.toml");
+        write_config(&config_path, &dir.path().join("missing"), dir.path());
+
+        let err = build_stats_output(&config_path).unwrap_err();
+        assert!(err.to_string().contains("KSM path not found"));
+    }
+
+    #[tokio::test]
+    async fn test_run_daemon_errors_when_config_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("animaksm.toml");
+        std::fs::write(&config_path, "not = [valid toml").unwrap();
+
+        let err = run_daemon_with_shutdown(config_path, true, async { Ok("SIGTERM") })
+            .await
+            .unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_run_daemon_errors_when_ksm_path_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        let config_path = dir.path().join("animaksm.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[general]\nstate_dir = \"{}\"\n\n[governor]\nenabled = false\nksm_path = \
+                 \"{}/missing\"\n\n[scanner]\nenabled = false\n",
+                state_dir.display(),
+                dir.path().display()
+            ),
+        )
+        .unwrap();
+
+        let err = run_daemon_with_shutdown(config_path, false, async { Ok("SIGTERM") })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("KSM path not found"));
     }
 }

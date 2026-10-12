@@ -81,26 +81,68 @@ cargo install --locked animaksm-daemon --git https://github.com/animaios/animaks
 git clone https://github.com/animaios/animaksmd
 cd animaksmd
 cargo build --release --bin animaksm
+
+# Install the binary
 sudo cp target/release/animaksm /usr/local/bin/
+
+# Install the config file. The repo ships a fully-commented example at
+# config/animaksm.toml; there is no /etc/animaksm.toml and no `make install`
+# target, so copy it into place yourself.
+sudo mkdir -p /var/lib/animaksm
+sudo cp config/animaksm.toml /etc/animaksm.toml
+
+# Install the systemd unit (its ExecStart expects /usr/local/bin/animaksm
+# and /etc/animaksm.toml) and reload systemd
 sudo cp systemd/animaksm.service /etc/systemd/system/
+sudo systemctl daemon-reload
 ```
+
+> **A missing config file is not an error.** If the path passed to `--config`
+> does not exist, the daemon logs `Config file not found, using defaults` and
+> runs entirely on built-in defaults — so forgetting to copy
+> `config/animaksm.toml` to `/etc/animaksm.toml` silently gives you a
+> default-tuned daemon instead of a failure. The systemd unit only gets
+> read access to `/etc/animaksm.toml` under its `ProtectSystem=strict`
+> sandbox, so that path must exist and be readable.
 
 ### Configure
 ```toml
-# /etc/animaksm.toml
+# /etc/animaksm.toml — every key below is a real key; unknown keys are ignored.
+
 [general]
-state_dir = "/var/lib/animaksm"
+log_level = "info"               # tracing filter: error | warn | info | debug | trace
+poll_interval_ms = 2000          # main loop tick, in milliseconds
+state_dir = "/var/lib/animaksm"  # where the KSM state snapshot is kept
 
 [governor]
-ksm_path = "/sys/kernel/mm/ksm"
-use_advisor = true           # Use kernel's scan-time advisor mode
-stabilization_secs = 30      # Seconds to wait before ramping down
+enabled = true                   # tune /sys/kernel/mm/ksm/* parameters
+use_advisor = true               # true: kernel advisor sets scan rate, governor only biases bounds
+psi_some_threshold = 5.0         # PSI some avg10 (%) that ramps aggressiveness up
+psi_full_threshold = 2.0         # PSI full avg10 (%) treated as critical
+advisor_scan_time_range = [30, 600]      # bounds on the advisor scan-time window; min must be < max
+max_page_sharing_range = [256, 1024]     # bounds on max_page_sharing; min must be < max
+hysteresis_readings = 4          # consecutive readings before changing level (up and down)
+min_level_duration_secs = 30     # cooldown after a down-step before stepping down again
+stabilization_secs = 30          # min seconds between repeated actions in the same tier
+ksm_path = "/sys/kernel/mm/ksm"  # KSM sysfs directory (the only thing written to)
 
 [scanner]
-interval_secs = 30           # Scan interval
-min_anon_rss_mb = 100        # Minimum anonymous RSS to consider
-max_candidates = 5           # Max processes per scan cycle
+enabled = true                   # inject MADV_MERGEABLE into other processes
+interval_secs = 30               # how often to scan processes, in seconds
+min_anon_rss_mb = 100            # only consider processes above this anonymous RSS, in MiB
+duplicate_ratio_threshold = 0.15 # fraction (0,1] of anon pages that look duplicated
+max_mergeable_per_process_mb = 512  # per-process cap, in MiB, to avoid over-marking
+max_candidates_per_cycle = 5     # top-K processes marked per scan cycle
+blocklist = ["animaksm", "ksmd", "systemd", "sshd"]  # process names never touched (replaces the default list)
+target_cgroups = []              # empty = scan all user processes
 ```
+
+> **Unrecognised keys are silently ignored.** The config is deserialized with
+> `#[serde(default)]` and no `deny_unknown_fields`, so a typo'd or renamed key
+> has **no effect and produces no warning** — a misspelled `max_candidates`
+> just quietly leaves `max_candidates_per_cycle` at its default. Check key
+> names against `crates/common/src/config.rs`, and remember that list-valued
+> keys like `blocklist` *replace* the default list rather than extending it.
 
 ### Run
 ```bash
@@ -110,12 +152,22 @@ animaksm stats
 # Show current status
 animaksm status
 
+# Restore the KSM parameters captured in the state snapshot
+animaksm restore-ksm
+
+# Dry-run to see what it would do (no sysfs writes, no madvise calls)
+animaksm run --dry-run
+
+# Point any subcommand at a non-default config file
+animaksm run --config /etc/animaksm.toml
+
 # Run as daemon (systemd)
 sudo systemctl enable --now animaksm
-
-# Dry-run to see what it would do
-animaksm run --dry-run
 ```
+
+Every subcommand (`run`, `status`, `stats`, `restore-ksm`) takes
+`--config <path>`, defaulting to `/etc/animaksm.toml`; only `run` has
+`--dry-run`.
 
 ---
 
