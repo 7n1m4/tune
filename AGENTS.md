@@ -7,7 +7,7 @@
 **Tool-Precedence Pledge (binding):** Whenever jcodemunch or other specialized tools are available, the agent MUST use them for every symbol/intent/impact operation. Native tools (`Read`, `Grep`, `Glob`, `Edit`, `Create`, `LS`) are reserved for side-effects, raw-text editing, and OS-level operations (git, cargo, systemctl, kernel files). A native tool marked "forbidden" in §3.5 may only run after the specialized tool returned an error or empty result AND the fallback reason is recorded in the active TodoWrite entry.
 
 ## 1. What is this repo?
-`animaksm` is a Rust-based userspace daemon that drives Linux's Kernel Samepage Merging (KSM) subsystem with a PSI-aware governor, deduplicates compressed swap pages, and exports Prometheus metrics. It reduces memory pressure in cloud, container, and embedded workloads.
+`animaksm` is a Rust-based userspace daemon that drives Linux's Kernel Samepage Merging (KSM) subsystem with a PSI-aware governor, marks other processes' anonymous pages `MADV_MERGEABLE` via ptrace injection, and logs the resulting KSM statistics. It reduces memory use in cloud, container, and embedded workloads where many processes share identical pages.
 
 ## 2. How is it structured?
 ```

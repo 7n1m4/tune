@@ -41,7 +41,7 @@ I missed uksmd. I wanted it back — but modernized, safer, and with features th
 | **MADV_COLLAPSE Support** | Opportunistically promotes memory to Transparent Huge Pages after KSM unmerges pages (breaks THP) |
 | **KSM Advisor Mode** | Runs in kernel's "scan-time" advisor mode — biases bounds only, lets kernel do the scanning |
 | **Full State Snapshotting** | Atomically snapshots KSM config on startup, restores on shutdown — zero config drift |
-| **Prometheus Metrics** | Exposes `/metrics` for Grafana/Prometheus dashboards |
+| **Structured Logging** | Emits KSM statistics as structured logs (journald/JSON) for scraping by your own collector |
 | **Systemd Integration** | Ships with hardened systemd unit (CAP_SYS_PTRACE, CAP_DAC_READ_SEARCH, ProtectSystem=strict) |
 
 ---
@@ -100,10 +100,6 @@ stabilization_secs = 30      # Seconds to wait before ramping down
 interval_secs = 30           # Scan interval
 min_anon_rss_mb = 100        # Minimum anonymous RSS to consider
 max_candidates = 5           # Max processes per scan cycle
-
-[metrics]
-enabled = true
-listen_addr = "0.0.0.0:9090"
 ```
 
 ### Run
@@ -150,34 +146,22 @@ General profit:             0.4 MiB
 
 ---
 
-## Metrics & Dashboards
+## Observability
 
-AKSMD exposes Prometheus metrics at `http://localhost:9090/metrics`:
+AKSMD does not expose an HTTP endpoint. Every 60 seconds it logs the live KSM
+counters and governor state as structured records, which journald (or your JSON
+collector) can pick up directly:
 
-```prometheus
-# HELP animaksm_ksm_pages_shared Total pages shared by KSM
-# TYPE animaksm_ksm_pages_shared gauge
-animaksm_ksm_pages_shared 15
-
-# HELP animaksm_ksm_pages_sharing Pages currently being shared
-# TYPE animaksm_ksm_pages_sharing gauge
-animaksm_ksm_pages_sharing 409
-
-# HELP animaksm_ksm_general_profit Memory saved (bytes) minus overhead
-# TYPE animaksm_ksm_general_profit gauge
-animaksm_ksm_general_profit -1096064
-
-# HELP animaksm_governor_level Current governor aggressiveness level (0-4)
-# TYPE animaksm_governor_level gauge
-animaksm_governor_level 1
-
-# HELP animaksm_psi_pressure Current memory pressure level
-# TYPE animaksm_psi_pressure gauge
-animaksm_psi_pressure{level="low"} 1
 ```
-<!--
-**Grafana Dashboard**: Import [AKSMD Dashboard](https://grafana.com/grafana/dashboards/animaksm) (JSON available in `grafana/animaksm-dashboard.json`)
--->
+animaksm: ksm pages_shared=0 pages_sharing=0 general_profit=0 full_scans=0
+animaksm: governor level=3 pressure=medium target=3 psi_some=0.66 psi_full=0.65
+animaksm: scanner targeted=3 marked_mib=291 cycles=4
+```
+
+To alert on KSM effectiveness, watch `general_profit` (saved memory minus
+overhead) and `pages_sharing` — the two numbers that say whether KSM is
+actually earning its CPU.
+
 ---
 
 ## Architecture
@@ -226,7 +210,6 @@ animaksm_psi_pressure{level="low"} 1
 | MADV_COLLAPSE | ❌ | ✅ |
 | PSI-aware governor | Basic | **Advanced (hysteresis, stabilization)** |
 | KSM Advisor mode | ❌ | ✅ |
-| Prometheus metrics | ❌ | ✅ |
 | State snapshotting | ❌ | ✅ |
 | Systemd hardening | Basic | **Strict (ProtectSystem=strict)** |
 | Maintenance | Archived (2025) | **Active** |
@@ -241,8 +224,12 @@ animaksm_psi_pressure{level="low"} 1
 ### Does it work with containers (Docker/Podman)?
 Yes! The scanner finds processes by PID namespace. For container workloads, run AKSMD on the host — it sees all container processes and can inject MADV_MERGEABLE into them.
 
-### What about ZRAM / zswap?
-AKSMD does not implement its own swap device. For compressed, deduplicated swap, use zram's built-in same-page merging — forking zram itself is the better path than a hacky userspace swap layer.
+### Where does AKSMD fit alongside zswap and zram?
+Nowhere — deliberately. AKSMD only writes `/sys/kernel/mm/ksm/*` and marks pages
+`MADV_MERGEABLE`; it has never implemented its own swap device and does not
+touch zswap, zram or any swap path. Use zswap/zram for swap compression and
+AKSMD for RAM-side page deduplication: different mechanisms, no shared
+configuration, no interference.
 
 ### Is it safe to run on production?
 Yes. AKSMD:
@@ -289,7 +276,7 @@ Dual-licensed under **MIT** or **Apache-2.0** at your option.
 
 ## Tags / Keywords
 
-`ksm` `kernel-samepage-merging` `memory-deduplication` `memory-optimization` `userspace-daemon` `ptrace` `madvise` `process-madvise` `psi` `memory-pressure` `prometheus-metrics` `systemd` `rust` `linux-kernel` `cachyOS` `uksmd` `uksmdstats` `memory-savings` `transparent-huge-pages` `thp` `madvise-mergeable` `process-injection` `linux-systems-programming`
+`ksm` `kernel-samepage-merging` `memory-deduplication` `memory-optimization` `userspace-daemon` `ptrace` `madvise` `process-madvise` `psi` `memory-pressure` `structured-logging` `systemd` `rust` `linux-kernel` `cachyOS` `uksmd` `uksmdstats` `memory-savings` `transparent-huge-pages` `thp` `madvise-mergeable` `process-injection` `linux-systems-programming`
 
 ---
 
