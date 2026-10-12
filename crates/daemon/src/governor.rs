@@ -492,8 +492,10 @@ mod tests {
     fn make_temp_gov_with(f: impl FnOnce(&mut GovernorConfig)) -> Governor {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.keep();
-        let mut config = GovernorConfig::default();
-        config.ksm_path = path.to_string_lossy().to_string();
+        let mut config = GovernorConfig {
+            ksm_path: path.to_string_lossy().to_string(),
+            ..Default::default()
+        };
         f(&mut config);
         let mut ksm = KsmController::new(&config.ksm_path).unwrap();
         ksm.set_dry_run(true);
@@ -551,8 +553,8 @@ mod tests {
     #[test]
     fn test_profiles_idle_stops_ksm() {
         assert_eq!(PROFILES[0].run, 0, "Idle profile must set run=0");
-        for i in 1..=5 {
-            assert!(PROFILES[i].run > 0, "Profile {i} should have run>0");
+        for p in &PROFILES[1..=5] {
+            assert!(p.run > 0, "Profile {} should have run>0", p.level);
         }
     }
 

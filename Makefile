@@ -7,7 +7,7 @@ all: check test
 check:
 	cargo check --workspace --all-targets
 	cargo fmt --check
-	cargo clippy --workspace -- -D warnings
+	cargo clippy --workspace --all-targets -- -D warnings
 
 # ── Tests ─────────────────────────────────────────────────────────────
 

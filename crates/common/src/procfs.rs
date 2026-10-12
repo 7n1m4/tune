@@ -664,11 +664,8 @@ mod tests {
         let mut stat = KsmProcStat::default();
         for line in content.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                match parts[0] {
-                    "ksm_rmap_items" => stat.rmap_items = parts[1].parse().unwrap_or(0),
-                    _ => {}
-                }
+            if parts.len() >= 2 && parts[0] == "ksm_rmap_items" {
+                stat.rmap_items = parts[1].parse().unwrap_or(0);
             }
         }
         assert_eq!(stat.rmap_items, 5);

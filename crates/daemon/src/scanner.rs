@@ -436,7 +436,7 @@ mod tests {
     fn test_scanner_new_initial_state() {
         let scanner = Scanner::new(ScannerConfig::default(), false, 30);
         assert_eq!(scanner.config.interval_secs, 30);
-        assert_eq!(scanner.dry_run, false);
+        assert!(!scanner.dry_run);
         assert_eq!(scanner.stabilization_secs, 30);
         assert_eq!(scanner.stats.scan_cycles, 0);
         assert_eq!(scanner.stats.skipped_stabilization, 0);
@@ -472,10 +472,12 @@ mod tests {
 
     #[test]
     fn test_scanner_new_with_nondefault_config() {
-        let mut config = ScannerConfig::default();
-        config.interval_secs = 120;
-        config.min_anon_rss_mb = 200;
-        config.max_candidates_per_cycle = 10;
+        let config = ScannerConfig {
+            interval_secs: 120,
+            min_anon_rss_mb: 200,
+            max_candidates_per_cycle: 10,
+            ..Default::default()
+        };
 
         let scanner = Scanner::new(config, false, 30);
         assert_eq!(scanner.config.interval_secs, 120);
@@ -832,13 +834,13 @@ mod tests {
                 passes_l25_profit_filter(stat.as_ref())
             })
             .collect();
-        l25.sort_by(|a, b| b.anon_rss_mb.cmp(&a.anon_rss_mb));
+        l25.sort_by_key(|c| std::cmp::Reverse(c.anon_rss_mb));
         l25.truncate(config.max_candidates_per_cycle);
 
         assert_eq!(l25.len(), 1);
         assert_eq!(l25[0].pid, 13);
 
-        let maps = vec![map(0x1000, 0x5000, "rw-p", 0, "")];
+        let maps = [map(0x1000, 0x5000, "rw-p", 0, "")];
         assert_eq!(eligible_anon_rw_summary(&maps), (1, 0x4000));
     }
 }

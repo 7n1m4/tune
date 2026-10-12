@@ -491,7 +491,7 @@ mod tests {
             PsiTrigger::new_from_path(&path, PsiTriggerKind::Some, 1000, 500_000).expect("trigger");
         assert_eq!(trigger.threshold_us, 1000);
         assert_eq!(trigger.window_us, 500_000);
-        assert_eq!(trigger.as_raw_fd() >= 0, true);
+        assert!(trigger.as_raw_fd() >= 0);
 
         trigger.rearm().unwrap();
 

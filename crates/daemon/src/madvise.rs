@@ -625,7 +625,7 @@ mod tests {
 
     #[test]
     fn test_build_batch_collects_regions() {
-        let regions = vec![
+        let regions = [
             MapsEntry {
                 start: 0x10000,
                 end: 0x11000,
@@ -654,7 +654,7 @@ mod tests {
 
     #[test]
     fn test_build_batch_respects_max_bytes() {
-        let regions = vec![
+        let regions = [
             MapsEntry {
                 start: 0x10000,
                 end: 0x11000,
@@ -693,7 +693,7 @@ mod tests {
 
     #[test]
     fn test_build_batch_partially_marks_first_large_region() {
-        let regions = vec![MapsEntry {
+        let regions = [MapsEntry {
             start: 0x10000,
             end: 0x90000,
             perms: "rw-p".into(),
@@ -730,7 +730,7 @@ mod tests {
 
     #[test]
     fn test_build_batch_exact_capacity() {
-        let regions = vec![
+        let regions = [
             MapsEntry {
                 start: 0x10000,
                 end: 0x12000,
@@ -758,7 +758,7 @@ mod tests {
 
     #[test]
     fn test_build_batch_zero_max_bytes() {
-        let regions = vec![MapsEntry {
+        let regions = [MapsEntry {
             start: 0x10000,
             end: 0x11000,
             perms: "rw-p".into(),
