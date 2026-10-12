@@ -17,6 +17,20 @@
 //! A stabilization window damps repeated governor profile changes. Other
 //! tiers maintain their own stabilization timestamps so a KSM profile write
 //! cannot starve the process scanner.
+//!
+//! ## Idle (level 0)
+//!
+//! Sustained idle pressure drives the governor to level 0, the profile with
+//! `run: 0`. In manual mode that stops the scanner outright. In advisor mode
+//! level 0 still keeps `run = 1` (the advisor needs it) but relaxes the
+//! governor's bias knobs — it is a real, distinct state, not a no-op.
+//!
+//! Because PSI's EWMA scores sit on a wandering boundary between Idle and
+//! Low, entering level 0 requires a *sustained* idle dwell
+//! (`hysteresis_readings * IDLE_DWELL_FACTOR` consecutive idle readings) on
+//! top of the cooldown, and leaving it still needs `hysteresis_readings`
+//! consecutive non-idle readings. Flickering pressure cannot toggle KSM on
+//! and off.
 
 use std::time::{Duration, Instant};
 
@@ -94,6 +108,15 @@ const PROFILES: &[KsmProfile] = &[
     },
 ];
 
+/// Multiplier applied to `hysteresis_readings` to get the number of
+/// *consecutive* idle readings required before stepping down into level 0.
+///
+/// Level 0 is the only profile that stops the scanner (`run: 0`), and starting
+/// it again costs a full ramp-up. PSI's 10-second EWMAs make a single reading a
+/// weak signal, so the transition demands sustained idleness well beyond the
+/// ordinary hysteresis window.
+const IDLE_DWELL_FACTOR: u32 = 3;
+
 /// The governor state machine.
 pub struct Governor {
     config: GovernorConfig,
@@ -102,6 +125,10 @@ pub struct Governor {
     hysteresis_count: u32,
     /// Consecutive ticks with target above current level (ramp-up damping).
     ramp_up_count: u32,
+    /// Consecutive ticks whose target is level 0 while sitting at level 1
+    /// (idle dwell). Reset by any non-idle reading, so a PSI score straddling
+    /// the Idle/Low boundary can never accumulate enough dwell to stop KSM.
+    idle_dwell_count: u32,
     level_entered_at: Instant,
     full_scans_at_level: u64,
     /// Last PSI reading (for fallback stability check).
@@ -118,6 +145,7 @@ impl Governor {
             current_level: 0,
             hysteresis_count: 0,
             ramp_up_count: 0,
+            idle_dwell_count: 0,
             level_entered_at: Instant::now(),
             full_scans_at_level: 0,
             last_psi: None,
@@ -278,15 +306,18 @@ impl Governor {
         self.last_psi = Some(psi.clone());
     }
 
-    /// Map pressure level to KSM aggressiveness level (1-5).
+    /// Map pressure level to KSM aggressiveness level (0-5).
     ///
-    /// Level 0 (KSM stopped) is never chosen automatically — Idle and Low
-    /// both map to level 1 (lightest scanning). This avoids 0↔1 oscillation
-    /// at the Idle/Low pressure boundary where PSI scores hover near the
-    /// classification threshold.
+    /// Idle maps to level 0 — the profile with `run: 0` that stops scanning.
+    /// The 0↔1 boundary is protected in `compute_transition`: entering Idle
+    /// needs `hysteresis_readings * IDLE_DWELL_FACTOR` *consecutive* idle
+    /// readings on top of the usual `min_level_duration_secs` cooldown, while
+    /// leaving Idle still needs `hysteresis_readings` consecutive non-idle
+    /// readings. PSI scores hovering around the Idle/Low classification
+    /// threshold therefore cannot toggle the scanner on and off.
     fn pressure_to_level(&self, pressure: PressureLevel) -> u8 {
         match pressure {
-            PressureLevel::Idle => 1,
+            PressureLevel::Idle => 0,
             PressureLevel::Low => 1,
             PressureLevel::Medium => 3,
             PressureLevel::High => 4,
@@ -296,11 +327,26 @@ impl Governor {
 
     /// Compute the actual transition with hysteresis and cooldown.
     ///
-    /// Ramp-up now also requires consecutive hysteresis readings when the
-    /// target is only +1 above the current level (prevents 0↔1 oscillation
-    /// at the Idle/Low PSI boundary). Multi-level emergency jumps (target
-    /// >= current+2) bypass hysteresis and ramp immediately.
+    /// Ramp-up requires consecutive hysteresis readings when the target is
+    /// only +1 above the current level (prevents 1↔2 oscillation). Multi-level
+    /// emergency jumps (target >= current+2) bypass hysteresis and ramp
+    /// immediately.
+    ///
+    /// Ramp-down steps one level at a time, gated by the `min_level_duration_secs`
+    /// cooldown plus `hysteresis_readings` consecutive readings. The final step
+    /// into level 0 (KSM stopped) additionally needs
+    /// `hysteresis_readings * IDLE_DWELL_FACTOR` consecutive idle readings, so
+    /// a PSI score flickering across the Idle/Low boundary cannot toggle the
+    /// scanner on and off.
     fn compute_transition(&mut self, target_level: u8) -> u8 {
+        // Idle dwell tracking: only a *consecutive* run of idle readings counts,
+        // so a single Low reading in between resets the count.
+        if target_level == 0 && self.current_level == 1 {
+            self.idle_dwell_count += 1;
+        } else {
+            self.idle_dwell_count = 0;
+        }
+
         if target_level > self.current_level {
             // Multi-level jump (emergency): ramp immediately
             // Use saturating_add so this is safe if current_level is near u8::MAX
@@ -335,6 +381,21 @@ impl Governor {
             self.hysteresis_count += 1;
             if self.hysteresis_count >= self.config.hysteresis_readings {
                 self.hysteresis_count = 0;
+                // The step into level 0 is the expensive one: it stops KSM
+                // entirely, and restarting it later costs a full ramp-up, so it
+                // needs a sustained idle dwell on top of the ordinary
+                // hysteresis. While dwelling, stay at level 1.
+                if self.current_level == 1 {
+                    let required = self
+                        .config
+                        .hysteresis_readings
+                        .saturating_mul(IDLE_DWELL_FACTOR)
+                        .max(1);
+                    if self.idle_dwell_count < required {
+                        return self.current_level;
+                    }
+                    self.idle_dwell_count = 0;
+                }
                 self.level_entered_at = Instant::now();
                 self.full_scans_at_level = 0;
                 // Step down by one level at a time
@@ -354,7 +415,9 @@ impl Governor {
     ///
     /// In advisor mode (Option B), only writes `max_page_sharing` and
     /// `sleep_millisecs` — the kernel advisor controls `pages_to_scan`.
-    /// In manual mode, writes all parameters directly.
+    /// Level 0 in advisor mode keeps `run = 1` (the advisor requires it) and
+    /// simply relaxes the bias knobs. In manual mode, writes all parameters
+    /// and level 0 stops the scanner with `run = 0`.
     async fn apply_profile(&mut self, level: u8, state: &SharedGovernorState) {
         let profile = &PROFILES[level as usize];
         let prev_level = self.current_level;
@@ -527,8 +590,8 @@ mod tests {
         let gov = make_gov();
         assert_eq!(
             gov.pressure_to_level(PressureLevel::Idle),
-            1,
-            "Idle and Low both map to level 1 (minimal scanning)"
+            0,
+            "Idle maps to level 0 (scanner stopped)"
         );
     }
 
@@ -738,6 +801,271 @@ mod tests {
         assert_eq!(r3, 2);
     }
 
+    // ── Idle (level 0) reachability ───────────────────────────────────
+
+    /// Idle ticks needed for the 1 → 0 step with the production defaults
+    /// (`hysteresis_readings = 4`, `IDLE_DWELL_FACTOR = 3`).
+    const DEFAULT_IDLE_DWELL_TICKS: u32 = 4 * IDLE_DWELL_FACTOR;
+
+    /// Drive the governor down from `start_level` to a stable level by feeding
+    /// `pressure` for `ticks` ticks, applying each returned level.
+    fn drive_to_idle(gov: &mut Governor, pressure: PressureLevel, ticks: u32) {
+        let target = gov.pressure_to_level(pressure);
+        for _ in 0..ticks {
+            let next = gov.compute_transition(target);
+            gov.current_level = next;
+        }
+    }
+
+    #[test]
+    fn test_idle_requires_sustained_dwell_then_reaches_level_zero() {
+        // Defaults: hysteresis_readings = 4, min_level_duration_secs = 0 so the
+        // cooldown does not gate this unit test.
+        let mut gov = make_gov_with(|c| c.min_level_duration_secs = 0);
+        gov.current_level = 1;
+
+        let dwell = DEFAULT_IDLE_DWELL_TICKS;
+
+        // Ordinary ramp-down hysteresis (4 readings) is NOT sufficient: the
+        // step into level 0 must wait for the full idle dwell.
+        for _ in 0..dwell - 1 {
+            assert_eq!(
+                gov.compute_transition(0),
+                1,
+                "level 0 must stay unreachable before the dwell completes"
+            );
+            gov.current_level = 1;
+        }
+
+        // The dwell-completing tick drops to level 0.
+        assert_eq!(
+            gov.compute_transition(0),
+            0,
+            "sustained idle must reach level 0"
+        );
+        assert_eq!(
+            gov.idle_dwell_count, 0,
+            "dwell counter reset after entering 0"
+        );
+    }
+
+    #[test]
+    fn test_idle_reachable_from_high_levels_via_ramp_down() {
+        // A full ride from Emergency (5) down to Idle (0) under sustained idle
+        // pressure. min_level_duration_secs = 0 keeps the test fast; the
+        // cooldown path is covered separately.
+        let mut gov = make_gov_with(|c| {
+            c.min_level_duration_secs = 0;
+            c.hysteresis_readings = 2;
+        });
+        gov.current_level = 5;
+
+        // The step into level 0 needs hysteresis_readings * IDLE_DWELL_FACTOR
+        // = 6 consecutive idle readings; the other steps need only 2 each, so
+        // 24 idle ticks comfortably covers the whole descent.
+        drive_to_idle(&mut gov, PressureLevel::Idle, 24);
+
+        assert_eq!(
+            gov.current_level, 0,
+            "sustained idle must drive the governor all the way to level 0"
+        );
+    }
+
+    #[test]
+    fn test_boundary_oscillation_does_not_reach_level_zero() {
+        // PSI hovering around the Idle/Low boundary: alternate Idle and Low
+        // ticks. Under the old mapping both mapped to level 1 and the governor
+        // never left level 1; now every Low tick must reset the idle dwell, so
+        // the scanner can never be switched off by a flickering signal.
+        let mut gov = make_gov_with(|c| {
+            c.min_level_duration_secs = 0;
+            c.hysteresis_readings = 2;
+        });
+        gov.current_level = 1;
+
+        // 40 alternating ticks is far more than the 6-reading dwell, so this
+        // sequence would reach level 0 if any non-idle tick failed to reset it.
+        for _ in 0..40 {
+            let idle_level = gov.compute_transition(0);
+            assert_eq!(idle_level, 1, "single idle tick must not stop KSM");
+            let low_level = gov.compute_transition(1);
+            assert_eq!(low_level, 1, "level must be stable during oscillation");
+            gov.current_level = 1;
+        }
+        assert_eq!(gov.current_level, 1);
+        assert_eq!(
+            gov.idle_dwell_count, 0,
+            "the trailing Low tick must reset the idle dwell"
+        );
+    }
+
+    #[test]
+    fn test_low_alone_never_stops_ksm() {
+        // Low maps to level 1, which equals the current level, so no dwell can
+        // ever accumulate.
+        let mut gov = make_gov_with(|c| c.min_level_duration_secs = 0);
+        gov.current_level = 1;
+
+        drive_to_idle(&mut gov, PressureLevel::Low, 100);
+
+        assert_eq!(
+            gov.current_level, 1,
+            "Low pressure alone must keep scanning"
+        );
+        assert_eq!(gov.idle_dwell_count, 0);
+    }
+
+    #[test]
+    fn test_idle_dwell_resets_after_single_interruption() {
+        // Almost enough dwell, interrupted by one Low tick: the count must
+        // start over from scratch rather than continuing.
+        let mut gov = make_gov_with(|c| {
+            c.min_level_duration_secs = 0;
+            c.hysteresis_readings = 2;
+        });
+        gov.current_level = 1;
+
+        let required = 2 * IDLE_DWELL_FACTOR; // 6
+
+        // Accumulate three of the six required idle readings.
+        for _ in 0..(required - 3) {
+            assert_eq!(gov.compute_transition(0), 1);
+        }
+        assert_eq!(gov.idle_dwell_count, required - 3);
+
+        // One Low reading wipes the progress.
+        assert_eq!(gov.compute_transition(1), 1);
+        assert_eq!(gov.idle_dwell_count, 0, "interrupted dwell must restart");
+
+        // Now the full requirement must be met again before reaching level 0.
+        for _ in 0..required - 1 {
+            assert_eq!(
+                gov.compute_transition(0),
+                1,
+                "dwell restarted, so level 0 must stay unreachable"
+            );
+        }
+        assert_eq!(
+            gov.compute_transition(0),
+            0,
+            "dwell complete after the restart"
+        );
+    }
+
+    #[test]
+    fn test_leaving_idle_still_requires_hysteresis() {
+        // Exiting level 0 keeps the ordinary ramp-up hysteresis: pressure
+        // flickering back above Idle cannot immediately restart the scanner.
+        let mut gov = make_gov_with(|c| {
+            c.min_level_duration_secs = 0;
+            c.hysteresis_readings = 3;
+        });
+        gov.current_level = 0;
+
+        assert_eq!(
+            gov.compute_transition(1),
+            0,
+            "leaving idle needs hysteresis readings"
+        );
+        assert_eq!(gov.ramp_up_count, 1);
+        assert_eq!(gov.compute_transition(1), 0);
+        assert_eq!(
+            gov.compute_transition(1),
+            1,
+            "third consecutive Low reading restarts scanning"
+        );
+    }
+
+    #[test]
+    fn test_idle_dwell_not_required_for_intermediate_steps() {
+        // Ramping from 5 to 4 must not pay the idle-dwell tax: only the step
+        // into level 0 does. hysteresis_readings = 1 keeps each step a single
+        // tick so the comparison is unambiguous.
+        let mut gov = make_gov_with(|c| {
+            c.min_level_duration_secs = 0;
+            c.hysteresis_readings = 1;
+        });
+        gov.current_level = 5;
+
+        assert_eq!(gov.compute_transition(0), 4);
+        gov.current_level = 4;
+        assert_eq!(gov.compute_transition(0), 3);
+        gov.current_level = 3;
+        assert_eq!(gov.compute_transition(0), 2);
+        gov.current_level = 2;
+        assert_eq!(gov.compute_transition(0), 1);
+    }
+
+    #[test]
+    fn test_emergency_ramp_up_overrides_pending_idle_dwell() {
+        // A sudden spike must escape immediately even if an idle dwell was in
+        // progress at level 1 — safety must not be delayed by the dwell.
+        let mut gov = make_gov_with(|c| {
+            c.min_level_duration_secs = 0;
+            c.hysteresis_readings = 2;
+        });
+        gov.current_level = 1;
+        gov.idle_dwell_count = 2;
+
+        let result = gov.compute_transition(3); // 3 >= 1 + 2 → emergency jump
+        assert_eq!(result, 3, "emergency ramp-up must bypass the idle dwell");
+        assert_eq!(gov.idle_dwell_count, 0, "dwell discarded on emergency jump");
+    }
+
+    #[tokio::test]
+    async fn test_sustained_idle_tick_reaches_level_zero_via_tick_with_readings() {
+        // End-to-end through `tick_with_readings`: sustained idle PSI drives the
+        // governor to level 0 and the shared state reports it.
+        let mut gov = make_temp_gov_with(|c| {
+            c.stabilization_secs = 0;
+            c.min_level_duration_secs = 0;
+            c.hysteresis_readings = 2;
+        });
+        gov.current_level = 1;
+        let state = new_shared_state();
+
+        // Below the 5.0 some-threshold and 0.5 score floor → classified Idle.
+        // Step 2→1 needs 2 readings; 1→0 needs 2 * IDLE_DWELL_FACTOR = 6.
+        for _ in 0..16 {
+            gov.tick_with_readings(&state, psi(0.0, 0.1), ksm_stats(500, 100, 5))
+                .await;
+        }
+
+        assert_eq!(
+            gov.current_level, 0,
+            "sustained idle PSI must drive the governor to level 0"
+        );
+        let s = state.read().await;
+        assert_eq!(s.current_pressure, PressureLevel::Idle);
+        assert_eq!(s.ksm_level, 0);
+    }
+
+    #[tokio::test]
+    async fn test_oscillating_pressure_never_reaches_level_zero_via_tick() {
+        // The same boundary flicker driven through the real tick path: the
+        // shared level must stay pinned at 1 forever.
+        let mut gov = make_temp_gov_with(|c| {
+            c.stabilization_secs = 0;
+            c.min_level_duration_secs = 0;
+            c.hysteresis_readings = 2;
+        });
+        gov.current_level = 1;
+        let state = new_shared_state();
+
+        for _ in 0..30 {
+            // Idle: score = 0.7*0.2 + 0.3*0.1 = 0.17 (< the 0.5 floor)
+            gov.tick_with_readings(&state, psi(0.1, 0.2), ksm_stats(500, 100, 5))
+                .await;
+            assert_eq!(gov.current_level, 1, "idle tick must not stop KSM");
+
+            // Low: score = 0.7*0.5 + 0.3*1.0 = 0.65 — just above the Idle floor,
+            // i.e. exactly the boundary where a flickering signal would straddle.
+            gov.tick_with_readings(&state, psi(1.0, 0.5), ksm_stats(500, 100, 5))
+                .await;
+            assert_eq!(gov.current_level, 1, "low tick must not stop KSM");
+        }
+    }
+
     #[test]
     fn test_emergency_ramp_up_overrides_pending_ramp_down() {
         let mut gov = make_gov_with(|c| {
@@ -845,6 +1173,102 @@ mod tests {
         assert_eq!(gov.current_level, 0);
         // The key difference: dry-run won't emit the "Would write KSM parameter run=0"
         // line because the set_run(0) call is skipped entirely when use_advisor=true.
+    }
+
+    /// Build a governor over a temp directory seeded with the KSM parameters
+    /// `apply_profile` touches, wired to a real (non-dry-run) controller so the
+    /// writes can be read back from disk.
+    fn level_zero_gov(use_advisor: bool) -> (Governor, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, value) in [
+            ("run", "1"),
+            ("pages_to_scan", "500"),
+            ("sleep_millisecs", "100"),
+            ("max_page_sharing", "256"),
+            ("advisor_mode", "scan-time"),
+            ("advisor_target_scan_time", "200"),
+            ("advisor_max_cpu", "70"),
+            ("advisor_min_pages_to_scan", "500"),
+            ("advisor_max_pages_to_scan", "30000"),
+        ] {
+            std::fs::write(dir.path().join(name), value).unwrap();
+        }
+        let mut ctrl = KsmController::new(&dir.path().to_string_lossy()).unwrap();
+        // Prime the controller's rate limiter so the first write is not skipped.
+        std::thread::sleep(Duration::from_millis(600));
+        ctrl.set_dry_run(false);
+        let gov = Governor::new(
+            GovernorConfig {
+                use_advisor,
+                ksm_path: dir.path().to_string_lossy().to_string(),
+                ..GovernorConfig::default()
+            },
+            ctrl,
+        );
+        (gov, dir)
+    }
+
+    #[tokio::test]
+    async fn test_level_zero_in_advisor_mode_writes_bias_knobs_not_run() {
+        // Level 0 must remain a *meaningful* state in advisor mode: the bias
+        // knobs move to their level-0 values while `run` is left untouched so
+        // the kernel advisor keeps working.
+        let (mut gov, dir) = level_zero_gov(true);
+        let state = new_shared_state();
+        gov.current_level = 1;
+
+        gov.apply_profile(0, &state).await;
+
+        let read = |name: &str| {
+            std::fs::read_to_string(dir.path().join(name))
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        assert_eq!(gov.current_level, 0, "advisor mode must reach level 0");
+        assert_eq!(read("run"), "1", "advisor mode must never write run=0");
+        assert_eq!(
+            read("max_page_sharing"),
+            "256",
+            "level 0 bias knob must be applied in advisor mode"
+        );
+        assert_eq!(
+            read("sleep_millisecs"),
+            "500",
+            "level 0 bias knob must be applied in advisor mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_level_zero_in_manual_mode_stops_scanner() {
+        // Counterpart in manual mode: reaching level 0 must really write
+        // `run = 0` and stop the scanner.
+        let (mut gov, dir) = level_zero_gov(false);
+        let state = new_shared_state();
+        gov.current_level = 1;
+
+        gov.apply_profile(0, &state).await;
+
+        assert_eq!(gov.current_level, 0);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("run"))
+                .unwrap()
+                .trim(),
+            "0",
+            "manual mode must write run=0 at level 0"
+        );
+    }
+
+    #[test]
+    fn test_level_zero_profile_is_a_real_state_in_advisor_mode() {
+        // Level 0 differs from level 1 in the knobs the governor actually owns
+        // in advisor mode, so reaching it has a real effect rather than being a
+        // silent no-op.
+        assert_eq!(PROFILES[0].max_page_sharing, PROFILES[1].max_page_sharing);
+        assert!(
+            PROFILES[0].sleep_millisecs > PROFILES[1].sleep_millisecs,
+            "level 0 must slow scanning relative to level 1"
+        );
     }
 
     #[tokio::test]
