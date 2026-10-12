@@ -930,6 +930,11 @@ impl Group {
 
 /// Bytes per page on every architecture this tool targets.
 const PAGE_BYTES: u64 = 4096;
+/// Widest spacing between two records that may still be treated as one
+/// interval. Two samples further apart than this belong to different runs,
+/// and the counter delta between them measures whatever happened in the
+/// gap rather than the action of either ceiling.
+const RECORD_GAP_MAX: u64 = 300;
 /// Minimum `Δstored_pages` a ceiling group needs before it may be judged.
 const SUFFICIENT_STORED_MIB: f64 = 200.0;
 /// The ceiling the verdict has to defend, and the one it is measured against.
@@ -947,6 +952,20 @@ fn analyse(records: &[Record]) -> Vec<Group> {
         // Out-of-order samples would produce negative deltas and misleading
         // intervals; a rotation or a manual edit can cause them.
         if after.ts < before.ts {
+            continue;
+        }
+        // A gap longer than a couple of record periods means the two samples
+        // come from different runs — the recorder was stopped, rotated or the
+        // machine slept in between. The counters then include everything that
+        // happened while nobody was recording, so the delta is not evidence
+        // about any ceiling. Drop it rather than attribute it.
+        if after.ts - before.ts > RECORD_GAP_MAX {
+            continue;
+        }
+        // The ceiling may change at any of the daemon's polls, so an interval
+        // whose endpoints disagree was not spent under either ceiling and
+        // cannot be judged.
+        if after.limit != before.limit {
             continue;
         }
         let stored_delta = after.stored_pages.saturating_sub(before.stored_pages);
@@ -1561,7 +1580,7 @@ Zswapped:         723448 kB
             "fixture has malformed lines: {:?}",
             problems
         );
-        assert_eq!(records.len(), 12, "fixture must hold 12 records");
+        assert_eq!(records.len(), 10, "fixture must hold 10 records");
         analyse(&records)
     }
 
@@ -1583,12 +1602,13 @@ Zswapped:         723448 kB
     #[test]
     fn fixture_interval_count_matches_records() {
         let groups = fixture_groups();
-        // 12 records yield 11 intervals, each attributed to the ceiling that
-        // opened it.
+        // The fixture holds one contiguous run per ceiling, so every interval
+        // belongs to the ceiling that opened it: 4 records at 20% yield 3
+        // intervals, 6 records at 40% yield 5.
         let total: usize = groups.iter().map(|g| g.samples).sum();
-        assert_eq!(total, 11);
-        assert_eq!(group(&groups, 20).samples, 5);
-        assert_eq!(group(&groups, 40).samples, 6);
+        assert_eq!(total, 8);
+        assert_eq!(group(&groups, 20).samples, 3);
+        assert_eq!(group(&groups, 40).samples, 5);
     }
 
     #[test]
@@ -1596,35 +1616,35 @@ Zswapped:         723448 kB
         let groups = fixture_groups();
 
         let low = group(&groups, 20);
-        assert_eq!(low.stored_bytes, 300000 * PAGE_BYTES);
-        assert_eq!(low.written_bytes, 9000 * PAGE_BYTES);
-        assert!((low.stored_mib() - 1171.875).abs() < 1e-6);
-        assert!((low.written_mib() - 35.15625).abs() < 1e-6);
+        assert_eq!(low.stored_bytes, 180000 * PAGE_BYTES);
+        assert_eq!(low.written_bytes, 4000 * PAGE_BYTES);
+        assert!((low.stored_mib() - 703.125).abs() < 1e-6);
+        assert!((low.written_mib() - 15.625).abs() < 1e-6);
 
         let high = group(&groups, 40);
-        assert_eq!(high.stored_bytes, 272000 * PAGE_BYTES);
-        assert_eq!(high.written_bytes, 15400 * PAGE_BYTES);
-        assert!((high.stored_mib() - 1062.5).abs() < 1e-6);
-        assert!((high.written_mib() - 60.15625).abs() < 1e-6);
+        assert_eq!(high.stored_bytes, 212000 * PAGE_BYTES);
+        assert_eq!(high.written_bytes, 14600 * PAGE_BYTES);
+        assert!((high.stored_mib() - 828.125).abs() < 1e-6);
+        assert!((high.written_mib() - 57.03125).abs() < 1e-6);
     }
 
     #[test]
     fn fixture_eviction_ratios() {
         let groups = fixture_groups();
-        assert!((group(&groups, 20).eviction_ratio().unwrap() - 0.03).abs() < 1e-9);
-        assert!((group(&groups, 40).eviction_ratio().unwrap() - 0.056618).abs() < 1e-6);
+        assert!((group(&groups, 20).eviction_ratio().unwrap() - 0.022222).abs() < 1e-6);
+        assert!((group(&groups, 40).eviction_ratio().unwrap() - 0.068867).abs() < 1e-6);
     }
 
     #[test]
     fn fixture_write_evidence_sums_both_devices() {
         let groups = fixture_groups();
-        // Interval attribution: each ceiling only owns the writes that happened
-        // while it was in force, so the two groups sum to more than the
-        // first-to-last difference across a mid-file ceiling change.
-        assert_eq!(group(&groups, 20).write_bytes, 308_938_496);
-        assert_eq!(group(&groups, 40).write_bytes, 331_889_408);
+        // Each ceiling owns only the writes that happened while it was in
+        // force, so the two groups sum to more than a first-to-last difference
+        // that ignored the ceiling change between them.
+        assert_eq!(group(&groups, 20).write_bytes, 179_201_024);
+        assert_eq!(group(&groups, 40).write_bytes, 274_121_216);
         let total: u64 = groups.iter().map(|g| g.write_bytes).sum();
-        assert_eq!(total, 640_827_904);
+        assert_eq!(total, 453_322_240);
     }
 
     #[test]
@@ -1646,9 +1666,61 @@ Zswapped:         723448 kB
         let sda1_net =
             device_of(&records[records.len() - 1], "sda1") - device_of(&records[0], "sda1");
         let total: u64 = groups.iter().map(|g| g.write_bytes).sum();
-        assert_eq!(total, md0_net + sda1_net);
-        assert_eq!(md0_net, 597_824_000);
-        assert_eq!(sda1_net, 43_003_904);
+        // Both device counters only ever grow, so the groups can never sum to
+        // more than the overall net difference. They legitimately sum to less:
+        // the interval straddling the 20->40 change is not attributed to
+        // either ceiling, and its writes are excluded from the evidence
+        // because no ceiling was in force for the whole of it.
+        assert!(
+            total <= md0_net + sda1_net,
+            "grouped write evidence {} must not exceed the net {}",
+            total,
+            md0_net + sda1_net
+        );
+        assert!(total > 0);
+    }
+
+    #[test]
+    fn ceiling_change_writes_are_excluded_from_evidence() {
+        // The boundary between two contiguous runs is the only place where a
+        // device counter moves without any interval owning it, because no
+        // ceiling was in force for the whole span.
+        let (records, problems) = parse_records(&fixture_text());
+        assert!(problems.is_empty(), "problems: {:?}", problems);
+        let boundary = records
+            .windows(2)
+            .find(|pair| pair[0].limit != pair[1].limit)
+            .expect("fixture must contain a ceiling change");
+        let (before, after) = (&boundary[0], &boundary[1]);
+
+        let device_delta = |from: &Record, to: &Record, device: &str| -> u64 {
+            let start = from
+                .devices
+                .iter()
+                .find(|(name, _)| name == device)
+                .map(|(_, bytes)| *bytes)
+                .unwrap_or(0);
+            let end = to
+                .devices
+                .iter()
+                .find(|(name, _)| name == device)
+                .map(|(_, bytes)| *bytes)
+                .unwrap_or(0);
+            end.saturating_sub(start)
+        };
+
+        let excluded = device_delta(before, after, "md0") + device_delta(before, after, "sda1");
+        let attributed: u64 = fixture_groups().iter().map(|g| g.write_bytes).sum();
+        // Via the boundary writes, every byte the fixture recorded is either
+        // attributed to a ceiling or excluded at the ceiling change.
+        assert!(excluded > 0, "the boundary must move a device counter");
+        let md0_whole = device_delta(&records[0], &records[records.len() - 1], "md0");
+        let sda1_whole = device_delta(&records[0], &records[records.len() - 1], "sda1");
+        assert_eq!(
+            attributed + excluded,
+            md0_whole + sda1_whole,
+            "no writes may be counted twice or vanish"
+        );
     }
 
     #[test]
@@ -1822,6 +1894,77 @@ Zswapped:         723448 kB
         assert_eq!(groups[0].samples, 1, "only the 100 -> 1500 interval survives");
         assert_eq!(groups[0].stored_bytes, 500 * PAGE_BYTES);
         assert_eq!(groups[0].written_bytes, 10 * PAGE_BYTES);
+    }
+
+    /// Build a record line for the interval-filter tests.
+    fn interval_record(ts: u64, limit: u8, stored: i64, written: i64) -> Record {
+        Record { ts, limit, stored_pages: stored, written_back_pages: written, devices: Vec::new() }
+    }
+
+    #[test]
+    fn analysis_drops_intervals_spanning_a_recording_gap() {
+        // Two runs of the daemon hours apart: the counter delta between them
+        // covers the whole idle stretch, under no ceiling in particular.
+        let records = vec![
+            interval_record(1_000_000, 20, 100, 0),
+            interval_record(1_000_300, 20, 400, 0),
+            // 2 hours of silence in between
+            interval_record(7_300_000, 20, 900, 200),
+        ];
+        let groups = analyse(&records);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].samples, 1);
+        assert_eq!(groups[0].stored_bytes, 300 * PAGE_BYTES);
+    }
+
+    #[test]
+    fn analysis_keeps_intervals_within_the_gap_threshold() {
+        // A cadence-adjusted run (ZSWAP_TUNE_RECORD_INTERVAL) legitimately
+        // spaces records further apart than 60 s; that is still one run.
+        let records = vec![
+            interval_record(1_000_000, 30, 100, 0),
+            interval_record(1_000_290, 30, 400, 0),
+        ];
+        let groups = analyse(&records);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].samples, 1);
+        assert_eq!(groups[0].limit, 30);
+    }
+
+    #[test]
+    fn analysis_drops_intervals_straddling_a_ceiling_change() {
+        // The ceiling moved mid-interval, so the delta was not measured under
+        // either ceiling and belongs to neither group.
+        let records = vec![
+            interval_record(1_000_000, 20, 100, 0),
+            interval_record(1_000_060, 35, 400, 50),
+        ];
+        assert!(analyse(&records).is_empty());
+    }
+
+    #[test]
+    fn analysis_folds_a_returning_ceiling_into_its_group() {
+        // A ceiling that appears, disappears and returns shares one group: the
+        // verdict compares ceilings, not runs, so the 20% evidence is pooled
+        // even though the 40% run interrupted it.
+        let records = vec![
+            interval_record(1_000_000, 20, 100, 0),
+            interval_record(1_000_060, 20, 400, 0),
+            interval_record(1_000_120, 40, 900, 0),
+            interval_record(1_000_180, 40, 1200, 0),
+            interval_record(1_000_240, 20, 1600, 0),
+            interval_record(1_000_300, 20, 2000, 0),
+        ];
+        let groups = analyse(&records);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].limit, 20);
+        // Two of the five intervals survive: the 20->40 and 40->20 boundaries
+        // straddle a ceiling change and belong to neither group.
+        assert_eq!(groups[0].samples, 2, "both 20% runs pool into one group");
+        assert_eq!(groups[1].limit, 40);
+        assert_eq!(groups[1].samples, 1);
+        assert_eq!(groups[0].stored_bytes, 700 * PAGE_BYTES);
+        assert_eq!(groups[1].stored_bytes, 300 * PAGE_BYTES);
     }
 
     #[test]

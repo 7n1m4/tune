@@ -58,6 +58,14 @@ evidence. This is why an idle machine legitimately yields
 `insufficient data` rather than a made-up verdict — **do not manufacture a
 result to fill the table.**
 
+**`--report` also drops intervals that cross a discontinuity.** Two samples
+further apart than `RECORD_GAP_MAX` (300 s) come from different daemon runs, and
+an interval whose endpoints name different ceilings was never spent under either
+one. Both are dropped rather than attributed to the ceiling that opened them —
+the counter delta across a gap or a ceiling change measures whatever the machine
+was doing in between, which no ceiling caused. Dropping them is why `samples` in
+the table is an interval count, not a record count.
+
 **zram is excluded from write evidence.** Its "writes" are RAM compressions, not
 the flash endurance cost the verdict is about. `WRITE_EVIDENCE_DEVICES` is
 `/dev/md0` + `/dev/sda1` only.
@@ -101,7 +109,7 @@ workload.
 
 ```console
 $ cargo build --release 2>&1 | tee /tmp/build.log   # exit 0, zero warnings
-$ cargo test --release                              # all 39 pass
+$ cargo test --release                              # all 44 pass
 $ sudo cargo run --release -- --stats               # root: live table, exit 0
 $ cargo run --release -- --stats                    # unprivileged: degraded, exit 0
 $ sudo cargo run --release -- --report tests/fixtures/report.jsonl

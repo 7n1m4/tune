@@ -100,9 +100,15 @@ Flags:
   plus an explicit note that the counters are unavailable, and still exits 0.
 * `--report [PATH]` — read a recorded stats file (default
   `/var/log/zswap-tune/stats.jsonl`), compute per-interval deltas, group them
-  by the ceiling that was in force and print one table plus a verdict. Group a
-  comparison only against groups with at least 200 MiB of stored growth;
-  anything smaller is reported as insufficient data rather than judged.
+  by the ceiling that was in force and print one table plus a verdict. An
+  interval is evidence only if it was spent contiguously under one ceiling:
+  samples spaced more than `RECORD_GAP_MAX` apart (300 s) belong to different
+  daemon runs, and an interval whose endpoints name different ceilings measured
+  neither. Both are dropped, as are intervals whose counters moved backwards.
+  Consequently the `samples` column counts intervals, not records — a file of 11
+  records can legitimately yield no rows at all. Group a comparison only against
+  groups with at least 200 MiB of stored growth; anything smaller is reported as
+  insufficient data rather than judged.
 * `-h`, `--help` — usage text.
 
 `--stats` and `--report` are mutually exclusive with each other and with
