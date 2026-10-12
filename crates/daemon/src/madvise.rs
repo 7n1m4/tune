@@ -50,9 +50,6 @@ const SYS_PIDFD_OPEN: libc::c_long = 434;
 /// madvise syscall number (x86_64).
 const SYS_MADVISE: libc::c_long = 28;
 
-/// Maximum iovecs per process_madvise call (kernel limit is typically 1024).
-const MAX_IOV_BATCH: usize = 256;
-
 /// Result of a madvise operation on a process.
 #[derive(Debug)]
 pub struct MadviseResult {
@@ -95,7 +92,7 @@ pub fn apply_mergeable(
         return result;
     }
 
-    // Collect regions into batches (respecting max_bytes and MAX_IOV_BATCH)
+    // Collect regions into one batch, respecting max_bytes
     let batch = build_batch(&eligible, max_bytes);
     result.regions_attempted = batch.len();
     let total_bytes: u64 = batch.iter().map(|&(_, len)| len as u64).sum();
@@ -485,32 +482,6 @@ fn errno_to_str(errno: i32) -> &'static str {
     }
 }
 
-#[allow(dead_code)]
-fn process_madvise_batch(
-    pidfd: RawFd,
-    iovs: &[libc::iovec],
-    advice: libc::c_int,
-) -> Result<u64, String> {
-    if advice == MADV_MERGEABLE {
-        return Err("MADV_MERGEABLE not supported by process_madvise; use ptrace".to_string());
-    }
-    let ret = unsafe {
-        libc::syscall(
-            SYS_PROCESS_MADVISE,
-            pidfd as libc::c_int,
-            iovs.as_ptr(),
-            iovs.len(),
-            advice,
-            0u32,
-        )
-    };
-    if ret < 0 {
-        let errno = unsafe { *libc::__errno_location() };
-        return Err(format!("errno={errno} ({})", errno_to_str(errno)));
-    }
-    Ok(ret as u64)
-}
-
 fn process_madvise_single(
     pidfd: RawFd,
     addr: u64,
@@ -539,73 +510,6 @@ fn process_madvise_single(
         return Err(format!("errno={errno} ({})", errno_to_str(errno)));
     }
     Ok(())
-}
-
-#[allow(dead_code)]
-fn apply_madvise_batches<BatchFn, SingleFn>(
-    pid: u32,
-    result: &mut MadviseResult,
-    batch: &[(u64, usize)],
-    mut batch_call: BatchFn,
-    mut single_call: SingleFn,
-) where
-    BatchFn: FnMut(&[libc::iovec]) -> Result<u64, String>,
-    SingleFn: FnMut(u64, usize) -> Result<(), String>,
-{
-    for chunk in batch.chunks(MAX_IOV_BATCH) {
-        let iovs: Vec<libc::iovec> = chunk
-            .iter()
-            .map(|&(addr, len)| libc::iovec {
-                iov_base: addr as *mut libc::c_void,
-                iov_len: len,
-            })
-            .collect();
-        let total_chunk_bytes: u64 = chunk.iter().map(|&(_, len)| len as u64).sum();
-        match batch_call(&iovs) {
-            Ok(bytes_processed) => {
-                if bytes_processed == total_chunk_bytes {
-                    result.regions_merged += chunk.len();
-                    result.total_bytes_marked += bytes_processed;
-                    debug!(
-                        pid,
-                        regions = chunk.len(),
-                        bytes = bytes_processed,
-                        "Batched process_madvise(MADV_MERGEABLE) succeeded"
-                    );
-                } else {
-                    result.regions_merged += chunk.len();
-                    result.total_bytes_marked += bytes_processed;
-                    debug!(
-                        pid,
-                        expected = total_chunk_bytes,
-                        processed = bytes_processed,
-                        "Partial batch madvise (some VMAs may have changed)"
-                    );
-                }
-            }
-            Err(e) => {
-                debug!(
-                    pid,
-                    error = %e,
-                    batch_size = chunk.len(),
-                    "Batched madvise failed, falling back to per-region"
-                );
-                for &(addr, len) in chunk {
-                    match single_call(addr, len) {
-                        Ok(_) => {
-                            result.regions_merged += 1;
-                            result.total_bytes_marked += len as u64;
-                        }
-                        Err(fallback_err) => {
-                            result
-                                .errors
-                                .push((addr, format!("process_madvise failed: {fallback_err}")));
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1277,135 +1181,29 @@ mod tests {
         assert_eq!(result.errors.len(), 1);
         assert_eq!(result.regions_merged, 1);
     }
-
-    #[test]
-    fn test_apply_madvise_batches_counts_full_batch_success() {
-        let mut result = MadviseResult {
-            pid: 123,
-            regions_attempted: 2,
-            regions_merged: 0,
-            total_bytes_marked: 0,
-            errors: vec![],
-        };
-        let batch = vec![(0x1000, 4096), (0x2000, 8192)];
-
-        apply_madvise_batches(
-            123,
-            &mut result,
-            &batch,
-            |_| Ok(12_288),
-            |_, _| panic!("single fallback should not run"),
-        );
-
-        assert_eq!(result.regions_merged, 2);
-        assert_eq!(result.total_bytes_marked, 12_288);
-        assert!(result.errors.is_empty());
-    }
-
-    #[test]
-    fn test_apply_madvise_batches_counts_partial_batch_success() {
-        let mut result = MadviseResult {
-            pid: 123,
-            regions_attempted: 2,
-            regions_merged: 0,
-            total_bytes_marked: 0,
-            errors: vec![],
-        };
-        let batch = vec![(0x1000, 4096), (0x2000, 8192)];
-
-        apply_madvise_batches(
-            123,
-            &mut result,
-            &batch,
-            |_| Ok(4096),
-            |_, _| panic!("single fallback should not run"),
-        );
-
-        assert_eq!(result.regions_merged, 2);
-        assert_eq!(result.total_bytes_marked, 4096);
-        assert!(result.errors.is_empty());
-    }
-
-    #[test]
-    fn test_apply_madvise_batches_falls_back_per_region_after_batch_failure() {
-        let mut result = MadviseResult {
-            pid: 123,
-            regions_attempted: 3,
-            regions_merged: 0,
-            total_bytes_marked: 0,
-            errors: vec![],
-        };
-        let batch = vec![(0x1000, 4096), (0x2000, 8192), (0x3000, 4096)];
-
-        apply_madvise_batches(
-            123,
-            &mut result,
-            &batch,
-            |_| Err("forced batch failure".into()),
-            |addr, _len| {
-                if addr == 0x2000 {
-                    Err("forced single failure".into())
-                } else {
-                    Ok(())
-                }
-            },
-        );
-
-        assert_eq!(result.regions_merged, 2);
-        assert_eq!(result.total_bytes_marked, 8192);
-        assert_eq!(result.errors.len(), 1);
-        assert_eq!(result.errors[0].0, 0x2000);
-        assert!(result.errors[0].1.contains("forced single failure"));
-    }
-
     #[test]
     fn test_errno_to_str_known_and_unknown() {
         assert!(errno_to_str(libc::EPERM).contains("EPERM"));
         assert_eq!(errno_to_str(999_999), "unknown");
     }
-
-    #[test]
-    fn test_process_madvise_helpers_report_bad_fd() {
-        let iov = libc::iovec {
-            iov_base: 0x10000usize as *mut libc::c_void,
-            iov_len: 4096,
-        };
-
-        let batch_err = process_madvise_batch(-1, &[iov], MADV_MERGEABLE).unwrap_err();
-        let single_err = process_madvise_single(-1, 0x10000, 4096, MADV_MERGEABLE).unwrap_err();
-
-        // These helpers validate advice and reject MADV_MERGEABLE
-        assert!(batch_err.contains("MADV_MERGEABLE not supported by process_madvise"));
-        assert!(single_err.contains("MADV_MERGEABLE not supported by process_madvise"));
-    }
-
-    /// Both helpers must reject `MADV_MERGEABLE` *before* issuing any syscall —
+    /// The helper must reject `MADV_MERGEABLE` *before* issuing any syscall —
     /// process_madvise(2) cannot apply that advice cross-process, so ptrace is
-    /// the only route. Guarded with advice checks against an intentionally bad
+    /// the only route. Guarded with an advice check against an intentionally bad
     /// fd so the assertion can only be satisfied by the early return.
     #[test]
-    fn test_process_madvise_helpers_guard_madvise_mergeable() {
+    fn test_process_madvise_guards_madvise_mergeable() {
         // A fd that is never valid in this process. Were the guard missing, the
         // helper would fall through to process_madvise and report an EBADF
         // errno string instead of this exact advice message.
         const GUARD_FD: RawFd = -1;
-        let iovs = [libc::iovec {
-            iov_base: 0x200000usize as *mut libc::c_void,
-            iov_len: 2 * 1024 * 1024,
-        }];
 
-        let batch_err = process_madvise_batch(GUARD_FD, &iovs, MADV_MERGEABLE).unwrap_err();
         let single_err =
             process_madvise_single(GUARD_FD, 0x200000, 2 * 1024 * 1024, MADV_MERGEABLE)
                 .unwrap_err();
 
         assert_eq!(
-            batch_err, "MADV_MERGEABLE not supported by process_madvise; use ptrace",
-            "batch helper must reject MADV_MERGEABLE before the syscall"
-        );
-        assert_eq!(
             single_err, "MADV_MERGEABLE not supported by process_madvise; use ptrace",
-            "single helper must reject MADV_MERGEABLE before the syscall"
+            "the helper must reject MADV_MERGEABLE before the syscall"
         );
     }
 
@@ -1415,12 +1213,8 @@ mod tests {
     /// message. This pins the guard's boundary so a future regression that
     /// widens it to all advice values is caught.
     #[test]
-    fn test_process_madvise_helpers_allow_supported_advice() {
+    fn test_process_madvise_allows_supported_advice() {
         const GUARD_FD: RawFd = -1;
-        let iovs = [libc::iovec {
-            iov_base: 0x200000usize as *mut libc::c_void,
-            iov_len: 2 * 1024 * 1024,
-        }];
 
         // MADV_COLLAPSE is the advice `collapse_regions` passes in production.
         let collapsed_err =
@@ -1434,7 +1228,8 @@ mod tests {
             "MADV_COLLAPSE must not trip the MERGEABLE guard, got: {collapsed_err}"
         );
 
-        let cold_err = process_madvise_batch(GUARD_FD, &iovs, libc::MADV_COLD).unwrap_err();
+        let cold_err = process_madvise_single(GUARD_FD, 0x200000, 2 * 1024 * 1024, libc::MADV_COLD)
+            .unwrap_err();
         assert!(
             cold_err.contains("errno="),
             "MADV_COLD must reach the syscall, got: {cold_err}"
@@ -1445,23 +1240,16 @@ mod tests {
         );
     }
 
-    /// Both helpers, given supported advice against a bad fd, report the raw
+    /// The helper, given supported advice against a bad fd, must report the raw
     /// errno and its human-readable name — the exact string `collapse_regions`
     /// pattern-matches on to decide whether to break out of its loop.
     #[test]
-    fn test_process_madvise_helpers_report_bad_fd_errno_message() {
+    fn test_process_madvise_reports_bad_fd_errno_message() {
         const GUARD_FD: RawFd = -1;
-        let iovs = [libc::iovec {
-            iov_base: 0x200000usize as *mut libc::c_void,
-            iov_len: 2 * 1024 * 1024,
-        }];
 
-        let batch_err = process_madvise_batch(GUARD_FD, &iovs, MADV_COLLAPSE).unwrap_err();
         let single_err =
             process_madvise_single(GUARD_FD, 0x200000, 2 * 1024 * 1024, MADV_COLLAPSE).unwrap_err();
 
-        assert!(batch_err.contains("errno="), "got: {batch_err}");
-        assert!(batch_err.contains("EBADF"), "got: {batch_err}");
         assert!(single_err.contains("errno="), "got: {single_err}");
         assert!(single_err.contains("EBADF"), "got: {single_err}");
     }
