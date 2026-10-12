@@ -117,3 +117,11 @@ $ sudo cargo run --release -- --report tests/fixtures/report.jsonl
 
 The fixture-driven tests are the deterministic proof of the analysis math; live
 data is not required to validate `analyse`/`verdict`.
+
+## Collecting a real 50-vs-25 verdict
+
+The unit tests prove the analysis math; they cannot produce a verdict from this
+machine's workload. `TESTING.md` covers the full collection procedure, the drop
+rules that shrink a group, and a mid-flight progress script. Read it before
+attempting a live measurement — an idle pool drains, and a drained pool yields
+`insufficient data` rather than a number, by design.

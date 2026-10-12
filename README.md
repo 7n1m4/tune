@@ -134,6 +134,11 @@ the eviction ratio at 50 is at least 25 % lower than at 25. If either ceiling
 lacks 200 MiB of stored growth the comparison is reported as
 `insufficient data` instead of being guessed at.
 
+Collecting that verdict from a live machine takes real workload, not synthetic
+pressure: see [TESTING.md](TESTING.md) for the procedure, the interval drop rules,
+and a progress script to check mid-run whether either ceiling has reached the
+200 MiB bar.
+
 ## Building
 
 ```console
