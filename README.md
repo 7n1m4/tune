@@ -27,18 +27,18 @@ devices. Those records are what `--report` analyses.
 
 | Quantity | Value |
 | --- | --- |
-| Minimum limit | 20 % of RAM |
+| Minimum limit | 25 % of RAM |
 | Maximum limit | 50 % of RAM |
 | Step size | at most 10 percentage points per change |
 | Raise when | `MemAvailable >= 25 %` of RAM **and** ratio `>= 2.2` |
-| Lower when | ratio `< 1.5`, debounced over 3 consecutive readings, converging to 20 % |
+| Lower when | ratio `< 1.5`, debounced over 3 consecutive readings, converging to 25 % |
 | Deadband | ratio in `[1.5, 2.2)` → no action (prevents oscillation) |
 
 Rationale: raising the ceiling only helps when the pool actually compresses
 (ratio >= 2.2 means ~2.2x less RAM than disk writes would have cost) and there
 is still plenty of free RAM to spend. A pool that barely compresses (ratio <
 1.5) burns RAM on compression metadata for no benefit, so the limit is pulled
-back towards 20 %. The deadband in between is deliberately inert so the daemon
+back towards 25 %. The deadband in between is deliberately inert so the daemon
 does not oscillate.
 
 ## Important: the limit is a ceiling, not a reservation
@@ -64,16 +64,16 @@ It writes **exactly one** thing: `max_pool_percent`. It does not:
 
 ## Manual override: `/run/zswap-tune.pin`
 
-While `/run/zswap-tune.pin` exists and holds an integer in `[20, 50]`, the
+While `/run/zswap-tune.pin` exists and holds an integer in `[25, 50]`, the
 daemon uses that value as the limit and writes it to sysfs instead of consulting
 the decision path. Remove the file to hand control back:
 
 ```console
-$ sudo sh -c 'echo 40 > /run/zswap-tune.pin'   # force ceiling 40
+$ sudo sh -c 'echo 50 > /run/zswap-tune.pin'   # force ceiling 50
 $ sudo rm /run/zswap-tune.pin                  # back to automatic tuning
 ```
 
-The pin is honoured exactly as written — a value outside `[20, 50]` or one that
+The pin is honoured exactly as written — a value outside `[25, 50]` or one that
 is not an integer is ignored, not clamped.
 
 ## Usage
@@ -129,8 +129,8 @@ extra flash writes? It groups the recorded intervals by ceiling and compares:
 * **Δ NVMe write** — the recorded write volume of the swap-backed devices
   (`md0`, `sda1`), as corroboration that extra eviction really reached disk.
 
-The verdict compares ceiling 40 against ceiling 20 and reports `PASS` only when
-the eviction ratio at 40 is at least 25 % lower than at 20. If either ceiling
+The verdict compares ceiling 50 against ceiling 25 and reports `PASS` only when
+the eviction ratio at 50 is at least 25 % lower than at 25. If either ceiling
 lacks 200 MiB of stored growth the comparison is reported as
 `insufficient data` instead of being guessed at.
 

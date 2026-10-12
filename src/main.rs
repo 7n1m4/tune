@@ -9,7 +9,7 @@
 //! range for the machine it runs on:
 //!
 //! * raise it when there is plenty of free RAM **and** the workload compresses well,
-//! * lower it (towards 20 %) when the workload hardly compresses at all,
+//! * lower it (towards 25 %) when the workload hardly compresses at all,
 //! * leave it alone in the deadband between the two, to avoid oscillation.
 //!
 //! `max_pool_percent` is a *ceiling*, not a reservation: lowering it never releases
@@ -42,13 +42,13 @@ const PIN_PATH: &str = "/run/zswap-tune.pin";
 const STATS_PATH: &str = "/var/log/zswap-tune/stats.jsonl";
 
 /// Inclusive lower bound of the allowed range, in percent of RAM.
-const MIN_LIMIT: u8 = 20;
+const MIN_LIMIT: u8 = 25;
 /// Inclusive upper bound of the allowed range, in percent of RAM.
 const MAX_LIMIT: u8 = 50;
 /// Largest change applied by a single decision, in percentage points.
 const STEP: u8 = 10;
 /// Ceiling the lowering path converges to.
-const FLOOR_TARGET: u8 = 20;
+const FLOOR_TARGET: u8 = 25;
 /// Compression ratio at or above which the pool is considered worthwhile.
 const RAISE_RATIO: f64 = 2.2;
 /// Compression ratio strictly below which the pool is considered wasteful.
@@ -95,7 +95,7 @@ Without options the tool runs as a daemon, polling every 15s until stopped, and
 appends one JSON sample to /var/log/zswap-tune/stats.jsonl every 60s
 (ZSWAP_TUNE_RECORD_INTERVAL=<seconds> shortens that for testing).
 
-The pin file /run/zswap-tune.pin, when it holds an integer between 20 and 50,
+The pin file /run/zswap-tune.pin, when it holds an integer between 25 and 50,
 replaces the decision path until it is removed.
 
 It only ever writes /sys/module/zswap/parameters/max_pool_percent.
@@ -938,8 +938,8 @@ const RECORD_GAP_MAX: u64 = 300;
 /// Minimum `Δstored_pages` a ceiling group needs before it may be judged.
 const SUFFICIENT_STORED_MIB: f64 = 200.0;
 /// The ceiling the verdict has to defend, and the one it is measured against.
-const VERDICT_HIGH: u8 = 40;
-const VERDICT_LOW: u8 = 20;
+const VERDICT_HIGH: u8 = 50;
+const VERDICT_LOW: u8 = 25;
 /// Required relative advantage of the high ceiling, as a fraction.
 const REQUIRED_ADVANTAGE: f64 = 0.25;
 
@@ -1018,7 +1018,7 @@ fn analyse(records: &[Record]) -> Vec<Group> {
     groups
 }
 
-/// The verdict on the 40-vs-20 comparison, as one self-contained sentence.
+/// The verdict on the 50-vs-25 comparison, as one self-contained sentence.
 fn verdict(groups: &[Group]) -> String {
     let high = groups.iter().find(|g| g.limit == VERDICT_HIGH);
     let low = groups.iter().find(|g| g.limit == VERDICT_LOW);
@@ -1383,7 +1383,7 @@ mod tests {
 
     #[test]
     fn ratio_none_never_acts() {
-        for limit in [MIN_LIMIT, 20, 25, 30, 35, 40, 45, MAX_LIMIT] {
+        for limit in [MIN_LIMIT, 30, 35, 40, 45, MAX_LIMIT] {
             for available in [0.0, 10.0, 24.999, 25.0, 50.0, 100.0] {
                 assert_eq!(
                     decide(limit, None, available),
@@ -1410,10 +1410,10 @@ mod tests {
 
     #[test]
     fn raise_with_headroom_and_good_ratio() {
-        assert_eq!(decide(20, Some(2.2), 25.0), Some(30));
-        assert_eq!(decide(20, Some(3.0), 40.0), Some(30));
-        assert_eq!(decide(30, Some(2.7), 30.0), Some(40));
-        assert_eq!(decide(20, Some(10.0), 100.0), Some(30));
+        assert_eq!(decide(MIN_LIMIT, Some(2.2), 25.0), Some(35));
+        assert_eq!(decide(MIN_LIMIT, Some(3.0), 40.0), Some(35));
+        assert_eq!(decide(35, Some(2.7), 30.0), Some(45));
+        assert_eq!(decide(MIN_LIMIT, Some(10.0), 100.0), Some(35));
         assert_eq!(decide(35, Some(2.2), 90.0), Some(45));
     }
 
@@ -1446,7 +1446,7 @@ mod tests {
     #[test]
     fn deadband_no_action() {
         for ratio in [1.5, 1.500_001, 1.6, 1.75, 2.0, 2.1, 2.19, 2.199_999] {
-            assert_eq!(decide(20, Some(ratio), 100.0), None, "ratio={}", ratio);
+            assert_eq!(decide(MIN_LIMIT, Some(ratio), 100.0), None, "ratio={}", ratio);
             assert_eq!(decide(35, Some(ratio), 0.0), None, "ratio={}", ratio);
             assert_eq!(decide(50, Some(ratio), 50.0), None, "ratio={}", ratio);
         }
@@ -1457,16 +1457,16 @@ mod tests {
 
     #[test]
     fn boundary_available_exactly_25() {
-        assert_eq!(decide(20, Some(2.2), 25.0), Some(30));
-        assert_eq!(decide(20, Some(3.0), 25.0), Some(30));
+        assert_eq!(decide(MIN_LIMIT, Some(2.2), 25.0), Some(35));
+        assert_eq!(decide(MIN_LIMIT, Some(3.0), 25.0), Some(35));
         // A hair below is not enough headroom.
-        assert_eq!(decide(20, Some(3.0), 24.999_999), None);
+        assert_eq!(decide(MIN_LIMIT, Some(3.0), 24.999_999), None);
     }
 
     #[test]
     fn boundary_ratio_exactly_2_2() {
-        assert_eq!(decide(20, Some(2.2), 25.0), Some(30));
-        assert_eq!(decide(20, Some(2.2), 100.0), Some(30));
+        assert_eq!(decide(MIN_LIMIT, Some(2.2), 25.0), Some(35));
+        assert_eq!(decide(MIN_LIMIT, Some(2.2), 100.0), Some(35));
         // Below the threshold inside the deadband.
         assert_eq!(decide(20, Some(2.199_999), 100.0), None);
     }
@@ -1481,11 +1481,11 @@ mod tests {
 
     #[test]
     fn nan_ratio_no_action() {
-        assert_eq!(decide(20, Some(f64::NAN), 100.0), None);
+        assert_eq!(decide(MIN_LIMIT, Some(f64::NAN), 100.0), None);
         assert_eq!(decide(50, Some(f64::NAN), 0.0), None);
         assert_eq!(decide(35, Some(f64::NAN), 50.0), None);
         // Infinities are just as unusable as NaN.
-        assert_eq!(decide(20, Some(f64::INFINITY), 100.0), None);
+        assert_eq!(decide(MIN_LIMIT, Some(f64::INFINITY), 100.0), None);
         assert_eq!(decide(50, Some(f64::NEG_INFINITY), 0.0), None);
     }
 
@@ -1561,7 +1561,7 @@ Zswapped:         723448 kB
         // Zero pool (zswap enabled but empty) must not divide by zero either.
         let empty = "MemTotal:  1000 kB\nMemAvailable:  900 kB\nZswap:  0 kB\nZswapped:  0 kB\n";
         assert_eq!(MemInfo::from_text(empty).ratio(), None);
-        assert_eq!(decide(20, MemInfo::from_text(empty).ratio(), 90.0), None);
+        assert_eq!(decide(MIN_LIMIT, MemInfo::from_text(empty).ratio(), 90.0), None);
     }
 
     // -- recording, pin and report surface ---------------------------------
@@ -1595,33 +1595,33 @@ Zswapped:         723448 kB
     fn fixture_parses_into_two_ceiling_groups() {
         let groups = fixture_groups();
         assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].limit, 20, "lowest ceiling first");
-        assert_eq!(groups[1].limit, 40);
+        assert_eq!(groups[0].limit, 25, "lowest ceiling first");
+        assert_eq!(groups[1].limit, 50);
     }
 
     #[test]
     fn fixture_interval_count_matches_records() {
         let groups = fixture_groups();
         // The fixture holds one contiguous run per ceiling, so every interval
-        // belongs to the ceiling that opened it: 4 records at 20% yield 3
-        // intervals, 6 records at 40% yield 5.
+        // belongs to the ceiling that opened it: 4 records at 25% yield 3
+        // intervals, 6 records at 50% yield 5.
         let total: usize = groups.iter().map(|g| g.samples).sum();
         assert_eq!(total, 8);
-        assert_eq!(group(&groups, 20).samples, 3);
-        assert_eq!(group(&groups, 40).samples, 5);
+        assert_eq!(group(&groups, 25).samples, 3);
+        assert_eq!(group(&groups, 50).samples, 5);
     }
 
     #[test]
     fn fixture_per_ceiling_deltas() {
         let groups = fixture_groups();
 
-        let low = group(&groups, 20);
+        let low = group(&groups, 25);
         assert_eq!(low.stored_bytes, 180000 * PAGE_BYTES);
         assert_eq!(low.written_bytes, 4000 * PAGE_BYTES);
         assert!((low.stored_mib() - 703.125).abs() < 1e-6);
         assert!((low.written_mib() - 15.625).abs() < 1e-6);
 
-        let high = group(&groups, 40);
+        let high = group(&groups, 50);
         assert_eq!(high.stored_bytes, 212000 * PAGE_BYTES);
         assert_eq!(high.written_bytes, 14600 * PAGE_BYTES);
         assert!((high.stored_mib() - 828.125).abs() < 1e-6);
@@ -1631,8 +1631,8 @@ Zswapped:         723448 kB
     #[test]
     fn fixture_eviction_ratios() {
         let groups = fixture_groups();
-        assert!((group(&groups, 20).eviction_ratio().unwrap() - 0.022222).abs() < 1e-6);
-        assert!((group(&groups, 40).eviction_ratio().unwrap() - 0.068867).abs() < 1e-6);
+        assert!((group(&groups, 25).eviction_ratio().unwrap() - 0.022222).abs() < 1e-6);
+        assert!((group(&groups, 50).eviction_ratio().unwrap() - 0.068867).abs() < 1e-6);
     }
 
     #[test]
@@ -1641,8 +1641,8 @@ Zswapped:         723448 kB
         // Each ceiling owns only the writes that happened while it was in
         // force, so the two groups sum to more than a first-to-last difference
         // that ignored the ceiling change between them.
-        assert_eq!(group(&groups, 20).write_bytes, 179_201_024);
-        assert_eq!(group(&groups, 40).write_bytes, 274_121_216);
+        assert_eq!(group(&groups, 25).write_bytes, 179_201_024);
+        assert_eq!(group(&groups, 50).write_bytes, 274_121_216);
         let total: u64 = groups.iter().map(|g| g.write_bytes).sum();
         assert_eq!(total, 453_322_240);
     }
@@ -1668,7 +1668,7 @@ Zswapped:         723448 kB
         let total: u64 = groups.iter().map(|g| g.write_bytes).sum();
         // Both device counters only ever grow, so the groups can never sum to
         // more than the overall net difference. They legitimately sum to less:
-        // the interval straddling the 20->40 change is not attributed to
+        // the interval straddling the 25->50 change is not attributed to
         // either ceiling, and its writes are excluded from the evidence
         // because no ceiling was in force for the whole of it.
         assert!(
@@ -1739,10 +1739,10 @@ Zswapped:         723448 kB
     #[test]
     fn fixture_verdict_names_both_ceilings_and_fails() {
         let verdict = verdict(&fixture_groups());
-        // Ceiling 40 evicts almost twice as much: the bar is not met.
+        // Ceiling 50 evicts almost twice as much: the bar is not met.
         assert!(verdict.starts_with("FAIL:"), "verdict was {:?}", verdict);
-        assert!(verdict.contains("ceiling 40"), "verdict was {:?}", verdict);
-        assert!(verdict.contains("ceiling 20"), "verdict was {:?}", verdict);
+        assert!(verdict.contains("ceiling 50"), "verdict was {:?}", verdict);
+        assert!(verdict.contains("ceiling 25"), "verdict was {:?}", verdict);
         assert!(verdict.contains("at least 25% lower"), "verdict was {:?}", verdict);
     }
 
@@ -1816,7 +1816,10 @@ Zswapped:         723448 kB
         let text = verdict(&[high.clone(), low.clone()]);
         assert!(text.starts_with("INCONCLUSIVE:"), "verdict was {:?}", text);
         assert!(
-            text.contains("ceiling 40 is insufficient data (<200 MiB)"),
+            text.contains(&format!(
+                "ceiling {} is insufficient data (<200 MiB)",
+                VERDICT_HIGH
+            )),
             "verdict was {:?}",
             text
         );
@@ -1830,11 +1833,14 @@ Zswapped:         723448 kB
             },
         ]);
         assert!(
-            both_small.contains("ceiling 20 is insufficient data (<200 MiB)"),
+            both_small.contains(&format!(
+                "ceiling {} is insufficient data (<200 MiB)",
+                VERDICT_LOW
+            )),
             "verdict was {:?}",
             both_small
         );
-        assert!(both_small.contains("40-vs-20"), "verdict was {:?}", both_small);
+        assert!(both_small.contains("50-vs-25"), "verdict was {:?}", both_small);
     }
 
     #[test]
@@ -1853,9 +1859,9 @@ Zswapped:         723448 kB
             "verdict was {:?}",
             low_only
         );
-        assert!(low_only.contains("40-vs-20"), "verdict was {:?}", low_only);
+        assert!(low_only.contains("50-vs-25"), "verdict was {:?}", low_only);
         assert!(
-            low_only.contains("ceiling 40 has no recorded samples"),
+            low_only.contains("ceiling 50 has no recorded samples"),
             "verdict was {:?}",
             low_only
         );
@@ -1863,7 +1869,7 @@ Zswapped:         723448 kB
         // Nothing at all is the same story, told once.
         let empty = verdict(&[]);
         assert!(empty.starts_with("INCONCLUSIVE:"), "verdict was {:?}", empty);
-        assert!(empty.contains("40-vs-20"), "verdict was {:?}", empty);
+        assert!(empty.contains("50-vs-25"), "verdict was {:?}", empty);
     }
 
     #[test]
@@ -1986,7 +1992,7 @@ Zswapped:         723448 kB
         // Valid values are used verbatim; anything else falls back to Auto.
         assert!(!std::path::Path::new(PIN_PATH).exists(), "live pin must be absent");
 
-        for raw in ["19", "51", "0", "255", "abc", "", " ", "40.5", "-30"] {
+        for raw in ["24", "51", "0", "20", "255", "abc", "", " ", "40.5", "-30"] {
             assert_eq!(
                 parse_pin_text(raw),
                 Override::Auto,
@@ -1995,7 +2001,7 @@ Zswapped:         723448 kB
             );
         }
         // Surrounding whitespace, including a trailing newline, is expected.
-        for raw in ["20", "30", "35", "40", "50", "  42\n", "\n42\n"] {
+        for raw in ["25", "30", "35", "40", "50", "  42\n", "\n42\n"] {
             assert_ne!(
                 parse_pin_text(raw),
                 Override::Auto,
@@ -2004,7 +2010,7 @@ Zswapped:         723448 kB
             );
         }
         assert_eq!(parse_pin_text("42"), Override::Pin(42));
-        assert_eq!(parse_pin_text("20"), Override::Pin(20));
+        assert_eq!(parse_pin_text("25"), Override::Pin(25));
         assert_eq!(parse_pin_text("50"), Override::Pin(50));
         assert_eq!(parse_pin_text(" garbage "), Override::Auto);
     }
@@ -2015,8 +2021,11 @@ Zswapped:         723448 kB
         // valid pin, not something to nudge towards the middle.
         assert_eq!(Override::Pin(MIN_LIMIT).limit(), Some(MIN_LIMIT));
         assert_eq!(Override::Pin(MAX_LIMIT).limit(), Some(MAX_LIMIT));
-        assert_eq!(parse_pin_text("19"), Override::Auto);
+        assert_eq!(parse_pin_text("24"), Override::Auto);
         assert_eq!(parse_pin_text("51"), Override::Auto);
+        // The new floor is itself a legitimate pin, and 20 is no longer in range.
+        assert_eq!(parse_pin_text("25"), Override::Pin(25));
+        assert_eq!(parse_pin_text("20"), Override::Auto);
     }
 
     #[test]

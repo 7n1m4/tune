@@ -20,7 +20,7 @@ turns the recording into an evidence-backed verdict.
 | **Zero third-party crates** | Deliberate. `Cargo.toml` must have no `[dependencies]`. `Cargo.lock` is committed (binary crate, trivially stable). |
 | **Never blocks or panics** | A transient `/proc` or debugfs read failure is logged and skipped. The decision poll never stalls on a failed read. |
 | **Writes exactly one path** | `/sys/module/zswap/parameters/max_pool_percent`. Nothing else, ever. |
-| **Decision semantics frozen** | `decide()`, the 15 s poll, the 10 pp step and the `[20, 50]` clamp are pinned by the original 15 unit tests. Do not change them. |
+| **Decision semantics frozen** | `decide()`, the 15 s poll, the 10 pp step and the `[25, 50]` clamp are pinned by the original 15 unit tests. Do not change them. |
 
 ## Layout
 
@@ -77,8 +77,8 @@ meminfo/parameter view plus one explanatory line and still exits 0.
 ## Policy (do not alter without updating README + the 15 original tests)
 
 Raise when `MemAvailable >= 25 %` **and** ratio `>= 2.2`; lower when ratio
-`< 1.5`, debounced over 3 consecutive readings, converging to 20 %; deadband in
-`[1.5, 2.2)` is inert. A change is at most 10 pp, clamped to `[20, 50]`. The limit
+`< 1.5`, debounced over 3 consecutive readings, converging to 25 %; deadband in
+`[1.5, 2.2)` is inert. A change is at most 10 pp, clamped to `[25, 50]`. The limit
 is a **ceiling, not a reservation** — lowering it never frees RAM.
 
 ## CLI surface
@@ -92,7 +92,7 @@ $ zswap-tune --report [PATH]    # per-ceiling deltas + verdict
 ```
 
 `ZSWAP_TUNE_RECORD_INTERVAL=<seconds>` shortens the 60 s cadence for testing.
-`/run/zswap-tune.pin` holding an integer in `[20, 50]` replaces the decision path;
+`/run/zswap-tune.pin` holding an integer in `[25, 50]` replaces the decision path;
 it is honoured verbatim, never clamped; removing it restores `decide()`.
 
 ## Operating note (this machine)
