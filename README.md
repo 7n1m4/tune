@@ -1,5 +1,10 @@
 # zswap-tune
 
+> **Save every megabyte.** Consumer hardware runs AI agents, browsers and
+> container fleets that were sized for a datacenter, and RAM is the one resource
+> a developer cannot stripe across a RAID of NVMe drives. This tool compresses
+> swap instead of pretending the hardware is bigger.
+
 A tiny, dependency-free Rust daemon that live-tunes one kernel parameter:
 `/sys/module/zswap/parameters/max_pool_percent`.
 
