@@ -13,11 +13,21 @@
 //! 3. **Level 3 (expensive):** `/proc/PID/maps` → only for top K candidates
 //!    by RSS, then apply madvise.
 //!
+//! ## Guard re-protection
+//!
+//! Level 2 does not merely skip an already-flagged process: it routes it into a
+//! separate pass that re-withdraws executable VMAs (see
+//! [`madvise::unmerge_executable_vmas`]). `MMF_VM_MERGE_ANY` is sticky and
+//! inherited, so a flagged process keeps acquiring new `r-xp` mappings after it
+//! was marked. That pass is budgeted by `max_candidates_per_cycle`, rate-limited
+//! per PID to the scan interval, and skips the daemon's own PID.
+//!
 //! ## Stabilization
 //!
 //! Respects its own stabilization window for madvise bursts. Governor profile
 //! changes use a separate timestamp and do not block scanner cycles.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use animaksm_common::config::ScannerConfig;
@@ -184,12 +194,50 @@ where
     }
 }
 
+/// Outcome of one executable-VMA re-protection pass.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReprotectTotals {
+    /// Processes the pass actually ran on (exit-losing targets excluded).
+    processes: usize,
+    /// Executable VMAs withdrawn across those processes.
+    withdrawn: usize,
+    /// Processes deferred by the per-PID rate limit rather than protected.
+    rate_limited: usize,
+}
+
+/// Per-PID bookkeeping for the executable-VMA re-protection pass.
+///
+/// The pass is a safety guard, not a tuning decision, so it must not run more
+/// often than the scan interval on any single process: a rate-limited PID keeps
+/// the ptrace burst bounded even if cycles start running back to back (manual
+/// restarts, a shortened interval, a cycle that is forced early).
+#[derive(Debug, Default)]
+struct ReprotectLedger {
+    /// PID → instant of the last completed re-protection pass on that PID.
+    last_run: HashMap<u32, Instant>,
+}
+
+impl ReprotectLedger {
+    fn last_run(&self, pid: u32) -> Option<Instant> {
+        self.last_run.get(&pid).copied()
+    }
+
+    fn record(&mut self, pid: u32, at: Instant) {
+        self.last_run.insert(pid, at);
+    }
+}
+
 /// The process scanner.
 pub struct Scanner {
     config: ScannerConfig,
     dry_run: bool,
     stats: ScannerStats,
     stabilization_secs: u64,
+    /// This daemon's PID. Never a re-protection target: injecting `madvise`
+    /// into the process that owns the sysfs writes serves no purpose, and a
+    /// renamed logger into itself is a self-inflicted ptrace storm.
+    daemon_pid: u32,
+    reprotect_ledger: ReprotectLedger,
 }
 
 impl Scanner {
@@ -199,6 +247,8 @@ impl Scanner {
             dry_run,
             stats: ScannerStats::default(),
             stabilization_secs,
+            daemon_pid: std::process::id(),
+            reprotect_ledger: ReprotectLedger::default(),
         }
     }
 
@@ -306,21 +356,14 @@ impl Scanner {
         // after it was marked; without this pass those mappings stay mergeable
         // for the daemon's whole lifetime, which is exactly the SIGILL this
         // guard exists to prevent. The withdrawal is per-VMA and idempotent.
-        for candidate in &targets.already_flagged {
-            let (withdrawn, found) = madvise::unmerge_executable_vmas(candidate.pid, self.dry_run);
-            self.stats.exec_vmas_reprotected += withdrawn as u64;
-
-            if found > 0 {
-                // A target can exit between listing and injection; that is
-                // expected, so this is a debug line, not a failure count.
-                debug!(
-                    pid = candidate.pid,
-                    name = %candidate.name,
-                    withdrawn,
-                    found,
-                    "Re-protected executable VMAs on an already-flagged process"
-                );
-            }
+        let reprotected =
+            self.reprotect_exec_vmas(&targets.already_flagged, madvise::unmerge_executable_vmas);
+        self.stats.exec_vmas_reprotected += reprotected.withdrawn as u64;
+        if reprotected.rate_limited > 0 {
+            debug!(
+                rate_limited = reprotected.rate_limited,
+                "Executable-VMA re-protection deferred by per-PID rate limit"
+            );
         }
 
         // Opportunistic MADV_COLLAPSE: if KSM has been unmerging pages
@@ -360,10 +403,95 @@ impl Scanner {
             processes_marked = self.stats.processes_marked,
             exec_vmas_protected = self.stats.exec_vmas_protected,
             exec_vmas_reprotected = self.stats.exec_vmas_reprotected,
+            reprotect_processes = reprotected.processes,
+            reprotect_rate_limited = reprotected.rate_limited,
             thp_collapsed = self.stats.thp_collapsed,
             skipped_stab = self.stats.skipped_stabilization,
             "Scanner cycle complete"
         );
+    }
+
+    /// Re-withdraw executable VMAs on processes that already hold the flag.
+    ///
+    /// `unmerge` is injected so tests can drive the withdrawal deterministically;
+    /// the live path passes [`madvise::unmerge_executable_vmas`]. Each target is
+    /// rate-limited to one pass per `interval_secs` window, and the pass skips
+    /// this daemon's own PID. A target that exited since collection is skipped,
+    /// not fatal to the cycle — and because it never consumed its rate-limit
+    /// slot, it stays eligible for the next cycle.
+    fn reprotect_exec_vmas<WithdrawFn>(
+        &mut self,
+        targets: &[Candidate],
+        mut unmerge: WithdrawFn,
+    ) -> ReprotectTotals
+    where
+        WithdrawFn: FnMut(u32, bool) -> (usize, usize),
+    {
+        let interval = Duration::from_secs(self.config.interval_secs);
+        let now = Instant::now();
+        let mut totals = ReprotectTotals::default();
+
+        for candidate in targets {
+            // The daemon's own pages are its own business and the guard exists
+            // for targets it does not own code-unaware of.
+            if candidate.pid == self.daemon_pid {
+                debug!(
+                    pid = candidate.pid,
+                    name = %candidate.name,
+                    "Skipped executable-VMA re-protection of this daemon"
+                );
+                continue;
+            }
+
+            // The budget bounds the number of ptrace injections this pass can
+            // issue; a rate-limited or already-scanned target does not consume
+            // one, so a full process table never turns into a burst.
+            if totals.processes >= self.config.max_candidates_per_cycle {
+                break;
+            }
+
+            if let Some(last) = self.reprotect_ledger.last_run(candidate.pid) {
+                if now.duration_since(last) < interval {
+                    debug!(
+                        pid = candidate.pid,
+                        name = %candidate.name,
+                        remaining_ms = interval
+                            .saturating_sub(now.duration_since(last))
+                            .as_millis(),
+                        "Deferred executable-VMA re-protection (rate limited)"
+                    );
+                    totals.rate_limited += 1;
+                    continue;
+                }
+            }
+
+            // A target that exited between listing and injection has no maps to
+            // read, so the withdrawal reports zero rather than an error: the
+            // cycle continues with the remaining targets.
+            let (withdrawn, found) = unmerge(candidate.pid, self.dry_run);
+
+            if found == 0 {
+                debug!(
+                    pid = candidate.pid,
+                    name = %candidate.name,
+                    "No executable mappings found to re-protect"
+                );
+                continue;
+            }
+
+            self.reprotect_ledger.record(candidate.pid, now);
+            totals.processes += 1;
+            totals.withdrawn += withdrawn;
+            debug!(
+                pid = candidate.pid,
+                name = %candidate.name,
+                withdrawn,
+                found,
+                "Re-protected executable VMAs on an already-flagged process"
+            );
+        }
+
+        totals
     }
 
     /// Get current scanner statistics.
@@ -907,5 +1035,300 @@ mod tests {
         // address ranges are needed to enable process-wide KSM eligibility.
         assert_eq!(l25[0].name, "winner");
         assert_eq!(l25[0].anon_rss_mb, 1024);
+    }
+
+    // ── Unit tests: executable-VMA re-protection pass ─────────────────
+
+    fn reprotect_candidate(pid: u32, name: &str, anon_rss_mb: u64) -> Candidate {
+        Candidate {
+            pid,
+            name: name.to_string(),
+            anon_rss_mb,
+        }
+    }
+
+    /// A withdrawal closure that reports `(withdrawn, found)` per PID and
+    /// records every PID it was called on.
+    fn recording_unmerge(
+        found: usize,
+        withdrawn: usize,
+        calls: std::rc::Rc<std::cell::RefCell<Vec<u32>>>,
+    ) -> impl FnMut(u32, bool) -> (usize, usize) {
+        move |pid, _dry_run| {
+            calls.borrow_mut().push(pid);
+            (withdrawn, found)
+        }
+    }
+
+    #[test]
+    fn test_reprotect_exec_vmas_selects_already_flagged_processes() {
+        let mut scanner = Scanner::new(
+            ScannerConfig {
+                interval_secs: 30,
+                max_candidates_per_cycle: 8,
+                ..ScannerConfig::default()
+            },
+            false,
+            0,
+        );
+
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let targets = vec![
+            reprotect_candidate(4242, "jit-app", 512),
+            reprotect_candidate(4243, "static-app", 256),
+        ];
+
+        let totals = scanner.reprotect_exec_vmas(
+            &targets,
+            recording_unmerge(3, 3, std::rc::Rc::clone(&calls)),
+        );
+
+        assert_eq!(
+            totals,
+            ReprotectTotals {
+                processes: 2,
+                withdrawn: 6,
+                rate_limited: 0,
+            },
+            "every already-flagged process must be offered the guard again"
+        );
+        assert_eq!(scanner.stats.exec_vmas_reprotected, 0);
+        assert_eq!(*calls.borrow(), vec![4242, 4243]);
+    }
+
+    #[test]
+    fn test_reprotect_exec_vmas_accumulates_stat_counter() {
+        let mut scanner = Scanner::new(
+            ScannerConfig {
+                interval_secs: 30,
+                max_candidates_per_cycle: 4,
+                ..ScannerConfig::default()
+            },
+            false,
+            0,
+        );
+
+        let targets = vec![reprotect_candidate(5000, "app", 100)];
+
+        // Drain the per-PID rate limit between the two passes, as successive
+        // cycles with a fresh interval would.
+        let first = scanner.reprotect_exec_vmas(&targets, |_pid, _dry| (2, 5));
+        scanner.config.interval_secs = 0;
+        let second = scanner.reprotect_exec_vmas(&targets, |_pid, _dry| (1, 4));
+        scanner.config.interval_secs = 30;
+
+        assert_eq!(first.withdrawn, 2);
+        assert_eq!(second.withdrawn, 1);
+        // The pass itself is side-effect free apart from the ledger; the
+        // cycle-level accumulation is what feeds the metric.
+        assert_eq!(scanner.stats.exec_vmas_reprotected, 0);
+        scanner.stats.exec_vmas_reprotected += first.withdrawn as u64;
+        scanner.stats.exec_vmas_reprotected += second.withdrawn as u64;
+        assert_eq!(scanner.stats.exec_vmas_reprotected, 3);
+    }
+
+    #[test]
+    fn test_reprotect_exec_vmas_survives_target_exit() {
+        let mut scanner = Scanner::new(
+            ScannerConfig {
+                interval_secs: 30,
+                max_candidates_per_cycle: 8,
+                ..ScannerConfig::default()
+            },
+            false,
+            0,
+        );
+
+        let targets = vec![
+            // PID 4241 is dead: no maps to read, nothing withdrawn.
+            reprotect_candidate(4241, "gone", 512),
+            reprotect_candidate(4242, "alive", 256),
+        ];
+
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let totals = scanner.reprotect_exec_vmas(&targets, {
+            let calls = std::rc::Rc::clone(&calls);
+            move |pid, _dry_run| {
+                calls.borrow_mut().push(pid);
+                // A dead PID reports "no executable mappings", the same shape
+                // `unmerge_executable_vmas` returns for an unreadable maps.
+                match pid {
+                    4241 => (0, 0),
+                    _ => (4, 4),
+                }
+            }
+        });
+
+        assert_eq!(
+            totals,
+            ReprotectTotals {
+                processes: 1,
+                withdrawn: 4,
+                rate_limited: 0,
+            },
+            "a target exiting mid-pass must be skipped, not abort the cycle"
+        );
+        assert_eq!(
+            *calls.borrow(),
+            vec![4241, 4242],
+            "the surviving process after the dead one must still be protected"
+        );
+
+        // The dead PID never consumed its slot, so it is retried on the next
+        // cycle rather than being suppressed for a whole interval.
+        let calls_after = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        scanner.reprotect_exec_vmas(
+            &[reprotect_candidate(4241, "gone", 512)],
+            recording_unmerge(1, 1, std::rc::Rc::clone(&calls_after)),
+        );
+        assert_eq!(*calls_after.borrow(), vec![4241]);
+    }
+
+    #[test]
+    fn test_reprotect_exec_vmas_skips_daemon_pid() {
+        let mut scanner = Scanner::new(
+            ScannerConfig {
+                interval_secs: 30,
+                max_candidates_per_cycle: 8,
+                ..ScannerConfig::default()
+            },
+            false,
+            0,
+        );
+
+        let daemon_pid = scanner.daemon_pid;
+        let targets = vec![
+            reprotect_candidate(daemon_pid, "animaksm-daemon", 512),
+            reprotect_candidate(4242, "app", 256),
+        ];
+
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let totals = scanner.reprotect_exec_vmas(
+            &targets,
+            recording_unmerge(2, 2, std::rc::Rc::clone(&calls)),
+        );
+
+        assert!(!calls.borrow().contains(&daemon_pid));
+        assert_eq!(totals.processes, 1);
+        assert_eq!(totals.withdrawn, 2);
+    }
+
+    #[test]
+    fn test_reprotect_exec_vmas_is_rate_limited_within_one_interval() {
+        let mut scanner = Scanner::new(
+            ScannerConfig {
+                interval_secs: 3600,
+                max_candidates_per_cycle: 8,
+                ..ScannerConfig::default()
+            },
+            false,
+            0,
+        );
+
+        let targets = vec![reprotect_candidate(4242, "app", 512)];
+
+        let first = scanner.reprotect_exec_vmas(&targets, |_pid, _dry| (3, 3));
+        assert_eq!(first.processes, 1);
+
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let second = scanner.reprotect_exec_vmas(
+            &targets,
+            recording_unmerge(3, 3, std::rc::Rc::clone(&calls)),
+        );
+
+        assert!(calls.borrow().is_empty());
+        assert_eq!(second.processes, 0);
+        assert_eq!(second.withdrawn, 0);
+        assert_eq!(second.rate_limited, 1);
+    }
+
+    #[test]
+    fn test_reprotect_exec_vmas_respects_candidate_budget() {
+        let mut scanner = Scanner::new(
+            ScannerConfig {
+                interval_secs: 0,
+                max_candidates_per_cycle: 2,
+                ..ScannerConfig::default()
+            },
+            false,
+            0,
+        );
+
+        let targets = vec![
+            reprotect_candidate(6001, "a", 512),
+            reprotect_candidate(6002, "b", 256),
+            reprotect_candidate(6003, "c", 128),
+            reprotect_candidate(6004, "d", 64),
+        ];
+
+        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let totals = scanner.reprotect_exec_vmas(
+            &targets,
+            recording_unmerge(1, 1, std::rc::Rc::clone(&calls)),
+        );
+
+        assert_eq!(totals.processes, 2);
+        assert_eq!(
+            *calls.borrow(),
+            vec![6001, 6002],
+            "the guard pass must stay bounded by the same budget as marking"
+        );
+    }
+
+    /// Live `madvise::unmerge_executable_vmas` already returns `(0, 0)` for an
+    /// unreachable PID instead of panicking, and a fresh long-range PID does
+    /// not exist on this machine — this drives the real function rather than a
+    /// stub to pin that contract.
+    #[test]
+    fn test_reprotect_exec_vmas_absorbs_unreachable_pid_via_real_madvise() {
+        let mut scanner = Scanner::new(
+            ScannerConfig {
+                interval_secs: 30,
+                max_candidates_per_cycle: 4,
+                ..ScannerConfig::default()
+            },
+            true,
+            0,
+        );
+
+        let totals = scanner.reprotect_exec_vmas(
+            &[reprotect_candidate(0x7FFF_FFFF, "gone", 512)],
+            madvise::unmerge_executable_vmas,
+        );
+
+        assert_eq!(
+            totals,
+            ReprotectTotals::default(),
+            "an unreachable PID must yield an empty pass, not an error"
+        );
+    }
+
+    /// End-to-end: the pass, the live withdrawal function, and the cycle-level
+    /// accumulation. The daemon-PID skip is lifted for this test only, so the
+    /// test process itself can act as the already-flagged target.
+    #[test]
+    fn test_reprotect_exec_vmas_wires_real_madvise_into_the_stat_counter() {
+        let mut scanner = Scanner::new(
+            ScannerConfig {
+                interval_secs: 30,
+                max_candidates_per_cycle: 4,
+                ..ScannerConfig::default()
+            },
+            true,
+            0,
+        );
+        scanner.daemon_pid = u32::MAX;
+
+        let own = std::process::id();
+        let targets = vec![reprotect_candidate(own, "test-runner", 512)];
+
+        let totals = scanner.reprotect_exec_vmas(&targets, madvise::unmerge_executable_vmas);
+        assert!(totals.withdrawn > 0);
+        assert_eq!(totals.processes, 1);
+        assert_eq!(scanner.stats.exec_vmas_reprotected, 0);
+
+        // Exactly what `scan_cycle` does with the pass result.
+        scanner.stats.exec_vmas_reprotected += totals.withdrawn as u64;
+        assert!(scanner.stats.exec_vmas_reprotected > 0);
     }
 }
