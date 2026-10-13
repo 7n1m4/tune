@@ -215,6 +215,46 @@ Every subcommand (`run`, `status`, `stats`, `restore-ksm`) takes
 `--config <path>`, defaulting to `/etc/animaksm.toml`; only `run` has
 `--dry-run`.
 
+### Field-testing a live run
+
+Before trusting the daemon on a machine you use, do a supervised run and watch
+three things.
+
+**1. Confirm KSM actually gets enabled.** The daemon snapshots `/sys/kernel/mm/ksm/run`
+before it starts and restores it on SIGTERM — even to `run=0`.
+
+```bash
+$ cat /sys/kernel/mm/ksm/run          # baseline, before starting the daemon
+```
+
+**2. Watch the scanner cycle logs.** These are the lines that prove the guard is
+live rather than theoretically present:
+
+```bash
+$ journalctl -u animaksm -f | grep 'scanner cycle'
+```
+
+`exec_vmas_protected` should be non-zero the first time a process is marked, and
+`exec_vmas_reprotected` should start becoming non-zero on later cycles once a
+browser or JIT-using process is flagged.
+
+**3. Check for the failure the guard prevents** — the whole point of the run:
+
+```bash
+$ sudo dmesg -wT | grep -i 'trap invalid opcode'
+```
+
+Any hit here involving your browser is the executable-VMA guard failing to keep
+up, not a coincidence. Stop the daemon, restart the browser, and file an issue.
+
+```bash
+$ sudo systemctl stop animaksm        # restores KSM state from the snapshot
+```
+
+The browser does not need restarting to clear the flag after the fixed code is
+in place — but if you ever ran an unfixed build, restart it anyway: the flag is
+sticky and inherited.
+
 ---
 
 ## Example Output
@@ -253,8 +293,16 @@ collector) can pick up directly:
 ```
 animaksm: ksm pages_shared=0 pages_sharing=0 general_profit=0 full_scans=0
 animaksm: governor level=3 pressure=medium target=3 psi_some=0.66 psi_full=0.65
-animaksm: scanner targeted=3 marked_mib=291 cycles=4
+animaksm: scanner targeted=3 processes_marked=3 exec_vmas_protected=104 \
+          exec_vmas_reprotected=0 thp_collapsed=0 cycles=4
 ```
+
+`exec_vmas_protected` counts executable VMAs withdrawn at marking time;
+`exec_vmas_reprotected` counts those withdrawn again on processes already
+holding the flag, because a browser keeps mapping new `r-xp` regions (JIT,
+fresh renderers) after it was flagged. A healthy long-running daemon shows the
+second number non-zero — if it is permanently zero while browsers are targeted,
+the guard is not re-running and the process is unprotected again.
 
 To alert on KSM effectiveness, watch `general_profit` (saved memory minus
 overhead) and `pages_sharing` — the two numbers that say whether KSM is
@@ -275,8 +323,9 @@ actually earning its CPU.
 │                                                │             │
 │                         ┌──────────────────────▼──────────┐  │
 │                         │     Eligibility Injector (PTrace) │
-│                         │  • Attach → vDSO syscall → Detach │  │
-│                         │  • PR_SET_MEMORY_MERGE injection │  │
+│                         │  • Attach → vDSO syscall → Detach │
+│                         │  • PR_SET_MEMORY_MERGE injection │
+│                         │  • MADV_UNMERGEABLE on r-xp VMAs │
 │                         │  • MADV_COLLAPSE (process_madvise)│ │
 │                         └──────────────┬──────────────────┘  │
 │                                        │                      │

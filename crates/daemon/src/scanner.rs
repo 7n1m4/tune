@@ -40,6 +40,10 @@ pub struct ScannerStats {
     /// means the guard in `madvise::enable_merge_any` ran; the guard exists
     /// because in-tree KSM's `merge_any` gate does not exclude `VM_EXEC`.
     pub exec_vmas_protected: u64,
+    /// Executable VMAs withdrawn again on processes already holding the flag.
+    /// A browser maps new `r-xp` regions (JIT, fresh renderers) after it was
+    /// flagged, so the guard must re-run, not merely run once.
+    pub exec_vmas_reprotected: u64,
     pub injection_failures: u64,
     pub scan_cycles: u64,
     pub skipped_stabilization: u64,
@@ -82,13 +86,25 @@ fn passes_l25_profit_filter(ksm_stat: Option<&KsmProcStat>) -> bool {
     ksm_stat.map(|s| s.process_profit >= 0).unwrap_or(true)
 }
 
+/// Candidates from Level 1, plus the set that already holds the KSM flag.
+///
+/// Already-flagged processes are returned rather than dropped: the
+/// executable-VMA guard has to re-run on them, because new `r-xp` mappings
+/// appear after the flag was set and are otherwise never withdrawn.
+struct ScanTargets {
+    /// Processes that passed L1/L2/L2.5 and are eligible to be marked.
+    to_mark: Vec<Candidate>,
+    /// Processes that already hold `merge_any` and need the guard re-applied.
+    already_flagged: Vec<Candidate>,
+}
+
 fn collect_scan_targets<StatusFn, KsmFn>(
     config: &ScannerConfig,
     pids: Vec<u32>,
     stats: &mut ScannerStats,
     mut read_status: StatusFn,
     mut read_ksm_stat: KsmFn,
-) -> Vec<Candidate>
+) -> ScanTargets
 where
     StatusFn: FnMut(u32) -> Option<ProcessStatus>,
     KsmFn: FnMut(u32) -> Option<KsmProcStat>,
@@ -110,15 +126,22 @@ where
 
     if l1_candidates.is_empty() {
         debug!("No processes passed Level 1 RSS filter");
-        return Vec::new();
+        return ScanTargets {
+            to_mark: Vec::new(),
+            already_flagged: Vec::new(),
+        };
     }
 
     let mut l25_candidates: Vec<Candidate> = Vec::new();
+    let mut already_flagged: Vec<Candidate> = Vec::new();
     let mut l2_passed_count = 0u64;
 
     for candidate in l1_candidates {
         let ksm_stat = read_ksm_stat(candidate.pid);
         if !passes_l2_already_merged_filter(ksm_stat.as_ref()) {
+            // Already mergeable: not a marking target, but its executable
+            // mappings still need the guard re-applied every cycle.
+            already_flagged.push(candidate);
             continue;
         }
         l2_passed_count += 1;
@@ -137,11 +160,6 @@ where
 
     stats.processes_filtered_l2 += l2_passed_count;
 
-    if l25_candidates.is_empty() {
-        debug!("All candidates filtered by KSM status or negative profit");
-        return Vec::new();
-    }
-
     l25_candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.anon_rss_mb));
     l25_candidates.truncate(config.max_candidates_per_cycle);
 
@@ -149,12 +167,21 @@ where
         debug!("No Level 3 targets after eligibility filters");
     }
 
+    // The guard pass is a safety check, not a tuning decision, so it takes the
+    // same budget as the marking pass: bounded, cheapest-vs-complexity, and it
+    // never expands into a full process-table ptrace burst.
+    already_flagged.sort_by_key(|candidate| std::cmp::Reverse(candidate.anon_rss_mb));
+    already_flagged.truncate(config.max_candidates_per_cycle);
+
     // Process-wide eligibility needs no address ranges, so the merge population
     // is never derived from `/proc/PID/maps` — that is what makes this
     // dramatically cheaper than the per-region `madvise` approach it replaces.
     // Maps is still read once per marked PID, but only to withdraw executable
     // VMAs (see `madvise::unmerge_executable_vmas`).
-    l25_candidates
+    ScanTargets {
+        to_mark: l25_candidates,
+        already_flagged,
+    }
 }
 
 /// The process scanner.
@@ -237,15 +264,16 @@ impl Scanner {
             }
         };
 
-        let candidates = collect_scan_targets(
+        let targets = collect_scan_targets(
             &self.config,
             pids,
             &mut self.stats,
             |pid| procfs::read_process_status(pid).ok(),
             |pid| procfs::read_ksm_stat(pid).ok(),
         );
+        let candidates = targets.to_mark;
 
-        if candidates.is_empty() {
+        if candidates.is_empty() && targets.already_flagged.is_empty() {
             return;
         }
 
@@ -269,6 +297,29 @@ impl Scanner {
                 self.stats.injection_failures += 1;
             } else {
                 injected.push(candidate.pid);
+            }
+        }
+
+        // Re-apply the executable-VMA guard to processes that were flagged on
+        // an earlier cycle. `PR_SET_MEMORY_MERGE` is sticky and inherited, so a
+        // browser keeps accumulating `r-xp` mappings (JIT, forked renderers)
+        // after it was marked; without this pass those mappings stay mergeable
+        // for the daemon's whole lifetime, which is exactly the SIGILL this
+        // guard exists to prevent. The withdrawal is per-VMA and idempotent.
+        for candidate in &targets.already_flagged {
+            let (withdrawn, found) = madvise::unmerge_executable_vmas(candidate.pid, self.dry_run);
+            self.stats.exec_vmas_reprotected += withdrawn as u64;
+
+            if found > 0 {
+                // A target can exit between listing and injection; that is
+                // expected, so this is a debug line, not a failure count.
+                debug!(
+                    pid = candidate.pid,
+                    name = %candidate.name,
+                    withdrawn,
+                    found,
+                    "Re-protected executable VMAs on an already-flagged process"
+                );
             }
         }
 
@@ -308,6 +359,7 @@ impl Scanner {
             targeted = candidates.len(),
             processes_marked = self.stats.processes_marked,
             exec_vmas_protected = self.stats.exec_vmas_protected,
+            exec_vmas_reprotected = self.stats.exec_vmas_reprotected,
             thp_collapsed = self.stats.thp_collapsed,
             skipped_stab = self.stats.skipped_stabilization,
             "Scanner cycle complete"
@@ -419,6 +471,7 @@ mod tests {
         assert_eq!(stats.processes_filtered_l25_profit, 0);
         assert_eq!(stats.processes_marked, 0);
         assert_eq!(stats.exec_vmas_protected, 0);
+        assert_eq!(stats.exec_vmas_reprotected, 0);
         assert_eq!(stats.injection_failures, 0);
         assert_eq!(stats.skipped_stabilization, 0);
         assert_eq!(stats.thp_collapsed, 0);
@@ -572,7 +625,8 @@ mod tests {
             |_| None,
         );
 
-        assert!(candidates.is_empty());
+        assert!(candidates.to_mark.is_empty());
+        assert!(candidates.already_flagged.is_empty());
         assert_eq!(stats.processes_filtered_l1, 0);
         assert_eq!(stats.processes_filtered_l2, 0);
     }
@@ -605,9 +659,93 @@ mod tests {
             },
         );
 
-        assert!(candidates.is_empty());
+        assert!(candidates.to_mark.is_empty());
         assert_eq!(stats.processes_filtered_l1, 2);
         assert_eq!(stats.processes_filtered_l2, 0);
+    }
+
+    /// Already-flagged processes must not be dropped: they are exactly the set
+    /// whose executable VMAs need the guard re-applied.
+    #[test]
+    fn test_collect_scan_targets_returns_already_flagged_processes() {
+        let config = ScannerConfig {
+            min_anon_rss_mb: 128,
+            ..ScannerConfig::default()
+        };
+        let mut stats = ScannerStats::default();
+
+        let candidates = collect_scan_targets(
+            &config,
+            vec![10, 11],
+            &mut stats,
+            |pid| {
+                Some(ProcessStatus {
+                    pid,
+                    name: format!("proc-{pid}"),
+                    anon_rss_kb: 256 * 1024,
+                    ..Default::default()
+                })
+            },
+            |_| {
+                Some(KsmProcStat {
+                    merge_any: true,
+                    ..Default::default()
+                })
+            },
+        );
+
+        assert!(candidates.to_mark.is_empty());
+        assert_eq!(candidates.already_flagged.len(), 2);
+        // Both must be offered for re-protection regardless of ordering, since
+        // equal RSS makes the sort order an implementation detail.
+        let mut pids: Vec<u32> = candidates.already_flagged.iter().map(|c| c.pid).collect();
+        pids.sort();
+        assert_eq!(pids, vec![10, 11]);
+    }
+
+    /// The guard pass is bounded by the same budget as the marking pass, so it
+    /// can never grow into a full process-table ptrace burst.
+    #[test]
+    fn test_collect_scan_targets_bounds_already_flagged_set() {
+        let config = ScannerConfig {
+            min_anon_rss_mb: 128,
+            max_candidates_per_cycle: 2,
+            ..ScannerConfig::default()
+        };
+        let mut stats = ScannerStats::default();
+
+        let candidates = collect_scan_targets(
+            &config,
+            vec![10, 11, 12, 13],
+            &mut stats,
+            |pid| {
+                let anon_mb = match pid {
+                    10 => 64,
+                    11 => 512,
+                    12 => 256,
+                    13 => 128,
+                    _ => 0,
+                };
+                Some(ProcessStatus {
+                    pid,
+                    name: format!("proc-{pid}"),
+                    anon_rss_kb: anon_mb * 1024,
+                    ..Default::default()
+                })
+            },
+            |_| {
+                Some(KsmProcStat {
+                    merge_any: true,
+                    ..Default::default()
+                })
+            },
+        );
+
+        assert_eq!(candidates.already_flagged.len(), 2);
+        // Highest anonymous RSS first — the guard should cover the largest
+        // mappings before the smallest.
+        assert_eq!(candidates.already_flagged[0].pid, 11);
+        assert_eq!(candidates.already_flagged[1].pid, 12);
     }
 
     #[test]
@@ -640,11 +778,11 @@ mod tests {
             },
         );
 
-        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates.to_mark.len(), 2);
         // PID 10 was dropped for negative profit, leaving 11 and 12. Both have
         // equal anonymous RSS, so the (stable) sort keeps discovery order.
-        assert_eq!(candidates[0].pid, 11);
-        assert_eq!(candidates[1].pid, 12);
+        assert_eq!(candidates.to_mark[0].pid, 11);
+        assert_eq!(candidates.to_mark[1].pid, 12);
         assert_eq!(stats.processes_filtered_l1, 3);
         assert_eq!(stats.processes_filtered_l2, 3);
         assert_eq!(stats.processes_filtered_l25_profit, 1);
@@ -681,9 +819,9 @@ mod tests {
         );
 
         // Top-2 by anonymous RSS: 11 (512 MiB) then 12 (256 MiB).
-        assert_eq!(candidates.len(), 2);
-        assert_eq!(candidates[0].pid, 11);
-        assert_eq!(candidates[1].pid, 12);
+        assert_eq!(candidates.to_mark.len(), 2);
+        assert_eq!(candidates.to_mark[0].pid, 11);
+        assert_eq!(candidates.to_mark[1].pid, 12);
     }
 
     #[test]
