@@ -1,32 +1,34 @@
-//! Tier 2: MADV_MERGEABLE injection via ptrace + process_madvise for COLLAPSE.
+//! Tier 2: process-wide KSM eligibility + THP collapse.
 //!
-//! Since Linux's process_madvise(2) only supports MADV_COLD, MADV_COLLAPSE,
-//! MADV_PAGEOUT, MADV_WILLNEED for cross-process (NOT MADV_MERGEABLE),
-//! we use ptrace(2) to inject madvise(MADV_MERGEABLE) into target processes.
+//! ## Why `PR_SET_MEMORY_MERGE` instead of per-region `MADV_MERGEABLE`
 //!
-//! For MADV_COLLAPSE we can use process_madvise directly.
+//! The original approach injected `madvise(addr, len, MADV_MERGEABLE)` once per
+//! eligible VMA via ptrace. That had two costs measured on a live workstation:
+//! it required parsing `/proc/PID/maps` for every candidate, and it capped how
+//! many candidates could be marked per cycle, leaving ~2.4 GiB of anonymous
+//! memory permanently un-offered while netting only 22.3 MiB of savings.
 //!
-//! ## Batched iovec (for COLLAPSE via process_madvise)
+//! Linux gained a per-`mm` alternative — `PR_SET_MEMORY_MERGE` (prctl option
+//! 67, confirmed present and working on 6.x/7.x) — which is what uksmd's
+//! `process_ksm_enable()` syscall did on pf-kernel. One injection marks
+//! **every** mapping of a process mergeable, including VMAs created after the
+//! call, and no address/length pair is needed at all.
 //!
-//! process_madvise(2) accepts an iovec array — instead of one syscall per
-//! VMA, we collect all eligible regions and fire a single batched call.
-//! This dramatically reduces syscall overhead (N VMAs → 1 syscall per PID).
+//! ## Safety: the flag is inherited
+//!
+//! `MMF_VM_MERGE_ANY` is a property of `struct mm_struct`, so it is inherited by
+//! children across `fork` **and across `execve`** — both verified live. Marking
+//! a shell therefore marks every command it later runs. The scanner's blocklist
+//! and an optional ancestor blocklist are the guard; see `scanner.rs`.
 //!
 //! ## MADV_COLLAPSE
 //!
 //! Opportunistic THP promotion: when KSM unmerges pages (triggering CoW),
 //! those pages lose their THP backing. MADV_COLLAPSE (Linux 6.1+)
 //! re-promotes aligned 2MB regions to transparent huge pages, recovering
-//! TLB efficiency.
-//!
-//! ## MADV_MERGEABLE via ptrace
-//!
-//! We attach to the target process with ptrace(PTRACE_ATTACH), inject a
-//! madvise(addr, len, MADV_MERGEABLE) syscall, then detach. This is
-//! slower than batched process_madvise but is the only way to mark
-//! another process's memory as KSM-mergeable.
+//! TLB efficiency. This uses `process_madvise(2)` directly, which does support
+//! it cross-process.
 
-use std::collections::HashMap;
 use std::os::unix::io::RawFd;
 
 use animaksm_common::procfs::MapsEntry;
@@ -35,7 +37,16 @@ use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use tracing::{debug, info};
 
+/// `PR_SET_MEMORY_MERGE` — marks every mapping of the calling process
+/// KSM-eligible (`MMF_VM_MERGE_ANY` in `struct mm_struct`).
+/// From `linux/prctl.h`; verified present and functional on 6.x/7.x.
+const PR_SET_MEMORY_MERGE: libc::c_ulong = 67;
+
 /// MADV_MERGEABLE constant (from linux/mman.h).
+///
+/// `process_madvise(2)` rejects this advice, so [`process_madvise_single`]
+/// guards against it explicitly rather than letting callers reach a syscall
+/// that cannot succeed. It is *not* used to mark memory any more.
 const MADV_MERGEABLE: libc::c_int = 12;
 
 /// MADV_COLLAPSE constant (Linux 6.1+, collapses memory into THP).
@@ -47,112 +58,57 @@ const SYS_PROCESS_MADVISE: libc::c_long = 440;
 /// pidfd_open syscall number (x86_64).
 const SYS_PIDFD_OPEN: libc::c_long = 434;
 
-/// madvise syscall number (x86_64).
-const SYS_MADVISE: libc::c_long = 28;
+/// prctl syscall number (x86_64).
+const SYS_PRCTL: libc::c_long = 157;
 
-/// Result of a madvise operation on a process.
+/// Result of enabling process-wide KSM eligibility on one process.
 #[derive(Debug)]
-pub struct MadviseResult {
+pub struct MergeableResult {
     pub pid: u32,
-    pub regions_attempted: usize,
-    pub regions_merged: usize,
-    pub total_bytes_marked: u64,
-    pub errors: Vec<(u64, String)>, // (address, error description)
+    /// 1 when the injection succeeded, else 0.
+    pub processes_marked: usize,
+    pub error: Option<String>,
 }
 
-/// Apply MADV_MERGEABLE to anonymous RW regions of a target process.
+/// Enable process-wide KSM eligibility on a target process.
 ///
-/// Uses ptrace(2) to inject madvise(MADV_MERGEABLE) syscalls into the
-/// target process, since process_madvise(2) does NOT support MADV_MERGEABLE
-/// for cross-process operations.
+/// Injects a single `prctl(PR_SET_MEMORY_MERGE, 1, 0, 0, 0)` via ptrace. This is
+/// the whole operation: no regions, no address/length pair, and it takes effect
+/// for VMAs that do not yet exist.
 ///
-/// For dry_run, simulates the injection without actually attaching.
-pub fn apply_mergeable(
-    pid: u32,
-    regions: &[MapsEntry],
-    max_bytes: u64,
-    dry_run: bool,
-) -> MadviseResult {
-    let mut result = MadviseResult {
-        pid,
-        regions_attempted: 0,
-        regions_merged: 0,
-        total_bytes_marked: 0,
-        errors: Vec::new(),
-    };
-
-    // Filter to eligible regions and enforce per-process byte cap
-    let eligible: Vec<&MapsEntry> = regions
-        .iter()
-        .filter(|r| r.is_anon_rw() && !r.has_exec() && !r.is_special())
-        .collect();
-
-    if eligible.is_empty() {
-        debug!(pid, "No eligible anonymous RW regions found");
-        return result;
-    }
-
-    // Collect regions into one batch, respecting max_bytes
-    let batch = build_batch(&eligible, max_bytes);
-    result.regions_attempted = batch.len();
-    let total_bytes: u64 = batch.iter().map(|&(_, len)| len as u64).sum();
-
-    if batch.is_empty() {
-        return result;
-    }
-
+/// `prctl` cannot be executed on another process by any other means — it always
+/// acts on the calling process's `mm` — so ptrace injection is the only route
+/// for a target the daemon does not own. systemd's `MemoryKSM=` covers the
+/// service case at launch.
+///
+/// For `dry_run`, no attachment happens and success is assumed.
+pub fn enable_merge_any(pid: u32, dry_run: bool) -> MergeableResult {
     if dry_run {
-        for &(addr, len) in &batch {
-            info!(
-                pid,
-                start = format!("0x{addr:x}"),
-                size_kb = len / 1024,
-                "[DRY RUN] Would inject MADV_MERGEABLE via ptrace"
-            );
-        }
-        result.regions_merged = batch.len();
-        result.total_bytes_marked = total_bytes;
-        return result;
-    }
-
-    // Inject MADV_MERGEABLE via ptrace for each region
-    // Find vdso syscall address once for this PID
-    let syscall_addr = match find_syscall_in_vdso(pid) {
-        Ok(addr) => addr,
-        Err(e) => {
-            for &(addr, _) in &batch {
-                result
-                    .errors
-                    .push((addr, format!("cannot find syscall instruction: {e}")));
-            }
-            return result;
-        }
-    };
-
-    for &(addr, len) in &batch {
-        match madvise_via_ptrace(pid, addr, len, syscall_addr) {
-            Ok(_) => {
-                result.regions_merged += 1;
-                result.total_bytes_marked += len as u64;
-            }
-            Err(e) => {
-                result
-                    .errors
-                    .push((addr, format!("ptrace madvise failed: {e}")));
-            }
-        }
-    }
-
-    if result.regions_merged > 0 {
-        info!(
+        return MergeableResult {
             pid,
-            regions_merged = result.regions_merged,
-            total_kb = result.total_bytes_marked / 1024,
-            "Applied MADV_MERGEABLE via ptrace to process regions"
-        );
+            processes_marked: 1,
+            error: None,
+        };
     }
 
-    result
+    match prctl_via_ptrace(pid, PR_SET_MEMORY_MERGE, 1, 0, 0) {
+        Ok(()) => {
+            debug!(
+                pid,
+                "Enabled process-wide KSM eligibility (PR_SET_MEMORY_MERGE)"
+            );
+            MergeableResult {
+                pid,
+                processes_marked: 1,
+                error: None,
+            }
+        }
+        Err(e) => MergeableResult {
+            pid,
+            processes_marked: 0,
+            error: Some(e),
+        },
+    }
 }
 
 /// Opportunistically collapse memory regions into transparent huge pages.
@@ -223,47 +179,6 @@ pub fn collapse_regions(pid: u32, regions: &[MapsEntry]) -> usize {
     collapsed
 }
 
-/// Build the batch of (addr, len) pairs from eligible regions, capping at
-/// `max_bytes` total.
-fn build_batch(eligible: &[&MapsEntry], max_bytes: u64) -> Vec<(u64, usize)> {
-    let mut batch: Vec<(u64, usize)> = Vec::new();
-    let mut bytes_accumulated: u64 = 0;
-
-    for region in eligible {
-        if bytes_accumulated >= max_bytes {
-            break;
-        }
-
-        let size = region.size();
-        let remaining = max_bytes - bytes_accumulated;
-        let len = size.min(remaining);
-        if len == 0 {
-            break;
-        }
-
-        batch.push((region.start, len as usize));
-        bytes_accumulated += len;
-    }
-
-    batch
-}
-
-/// Apply MADV_MERGEABLE to multiple processes at once.
-pub fn batch_apply_mergeable(
-    targets: &[(u32, Vec<MapsEntry>)],
-    max_bytes_per_process: u64,
-    dry_run: bool,
-) -> HashMap<u32, MadviseResult> {
-    let mut results = HashMap::new();
-
-    for (pid, regions) in targets {
-        let result = apply_mergeable(*pid, regions, max_bytes_per_process, dry_run);
-        results.insert(*pid, result);
-    }
-
-    results
-}
-
 /// Open a pidfd for the given PID using pidfd_open(2).
 fn pidfd_open(pid: u32) -> Result<RawFd, String> {
     let ret = unsafe { libc::syscall(SYS_PIDFD_OPEN, pid as libc::c_int, 0 as libc::c_uint) };
@@ -326,26 +241,31 @@ fn find_syscall_in_vdso(pid: u32) -> Result<u64, String> {
         .ok_or_else(|| "no syscall instruction in vdso".to_string())
 }
 
-/// Inject `madvise(MADV_MERGEABLE)` into a target process via ptrace.
+/// Inject `prctl(option, arg2, arg3, arg4, arg5)` into a target process.
 ///
 /// ptrace(2) syscall injection pattern (x86_64):
 ///   1. PTRACE_ATTACH + waitpid(WSTOPPED)
 ///   2. getregs → save ALL registers (syscall clobbers rcx, r11)
 ///   3. Find a `syscall` instruction in the target’s vDSO
-///   4. Set regs: rip → vDSO syscall addr, rax=28, rdi=addr, rsi=len, rdx=12
+///   4. Set regs: rip → vDSO syscall addr, rax=157, rdi..r5 = prctl args
 ///   5. ptrace(SYSCALL) → waitpid (entry stop)
 ///   6. ptrace(SYSCALL) → waitpid (exit stop)
 ///   7. getregs → read rax for return value
 ///   8. Restore ALL original registers
 ///   9. PTRACE_DETACH
-fn madvise_via_ptrace(pid: u32, addr: u64, len: usize, syscall_addr: u64) -> Result<(), String> {
+fn prctl_via_ptrace(
+    pid: u32,
+    option: libc::c_ulong,
+    arg2: libc::c_ulong,
+    arg3: libc::c_ulong,
+    arg4: libc::c_ulong,
+) -> Result<(), String> {
     let nix_pid = Pid::from_raw(pid as i32);
 
     debug!(
         pid,
-        addr = format!("0x{addr:x}"),
-        len_kb = len / 1024,
-        "Injecting madvise via ptrace"
+        prctl_option = option,
+        "Injecting prctl into target process via ptrace"
     );
 
     // Attach to the target process
@@ -377,15 +297,26 @@ fn madvise_via_ptrace(pid: u32, addr: u64, len: usize, syscall_addr: u64) -> Res
         }
     };
 
+    // Locate the target's own vDSO `syscall` instruction to execute.
+    let syscall_addr = match find_syscall_in_vdso(pid) {
+        Ok(addr) => addr,
+        Err(e) => {
+            let _ = ptrace::detach(nix_pid, None);
+            return Err(format!("cannot find syscall instruction: {e}"));
+        }
+    };
+
     let mut regs = orig;
 
-    // Set up madvise(addr, len, MADV_MERGEABLE) syscall
-    // x86_64: rax=28 (SYS_madvise), rdi=addr, rsi=len, rdx=advice
+    // Set up prctl(option, arg2, arg3, arg4, arg5)
+    // x86_64: rax=157 (SYS_prctl), rdi=option, rsi..r5 = the four arguments
     regs.rip = syscall_addr;
-    regs.rax = SYS_MADVISE as u64;
-    regs.rdi = addr;
-    regs.rsi = len as u64;
-    regs.rdx = MADV_MERGEABLE as u64;
+    regs.rax = SYS_PRCTL as u64;
+    regs.rdi = option;
+    regs.rsi = arg2;
+    regs.rdx = arg3;
+    regs.r10 = arg4;
+    regs.r8 = 0;
 
     if let Err(e) = ptrace::setregs(nix_pid, regs) {
         let _ = ptrace::detach(nix_pid, None);
@@ -458,10 +389,11 @@ fn madvise_via_ptrace(pid: u32, addr: u64, len: usize, syscall_addr: u64) -> Res
     }
 
     // Check result (rax contains return value; negative values are errno)
-    if (regs_after.rax as i64) < 0 && (regs_after.rax as i64) > -4096 {
-        let errno = (-(regs_after.rax as i64)) as i32;
+    let ret = regs_after.rax as i64;
+    if ret < 0 && ret > -4096 {
+        let errno = (-ret) as i32;
         return Err(format!(
-            "madvise failed: errno={errno} ({})",
+            "prctl failed: errno={errno} ({})",
             errno_to_str(errno)
         ));
     }
@@ -517,338 +449,35 @@ mod tests {
     use super::*;
     use animaksm_common::procfs::MapsEntry;
 
-    // ── build_batch ──────────────────────────────────────────────────────
+    // ── enable_merge_any (dry-run) ────────────────────────────────────────
 
     #[test]
-    fn test_build_batch_empty_eligible() {
-        let eligible: Vec<&MapsEntry> = vec![];
-        let batch = build_batch(&eligible, 4096);
-        assert!(batch.is_empty());
-    }
+    fn test_enable_merge_any_dry_run_marks_without_attaching() {
+        let result = enable_merge_any(std::process::id(), true);
 
-    #[test]
-    fn test_build_batch_collects_regions() {
-        let regions = [
-            MapsEntry {
-                start: 0x10000,
-                end: 0x11000,
-                perms: "rw-p".into(),
-                offset: 0,
-                dev: "00:00".into(),
-                inode: 0,
-                pathname: String::new(),
-            },
-            MapsEntry {
-                start: 0x20000,
-                end: 0x22000,
-                perms: "rw-p".into(),
-                offset: 0,
-                dev: "00:00".into(),
-                inode: 0,
-                pathname: String::new(),
-            },
-        ];
-        let refs: Vec<&MapsEntry> = regions.iter().collect();
-        let batch = build_batch(&refs, 10 * 4096);
-        assert_eq!(batch.len(), 2);
-        assert_eq!(batch[0], (0x10000, 0x1000usize));
-        assert_eq!(batch[1], (0x20000, 0x2000usize));
-    }
-
-    #[test]
-    fn test_build_batch_respects_max_bytes() {
-        let regions = [
-            MapsEntry {
-                start: 0x10000,
-                end: 0x11000,
-                perms: "rw-p".into(),
-                offset: 0,
-                dev: "00:00".into(),
-                inode: 0,
-                pathname: String::new(),
-            }, // 4KB
-            MapsEntry {
-                start: 0x20000,
-                end: 0x24000,
-                perms: "rw-p".into(),
-                offset: 0,
-                dev: "00:00".into(),
-                inode: 0,
-                pathname: String::new(),
-            }, // 16KB
-            MapsEntry {
-                start: 0x30000,
-                end: 0x31000,
-                perms: "rw-p".into(),
-                offset: 0,
-                dev: "00:00".into(),
-                inode: 0,
-                pathname: String::new(),
-            }, // 4KB
-        ];
-        let refs: Vec<&MapsEntry> = regions.iter().collect();
-        // max_bytes = 12KB -> first region plus 8KB from the second region.
-        let batch = build_batch(&refs, 12 * 1024);
-        assert_eq!(batch.len(), 2);
-        assert_eq!(batch[0], (0x10000, 0x1000usize));
-        assert_eq!(batch[1], (0x20000, 8 * 1024usize));
-    }
-
-    #[test]
-    fn test_build_batch_partially_marks_first_large_region() {
-        let regions = [MapsEntry {
-            start: 0x10000,
-            end: 0x90000,
-            perms: "rw-p".into(),
-            offset: 0,
-            dev: "00:00".into(),
-            inode: 0,
-            pathname: String::new(),
-        }];
-        let refs: Vec<&MapsEntry> = regions.iter().collect();
-        let batch = build_batch(&refs, 64 * 1024);
-        assert_eq!(batch, vec![(0x10000, 64 * 1024usize)]);
-    }
-
-    #[test]
-    fn test_build_batch_does_not_apply_iovec_limit_to_ptrace_path() {
-        let regions: Vec<MapsEntry> = (0..300)
-            .map(|i| {
-                let start = 0x10000 + i * 0x2000;
-                MapsEntry {
-                    start,
-                    end: start + 0x1000,
-                    perms: "rw-p".into(),
-                    offset: 0,
-                    dev: "00:00".into(),
-                    inode: 0,
-                    pathname: String::new(),
-                }
-            })
-            .collect();
-        let refs: Vec<&MapsEntry> = regions.iter().collect();
-        let batch = build_batch(&refs, 2 * 1024 * 1024);
-        assert_eq!(batch.len(), 300);
-    }
-
-    #[test]
-    fn test_build_batch_exact_capacity() {
-        let regions = [
-            MapsEntry {
-                start: 0x10000,
-                end: 0x12000,
-                perms: "rw-p".into(),
-                offset: 0,
-                dev: "00:00".into(),
-                inode: 0,
-                pathname: String::new(),
-            }, // 8KB
-            MapsEntry {
-                start: 0x20000,
-                end: 0x22000,
-                perms: "rw-p".into(),
-                offset: 0,
-                dev: "00:00".into(),
-                inode: 0,
-                pathname: String::new(),
-            }, // 8KB
-        ];
-        let refs: Vec<&MapsEntry> = regions.iter().collect();
-        // max_bytes = 16KB → exactly both
-        let batch = build_batch(&refs, 16 * 1024);
-        assert_eq!(batch.len(), 2);
-    }
-
-    #[test]
-    fn test_build_batch_zero_max_bytes() {
-        let regions = [MapsEntry {
-            start: 0x10000,
-            end: 0x11000,
-            perms: "rw-p".into(),
-            offset: 0,
-            dev: "00:00".into(),
-            inode: 0,
-            pathname: String::new(),
-        }];
-        let refs: Vec<&MapsEntry> = regions.iter().collect();
-        let batch = build_batch(&refs, 0);
-        assert!(batch.is_empty(), "zero cap should yield empty batch");
-    }
-
-    // ── apply_mergeable (dry-run, using our own PID) ────────────────────
-
-    #[test]
-    fn test_apply_mergeable_dry_run_eligible_regions() {
-        let my_pid = std::process::id();
-        let regions = vec![
-            MapsEntry {
-                start: 0x10000,
-                end: 0x11000,
-                perms: "rw-p".into(),
-                offset: 0,
-                dev: "00:00".into(),
-                inode: 0,
-                pathname: String::new(),
-            },
-            MapsEntry {
-                start: 0x20000,
-                end: 0x24000,
-                perms: "rw-p".into(),
-                offset: 0,
-                dev: "00:00".into(),
-                inode: 0,
-                pathname: String::new(),
-            },
-        ];
-        let result = apply_mergeable(my_pid, &regions, 1024 * 1024, true);
-        // Both regions should be eligible (anon RW, no exec, not special)
-        // First region = 4KB, second = 16KB → total = 20KB
-        assert_eq!(result.regions_attempted, 2);
-        assert_eq!(result.regions_merged, 2);
-        assert_eq!(result.total_bytes_marked, (4 + 16) * 1024);
-        assert!(result.errors.is_empty());
-    }
-
-    #[test]
-    fn test_apply_mergeable_dry_run_filters_non_eligible() {
-        let my_pid = std::process::id();
-        // One eligible, one file-backed (not anon), one executable
-        let regions = vec![
-            MapsEntry {
-                start: 0x10000,
-                end: 0x11000,
-                perms: "rw-p".into(),
-                offset: 0,
-                dev: "00:00".into(),
-                inode: 0,
-                pathname: String::new(),
-            }, // eligible
-            MapsEntry {
-                start: 0x20000,
-                end: 0x21000,
-                perms: "rw-p".into(),
-                offset: 1,
-                dev: "00:00".into(),
-                inode: 12345,
-                pathname: "/some/file".into(),
-            }, // file-backed, not eligible
-            MapsEntry {
-                start: 0x30000,
-                end: 0x31000,
-                perms: "r-xp".into(),
-                offset: 0,
-                dev: "00:00".into(),
-                inode: 0,
-                pathname: String::new(),
-            }, // executable, not eligible
-        ];
-        let result = apply_mergeable(my_pid, &regions, 1024 * 1024, true);
-        // Only the first region should pass the eligibility filter
-        assert_eq!(result.regions_attempted, 1);
-        assert_eq!(result.regions_merged, 1);
-    }
-
-    #[test]
-    fn test_apply_mergeable_dry_run_respects_max_bytes() {
-        let my_pid = std::process::id();
-        let regions = vec![
-            MapsEntry {
-                start: 0x10000,
-                end: 0x12000,
-                perms: "rw-p".into(),
-                offset: 0,
-                dev: "00:00".into(),
-                inode: 0,
-                pathname: String::new(),
-            }, // 8KB
-            MapsEntry {
-                start: 0x20000,
-                end: 0x24000,
-                perms: "rw-p".into(),
-                offset: 0,
-                dev: "00:00".into(),
-                inode: 0,
-                pathname: String::new(),
-            }, // 16KB
-        ];
-        // max_bytes = 8KB → only 1 region fits
-        let result = apply_mergeable(my_pid, &regions, 8 * 1024, true);
-        assert_eq!(result.regions_attempted, 1);
-        assert_eq!(result.regions_merged, 1);
-        assert_eq!(result.total_bytes_marked, 8 * 1024);
-    }
-
-    #[test]
-    fn test_apply_mergeable_dry_run_invalid_pid() {
-        // PID 0xFFFFFF is almost certainly non-existent
-        let regions = vec![MapsEntry {
-            start: 0x10000,
-            end: 0x11000,
-            perms: "rw-p".into(),
-            offset: 0,
-            dev: "00:00".into(),
-            inode: 0,
-            pathname: String::new(),
-        }];
-        let result = apply_mergeable(0xFFFFFF, &regions, 4096, true);
-        // In dry_run mode, we build a batch and simulate success without
-        // actually checking PID validity (ptrace happens at runtime, not batch-build time)
-        assert_eq!(result.regions_attempted, 1);
-        assert_eq!(result.regions_merged, 1);
-        assert_eq!(result.total_bytes_marked, 4096);
+        assert_eq!(result.pid, std::process::id());
+        assert_eq!(result.processes_marked, 1);
         assert!(
-            result.errors.is_empty(),
-            "dry run should have no errors: {:?}",
-            result.errors
+            result.error.is_none(),
+            "dry run must not attach or report errors: {:?}",
+            result.error
         );
     }
 
     #[test]
-    fn test_apply_mergeable_returns_zero_when_no_regions_are_eligible() {
-        let result = apply_mergeable(
-            std::process::id(),
-            &[MapsEntry {
-                start: 0x10000,
-                end: 0x11000,
-                perms: "r-xp".into(),
-                offset: 0,
-                dev: "00:00".into(),
-                inode: 0,
-                pathname: String::new(),
-            }],
-            4096,
-            true,
-        );
+    fn test_enable_merge_any_on_dead_pid_reports_error_not_success() {
+        // A PID that cannot exist on this host; the ptrace attach must fail
+        // loudly rather than silently claiming success.
+        let result = enable_merge_any(0xFFFF_FFFE, false);
 
-        assert_eq!(result.regions_attempted, 0);
-        assert_eq!(result.regions_merged, 0);
-        assert!(result.errors.is_empty());
+        assert_eq!(result.processes_marked, 0);
+        assert!(
+            result.error.is_some(),
+            "injecting into a dead PID must report an error"
+        );
     }
 
-    #[test]
-    fn test_apply_mergeable_non_dry_run_reports_fallback_errors() {
-        let result = apply_mergeable(
-            std::process::id(),
-            &[MapsEntry {
-                start: 0x10000,
-                end: 0x11000,
-                perms: "rw-p".into(),
-                offset: 0,
-                dev: "00:00".into(),
-                inode: 0,
-                pathname: String::new(),
-            }],
-            4096,
-            false,
-        );
-
-        assert_eq!(result.regions_attempted, 1);
-        assert_eq!(result.regions_merged, 0);
-        assert_eq!(result.total_bytes_marked, 0);
-        assert!(!result.errors.is_empty());
-        // Now uses ptrace injection, not process_madvise
-        assert!(result.errors[0].1.contains("ptrace madvise failed"));
-    }
+    // ── collapse_regions (MADV_COLLAPSE via process_madvise) ──────────────
 
     #[test]
     fn test_collapse_regions_returns_zero_without_large_eligible_regions() {
@@ -1125,67 +754,6 @@ mod tests {
         assert_eq!(errno_to_str(-1), "unknown");
     }
 
-    // ── batch_apply_mergeable ───────────────────────────────────────────
-
-    #[test]
-    fn test_batch_apply_mergeable_multiple_targets() {
-        let my_pid = std::process::id();
-        let regions = vec![MapsEntry {
-            start: 0x10000,
-            end: 0x11000,
-            perms: "rw-p".into(),
-            offset: 0,
-            dev: "00:00".into(),
-            inode: 0,
-            pathname: String::new(),
-        }];
-
-        // Two different PIDs — batch_apply_mergeable returns one per PID
-        let other_pid = my_pid.checked_add(1).unwrap_or(2);
-        let targets = vec![(my_pid, regions.clone()), (other_pid, regions)];
-        let results = batch_apply_mergeable(&targets, 4096, true);
-
-        assert_eq!(results.len(), 2, "should have entries for both PIDs");
-        // First PID exists → dry-run succeeds with 1 region merged
-        assert_eq!(results[&my_pid].regions_merged, 1);
-        // In dry_run mode, non-existent PID still simulates success
-        // (ptrace only runs at runtime, not during dry-run batch building)
-        assert_eq!(results[&other_pid].regions_merged, 1);
-    }
-
-    // ── MadviseResult ───────────────────────────────────────────────────
-
-    #[test]
-    fn test_madvise_result_default_zeroes() {
-        let result = MadviseResult {
-            pid: 42,
-            regions_attempted: 0,
-            regions_merged: 0,
-            total_bytes_marked: 0,
-            errors: vec![],
-        };
-        assert_eq!(result.pid, 42);
-        assert_eq!(result.regions_merged, 0);
-        assert!(result.errors.is_empty());
-    }
-
-    #[test]
-    fn test_madvise_result_with_errors() {
-        let result = MadviseResult {
-            pid: 99,
-            regions_attempted: 2,
-            regions_merged: 1,
-            total_bytes_marked: 4096,
-            errors: vec![(0x10000, "EPERM: Operation not permitted".into())],
-        };
-        assert_eq!(result.errors.len(), 1);
-        assert_eq!(result.regions_merged, 1);
-    }
-    #[test]
-    fn test_errno_to_str_known_and_unknown() {
-        assert!(errno_to_str(libc::EPERM).contains("EPERM"));
-        assert_eq!(errno_to_str(999_999), "unknown");
-    }
     /// The helper must reject `MADV_MERGEABLE` *before* issuing any syscall —
     /// process_madvise(2) cannot apply that advice cross-process, so ptrace is
     /// the only route. Guarded with an advice check against an intentionally bad

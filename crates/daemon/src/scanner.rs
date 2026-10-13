@@ -21,7 +21,7 @@
 use std::time::{Duration, Instant};
 
 use animaksm_common::config::ScannerConfig;
-use animaksm_common::procfs::{self, KsmProcStat, MapsEntry, ProcessStatus};
+use animaksm_common::procfs::{self, KsmProcStat, ProcessStatus};
 use animaksm_common::SharedGovernorState;
 use tokio::sync::watch;
 use tokio::time;
@@ -35,9 +35,8 @@ pub struct ScannerStats {
     pub processes_filtered_l1: u64,
     pub processes_filtered_l2: u64,
     pub processes_filtered_l25_profit: u64,
-    pub processes_targeted: u64,
-    pub madvise_calls: u64,
-    pub total_bytes_marked: u64,
+    pub processes_marked: u64,
+    pub injection_failures: u64,
     pub scan_cycles: u64,
     pub skipped_stabilization: u64,
     pub thp_collapsed: u64,
@@ -79,33 +78,16 @@ fn passes_l25_profit_filter(ksm_stat: Option<&KsmProcStat>) -> bool {
     ksm_stat.map(|s| s.process_profit >= 0).unwrap_or(true)
 }
 
-fn eligible_anon_rw_summary(maps: &[MapsEntry]) -> (usize, u64) {
-    let eligible = maps
-        .iter()
-        .filter(|m| m.is_anon_rw() && !m.has_exec() && !m.is_special());
-
-    let mut count = 0;
-    let mut bytes = 0;
-    for map in eligible {
-        count += 1;
-        bytes += map.size();
-    }
-
-    (count, bytes)
-}
-
-fn collect_scan_targets<StatusFn, KsmFn, MapsFn>(
+fn collect_scan_targets<StatusFn, KsmFn>(
     config: &ScannerConfig,
     pids: Vec<u32>,
     stats: &mut ScannerStats,
     mut read_status: StatusFn,
     mut read_ksm_stat: KsmFn,
-    mut read_maps: MapsFn,
-) -> Vec<(u32, Vec<procfs::MapsEntry>)>
+) -> Vec<Candidate>
 where
     StatusFn: FnMut(u32) -> Option<ProcessStatus>,
     KsmFn: FnMut(u32) -> Option<KsmProcStat>,
-    MapsFn: FnMut(u32) -> Option<Vec<procfs::MapsEntry>>,
 {
     let mut l1_candidates: Vec<Candidate> = Vec::new();
 
@@ -159,37 +141,15 @@ where
     l25_candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.anon_rss_mb));
     l25_candidates.truncate(config.max_candidates_per_cycle);
 
-    let mut targets: Vec<(u32, Vec<procfs::MapsEntry>)> = Vec::new();
-
-    for candidate in &l25_candidates {
-        let maps = match read_maps(candidate.pid) {
-            Some(m) => m,
-            None => continue,
-        };
-
-        let (anon_rw_count, total_anon_rw_bytes) = eligible_anon_rw_summary(&maps);
-
-        if anon_rw_count == 0 {
-            continue;
-        }
-
-        debug!(
-            pid = candidate.pid,
-            name = %candidate.name,
-            anon_rss_mb = candidate.anon_rss_mb,
-            anon_rw_regions = anon_rw_count,
-            eligible_mb = total_anon_rw_bytes / 1024 / 1024,
-            "Level 3 candidate — seeding KSM eligibility"
-        );
-
-        targets.push((candidate.pid, maps));
+    if l25_candidates.is_empty() {
+        debug!("No Level 3 targets after eligibility filters");
     }
 
-    if targets.is_empty() {
-        debug!("No Level 3 targets after maps filtering");
-    }
-
-    targets
+    // Process-wide eligibility needs no address ranges, so `/proc/PID/maps` —
+    // by far the most expensive step of the scan — is never read. Only the PID
+    // matters now, which is what makes this dramatically cheaper than the
+    // per-region `madvise` approach it replaces.
+    l25_candidates
 }
 
 /// The process scanner.
@@ -260,7 +220,7 @@ impl Scanner {
             }
         }
 
-        let madvise_calls_before = self.stats.madvise_calls;
+        let processes_marked_before = self.stats.processes_marked;
 
         // === Level 1: Cheap /proc/PID/status filter ===
         // Only read RssAnon — no maps parsing, no pagemap.
@@ -272,51 +232,53 @@ impl Scanner {
             }
         };
 
-        let targets = collect_scan_targets(
+        let candidates = collect_scan_targets(
             &self.config,
             pids,
             &mut self.stats,
             |pid| procfs::read_process_status(pid).ok(),
             |pid| procfs::read_ksm_stat(pid).ok(),
-            |pid| procfs::read_process_maps(pid).ok(),
         );
 
-        if targets.is_empty() {
+        if candidates.is_empty() {
             return;
         }
 
-        // Apply MADV_MERGEABLE to targets
-        let max_bytes = self.config.max_mergeable_per_process_mb * 1024 * 1024;
-        let results = madvise::batch_apply_mergeable(&targets, max_bytes, self.dry_run);
+        // Enable process-wide KSM eligibility — one prctl injection per PID.
+        let mut injected = Vec::with_capacity(candidates.len());
+        for candidate in &candidates {
+            let result = madvise::enable_merge_any(candidate.pid, self.dry_run);
+            self.stats.processes_marked += result.processes_marked as u64;
 
-        // Aggregate statistics
-        for result in results.values() {
-            self.stats.processes_targeted += 1;
-            self.stats.madvise_calls += result.regions_merged as u64;
-            self.stats.total_bytes_marked += result.total_bytes_marked;
-
-            if !result.errors.is_empty() {
-                for (addr, err) in &result.errors {
-                    debug!(
-                        pid = result.pid,
-                        addr = format!("0x{addr:x}"),
-                        error = %err,
-                        "madvise error for region"
-                    );
-                }
+            if let Some(error) = result.error {
+                // A target can exit, or be un-injectable (kernel threads, and
+                // processes staring a hardened sandbox). Both are expected, so
+                // this is a per-PID debug line rather than an error level.
+                warn!(
+                    pid = result.pid,
+                    name = %candidate.name,
+                    error = %error,
+                    "Could not enable process-wide KSM eligibility"
+                );
+                self.stats.injection_failures += 1;
+            } else {
+                injected.push(candidate.pid);
             }
         }
 
         // Opportunistic MADV_COLLAPSE: if KSM has been unmerging pages
         // (high pages_volatile), try to re-promote large regions to THPs
-        // for TLB efficiency. Only on processes we already touched.
+        // for TLB efficiency. process_madvise supports COLLAPSE cross-process,
+        // so it needs the region list this path used to be able to rely on.
         if let Ok(ksm_stats) = animaksm_common::ksm::KsmController::new("/sys/kernel/mm/ksm") {
             if let Ok(stats) = ksm_stats.read_stats() {
                 if stats.pages_volatile > 1000 {
-                    for (pid, maps) in &targets {
+                    for pid in &injected {
                         if !self.dry_run {
-                            let collapsed = madvise::collapse_regions(*pid, maps);
-                            self.stats.thp_collapsed += collapsed as u64;
+                            if let Ok(maps) = procfs::read_process_maps(*pid) {
+                                let collapsed = madvise::collapse_regions(*pid, &maps);
+                                self.stats.thp_collapsed += collapsed as u64;
+                            }
                         }
                     }
                 }
@@ -324,9 +286,9 @@ impl Scanner {
         }
 
         // Update scanner stabilization timestamp if this cycle actually did
-        // something. `madvise_calls` is cumulative, so compare against the
+        // something. `processes_marked` is cumulative, so compare against the
         // start-of-cycle value instead of checking it for nonzero.
-        if self.stats.madvise_calls > madvise_calls_before {
+        if self.stats.processes_marked > processes_marked_before {
             let mut s = state.write().await;
             s.last_scanner_action = Instant::now();
             s.last_global_action = Instant::now();
@@ -337,9 +299,8 @@ impl Scanner {
             l1_passed = self.stats.processes_filtered_l1,
             l2_passed = self.stats.processes_filtered_l2,
             l25_profit_filtered = self.stats.processes_filtered_l25_profit,
-            targeted = targets.len(),
-            madvise_calls = self.stats.madvise_calls,
-            marked_mb = self.stats.total_bytes_marked / 1024 / 1024,
+            targeted = candidates.len(),
+            processes_marked = self.stats.processes_marked,
             thp_collapsed = self.stats.thp_collapsed,
             skipped_stab = self.stats.skipped_stabilization,
             "Scanner cycle complete"
@@ -449,9 +410,8 @@ mod tests {
         assert_eq!(stats.processes_filtered_l1, 0);
         assert_eq!(stats.processes_filtered_l2, 0);
         assert_eq!(stats.processes_filtered_l25_profit, 0);
-        assert_eq!(stats.processes_targeted, 0);
-        assert_eq!(stats.madvise_calls, 0);
-        assert_eq!(stats.total_bytes_marked, 0);
+        assert_eq!(stats.processes_marked, 0);
+        assert_eq!(stats.injection_failures, 0);
         assert_eq!(stats.skipped_stabilization, 0);
         assert_eq!(stats.thp_collapsed, 0);
     }
@@ -581,34 +541,6 @@ mod tests {
         })));
     }
 
-    fn map(start: u64, end: u64, perms: &str, inode: u64, pathname: &str) -> MapsEntry {
-        MapsEntry {
-            start,
-            end,
-            perms: perms.into(),
-            offset: 0,
-            dev: "00:00".into(),
-            inode,
-            pathname: pathname.into(),
-        }
-    }
-
-    #[test]
-    fn test_eligible_anon_rw_summary_counts_only_l3_candidates() {
-        let maps = vec![
-            map(0x1000, 0x5000, "rw-p", 0, ""),
-            map(0x5000, 0x9000, "rwxp", 0, ""),
-            map(0x9000, 0xD000, "rw-s", 0, ""),
-            map(0xD000, 0x11000, "rw-p", 12, "/tmp/file"),
-            map(0x11000, 0x15000, "rw-p", 0, "[heap]"),
-            map(0x15000, 0x1D000, "rw-p", 0, ""),
-        ];
-
-        let (count, bytes) = eligible_anon_rw_summary(&maps);
-        assert_eq!(count, 2);
-        assert_eq!(bytes, 0x4000 + 0x8000);
-    }
-
     #[test]
     fn test_collect_scan_targets_returns_empty_when_l1_has_no_candidates() {
         let config = ScannerConfig {
@@ -617,7 +549,7 @@ mod tests {
         };
         let mut stats = ScannerStats::default();
 
-        let targets = collect_scan_targets(
+        let candidates = collect_scan_targets(
             &config,
             vec![1, 2, 10],
             &mut stats,
@@ -630,10 +562,9 @@ mod tests {
                 })
             },
             |_| None,
-            |_| None,
         );
 
-        assert!(targets.is_empty());
+        assert!(candidates.is_empty());
         assert_eq!(stats.processes_filtered_l1, 0);
         assert_eq!(stats.processes_filtered_l2, 0);
     }
@@ -646,7 +577,7 @@ mod tests {
         };
         let mut stats = ScannerStats::default();
 
-        let targets = collect_scan_targets(
+        let candidates = collect_scan_targets(
             &config,
             vec![10, 11],
             &mut stats,
@@ -664,16 +595,15 @@ mod tests {
                     ..Default::default()
                 })
             },
-            |_| Some(vec![map(0x1000, 0x5000, "rw-p", 0, "")]),
         );
 
-        assert!(targets.is_empty());
+        assert!(candidates.is_empty());
         assert_eq!(stats.processes_filtered_l1, 2);
         assert_eq!(stats.processes_filtered_l2, 0);
     }
 
     #[test]
-    fn test_collect_scan_targets_filters_negative_profit_and_missing_maps() {
+    fn test_collect_scan_targets_filters_negative_profit() {
         let config = ScannerConfig {
             min_anon_rss_mb: 128,
             max_candidates_per_cycle: 3,
@@ -681,7 +611,7 @@ mod tests {
         };
         let mut stats = ScannerStats::default();
 
-        let targets = collect_scan_targets(
+        let candidates = collect_scan_targets(
             &config,
             vec![10, 11, 12],
             &mut stats,
@@ -700,15 +630,13 @@ mod tests {
                 }),
                 _ => None,
             },
-            |pid| match pid {
-                11 => None,
-                12 => Some(vec![map(0x1000, 0x5000, "rw-p", 0, "")]),
-                _ => unreachable!(),
-            },
         );
 
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].0, 12);
+        assert_eq!(candidates.len(), 2);
+        // PID 10 was dropped for negative profit, leaving 11 and 12. Both have
+        // equal anonymous RSS, so the (stable) sort keeps discovery order.
+        assert_eq!(candidates[0].pid, 11);
+        assert_eq!(candidates[1].pid, 12);
         assert_eq!(stats.processes_filtered_l1, 3);
         assert_eq!(stats.processes_filtered_l2, 3);
         assert_eq!(stats.processes_filtered_l25_profit, 1);
@@ -723,7 +651,7 @@ mod tests {
         };
         let mut stats = ScannerStats::default();
 
-        let targets = collect_scan_targets(
+        let candidates = collect_scan_targets(
             &config,
             vec![10, 11, 12],
             &mut stats,
@@ -742,23 +670,12 @@ mod tests {
                 })
             },
             |_| None,
-            |pid| {
-                Some(vec![map(
-                    pid as u64 * 0x10000,
-                    pid as u64 * 0x10000 + 0x4000,
-                    "rw-p",
-                    0,
-                    "",
-                )])
-            },
         );
 
-        assert_eq!(
-            targets.iter().map(|(pid, _)| *pid).collect::<Vec<_>>(),
-            vec![11, 12]
-        );
-        assert_eq!(stats.processes_filtered_l1, 3);
-        assert_eq!(stats.processes_filtered_l2, 3);
+        // Top-2 by anonymous RSS: 11 (512 MiB) then 12 (256 MiB).
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].pid, 11);
+        assert_eq!(candidates[1].pid, 12);
     }
 
     #[test]
@@ -840,7 +757,9 @@ mod tests {
         assert_eq!(l25.len(), 1);
         assert_eq!(l25[0].pid, 13);
 
-        let maps = [map(0x1000, 0x5000, "rw-p", 0, "")];
-        assert_eq!(eligible_anon_rw_summary(&maps), (1, 0x4000));
+        // The candidate carries only a name, a PID and its anonymous RSS — no
+        // address ranges are needed to enable process-wide KSM eligibility.
+        assert_eq!(l25[0].name, "winner");
+        assert_eq!(l25[0].anon_rss_mb, 1024);
     }
 }

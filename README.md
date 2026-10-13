@@ -5,7 +5,7 @@
 <img width="256" height="384" alt="AnimAIOS mascot" src="https://github.com/user-attachments/assets/8d548058-3363-481b-90d6-09f4620f70f7" />
 
 
-### The spiritual successor to uksmd — a modern, Rust-based userspace KSM daemon with PTrace-powered MADV_MERGEABLE injection
+### The spiritual successor to uksmd — a modern, Rust-based userspace KSM daemon with PTrace-powered process-wide KSM eligibility
 
 <!--
 [![Crates.io](https://img.shields.io/crates/v/animaksm-daemon.svg)](https://crates.io/crates.io/crates/animaksm-daemon)
@@ -21,9 +21,11 @@
 
 ## Why AKSMD?
 
-I used to run **uksmd** (the userspace KSM daemon from the CachyOS project) on my desktop. It was brilliant — a userspace daemon that proactively scanned processes and marked their anonymous memory as `MADV_MERGEABLE` so the kernel's KSM (Kernel Samepage Merging) could deduplicate identical pages. It traded a little CPU for massive RAM savings.
+I used to run **uksmd** (the userspace KSM daemon from the CachyOS project) on my desktop. It was brilliant — a userspace daemon that proactively scanned processes and made their anonymous memory KSM-eligible so the kernel's KSM (Kernel Samepage Merging) could deduplicate identical pages. It traded a little CPU for massive RAM savings.
 
-Then uksmd went unmaintained. The repo was archived. The kernel evolved — `process_madvise()` gained support for `MADV_COLLAPSE` and `MADV_COLD`, but **never for `MADV_MERGEABLE`**. The old `pidfd` + `process_madvise` approach hit a wall.
+Then uksmd went unmaintained. The repo was archived. Worse, the kernel half of its trick never made it upstream: `MMF_VM_MERGE_ANY` and the `process_ksm_enable()` syscall lived only in the pf-kernel branch, so a userspace daemon could not reach another process's memory the way uksmd did. What mainline *did* gain — `process_madvise()` with `MADV_COLLAPSE` and `MADV_COLD` — pointed the other way: it never accepted `MADV_MERGEABLE`.
+
+The kernel has since caught up. **`PR_SET_MEMORY_MERGE` (prctl 67) is the mainline equivalent of what uksmd was reaching for** — a process-wide KSM eligibility flag, no per-region marking, no kernel patch. AKSMD is built on that, and on `ptrace(2)` to set it on processes the daemon does not own.
 
 I missed uksmd. I wanted it back — but modernized, safer, and with features the original never had.
 
@@ -36,8 +38,8 @@ I missed uksmd. I wanted it back — but modernized, safer, and with features th
 | Feature | Description |
 |---------|-------------|
 | **PSI-Aware Governor** | Dynamically tunes KSM aggressiveness based on memory pressure (PSI) — backs off when system is under pressure, ramps up when idle |
-| **Process Scanner** | Proactively finds processes with high anonymous RSS and marks their memory for KSM merging |
-| **PTrace MADV_MERGEABLE Injection** | Uses `ptrace(2)` to inject `madvise(MADV_MERGEABLE)` into target processes — the **only way** to mark another process's memory as mergeable cross-process |
+| **Process Scanner** | Proactively finds processes with high anonymous RSS and makes every mapping of them KSM-eligible |
+| **PTrace `PR_SET_MEMORY_MERGE` Injection** | Uses `ptrace(2)` to inject `prctl(PR_SET_MEMORY_MERGE, 1)` into target processes — the only way to enable process-wide KSM eligibility on a process you do not own |
 | **MADV_COLLAPSE Support** | Opportunistically promotes memory to Transparent Huge Pages after KSM unmerges pages (breaks THP) |
 | **KSM Advisor Mode** | Runs in kernel's "scan-time" advisor mode — biases bounds only, lets kernel do the scanning |
 | **Full State Snapshotting** | Atomically snapshots KSM config on startup, restores on shutdown — zero config drift |
@@ -48,19 +50,34 @@ I missed uksmd. I wanted it back — but modernized, safer, and with features th
 
 ## How It Works (The PTrace Magic)
 
-Since Linux's `process_madvise(2)` **does not support `MADV_MERGEABLE`** for cross-process operations (only `MADV_COLD`, `MADV_COLLAPSE`, `MADV_PAGEOUT`, `MADV_WILLNEED`), AKSMD uses `ptrace(2)` to inject the syscall directly:
+`PR_SET_MEMORY_MERGE` (prctl option 67) sets `MMF_VM_MERGE_ANY` on a process's
+`struct mm_struct`, which makes **every** mapping of that process eligible for
+KSM — including VMAs created after the call. This is the capability uksmd got
+from its pf-kernel `process_ksm_enable()` syscall, now available in mainline
+with no patch required.
+
+`prctl` can only ever act on the *calling* process, so there is no userspace
+call that reaches another process's `mm`. AKSMD therefore injects the syscall
+directly:
 
 ```
 1. PTRACE_ATTACH to target PID → waitpid(WSTOPPED)
 2. GETREGS → save ALL registers (syscall clobbers RCX/R11)
 3. Find `syscall` instruction (0x0F 0x05) in target's vDSO
-4. Set RIP → vDSO syscall addr, RAX=28 (madvise), RDI=addr, RSI=len, RDX=12 (MADV_MERGEABLE)
-4. PTRACE_SYSCALL → waitpid (entry stop) → PTRACE_SYSCALL → waitpid (exit stop)
-5. GETREGS → read RAX for return value
-6. Restore ALL original registers → PTRACE_DETACH
+4. Set RIP → vDSO syscall addr, RAX=157 (prctl), RDI=67, RSI=1
+5. PTRACE_SYSCALL → waitpid (entry stop) → PTRACE_SYSCALL → waitpid (exit stop)
+6. GETREGS → read RAX for return value
+7. Restore ALL original registers → PTRACE_DETACH
 ```
 
-This is the **only way** to mark another process's memory as `MADV_MERGEABLE` from userspace. AKSMD does it safely: full register save/restore, SIGTRAP verification, vDSO syscall instruction discovery per-PID, and graceful error handling.
+Because the flag lives on `mm_struct`, it is **inherited across `fork` and
+`execve`** — both verified on a live 7.3 kernel. Marking a long-lived shell or
+init would therefore mark everything it ever spawns, so the blocklist and
+`max_candidates_per_cycle` are the guard, not an optimisation.
+
+One injection replaces what used to be one `madvise()` per region, and it needs
+no address ranges at all — so `/proc/PID/maps`, the most expensive part of the
+scan, is never read.
 
 ---
 
@@ -127,11 +144,10 @@ stabilization_secs = 30          # min seconds between repeated actions in the s
 ksm_path = "/sys/kernel/mm/ksm"  # KSM sysfs directory (the only thing written to)
 
 [scanner]
-enabled = true                   # inject MADV_MERGEABLE into other processes
+enabled = true                   # enable process-wide KSM eligibility on other processes
 interval_secs = 30               # how often to scan processes, in seconds
 min_anon_rss_mb = 100            # only consider processes above this anonymous RSS, in MiB
 duplicate_ratio_threshold = 0.15 # fraction (0,1] of anon pages that look duplicated
-max_mergeable_per_process_mb = 512  # per-process cap, in MiB, to avoid over-marking
 max_candidates_per_cycle = 5     # top-K processes marked per scan cycle
 blocklist = ["animaksm", "ksmd", "systemd", "sshd"]  # process names never touched (replaces the default list)
 target_cgroups = []              # empty = scan all user processes
@@ -228,9 +244,9 @@ actually earning its CPU.
 │  └──────────────┘  └──────────────┘  └────────┬─────────┘  │
 │                                                │             │
 │                         ┌──────────────────────▼──────────┐  │
-│                         │     MADV Injector (PTrace)      │  │
+│                         │     Eligibility Injector (PTrace) │
 │                         │  • Attach → vDSO syscall → Detach │  │
-│                         │  • MADV_MERGEABLE injection      │  │
+│                         │  • PR_SET_MEMORY_MERGE injection │  │
 │                         │  • MADV_COLLAPSE (process_madvise)│ │
 │                         └──────────────┬──────────────────┘  │
 │                                        │                      │
@@ -258,7 +274,7 @@ actually earning its CPU.
 | Feature | uksmd (original) | AKSMD |
 |---------|------------------|-----------|
 | Language | C | **Rust** (memory safe) |
-| MADV_MERGEABLE | pidfd + process_madvise (broken) | **PTrace injection (works)** |
+| Process-wide eligibility | `process_ksm_enable()` (pf-kernel only) | **`PR_SET_MEMORY_MERGE` via ptrace — mainline, no patch** |
 | MADV_COLLAPSE | ❌ | ✅ |
 | PSI-aware governor | Basic | **Advanced (hysteresis, stabilization)** |
 | KSM Advisor mode | ❌ | ✅ |
@@ -271,10 +287,10 @@ actually earning its CPU.
 ## FAQ
 
 ### Why not just use `ksmtuned`?
-`ksmtuned` is deprecated and only adjusts KSM parameters reactively. AKSMD **proactively hunts processes** and **injects MADV_MERGEABLE** via ptrace — something `ksmtuned` never did.
+`ksmtuned` is deprecated and only adjusts KSM parameters reactively. AKSMD **proactively hunts processes** and **enables process-wide KSM eligibility** via ptrace — something `ksmtuned` never did.
 
 ### Does it work with containers (Docker/Podman)?
-Yes! The scanner finds processes by PID namespace. For container workloads, run AKSMD on the host — it sees all container processes and can inject MADV_MERGEABLE into them.
+Yes! The scanner finds processes by PID namespace. For container workloads, run AKSMD on the host — it sees all container processes and can enable KSM eligibility in them.
 
 ### Is it safe to run on production?
 Yes. AKSMD:

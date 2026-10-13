@@ -23,7 +23,6 @@ enabled = true
 interval_secs = 30              # how often to scan processes
 min_anon_rss_mb = 100           # only consider processes with >100MB anonymous RSS
 duplicate_ratio_threshold = 0.15
-max_mergeable_per_process_mb = 512  # cap per-process to avoid over-marking
-max_candidates_per_cycle = 5    # top K by RSS only (avoid O(n*m) cost)
+max_candidates_per_cycle = 5    # top K by RSS per cycle (bounds the ptrace burst)
 blocklist = ["animaksm", "ksmd", "systemd", "sshd", "journald", "udevd"]
 target_cgroups = []             # empty = scan all user processes

@@ -4,9 +4,9 @@
 
 `animaksm` is a Rust-based userspace daemon that drives Linux's Kernel Samepage
 Merging (KSM) subsystem with a PSI-aware governor, marks other processes'
-anonymous pages `MADV_MERGEABLE` via ptrace injection, and logs the resulting KSM
-statistics. It reduces memory use in cloud, container, and embedded workloads
-where many processes share identical pages.
+anonymous pages KSM-eligible by ptrace-injecting `prctl(PR_SET_MEMORY_MERGE)`,
+and logs the resulting KSM statistics. It reduces memory use in cloud,
+container, and embedded workloads where many processes share identical pages.
 
 It is a KSM tool and nothing else. It writes only `/sys/kernel/mm/ksm/*`.
 
@@ -83,9 +83,10 @@ test(scope): description
 ## Rust gotchas
 
 - Async runtime: only Tokio v1 (installed in the workspace)
-- `unsafe` is confined to the low-level kernel interfaces: ptrace/madvise
-  injection in `crates/daemon/src/madvise.rs` (7 sites) and the PSI trigger fd
-  handling in `crates/common/src/psi.rs` (6 sites). Do not add it elsewhere.
+- `unsafe` is confined to the low-level kernel interfaces: the ptrace/prctl
+  injection and `process_madvise` calls in `crates/daemon/src/madvise.rs` (5
+  sites) and the PSI trigger fd handling in `crates/common/src/psi.rs` (6
+  sites). Do not add it elsewhere.
 
 ## No secrets
 

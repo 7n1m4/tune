@@ -115,11 +115,10 @@ pub struct ScannerConfig {
     pub interval_secs: u64,
     pub min_anon_rss_mb: u64,
     pub duplicate_ratio_threshold: f32,
-    pub max_mergeable_per_process_mb: u64,
     pub blocklist: Vec<String>,
     pub target_cgroups: Vec<String>,
-    /// Maximum number of processes to apply madvise to per scan cycle.
-    /// Limits CPU overhead from syscall bursts.
+    /// Maximum number of processes to enable cross-process KSM eligibility on
+    /// per scan cycle. Bounds the cost of a ptrace burst.
     pub max_candidates_per_cycle: usize,
 }
 
@@ -130,7 +129,6 @@ impl Default for ScannerConfig {
             interval_secs: 30,
             min_anon_rss_mb: 100,
             duplicate_ratio_threshold: 0.15,
-            max_mergeable_per_process_mb: 512,
             blocklist: vec![
                 "animaksm".to_string(),
                 "ksmd".to_string(),
