@@ -98,10 +98,36 @@ The faulting address resolves to offset `0x6d9e0c0` of the chrome binary
 So AKSMD injects `madvise(MADV_UNMERGEABLE)` on every `r-xp` mapping right after
 setting the flag. That has to be injected too: `process_madvise(2)` refuses KSM
 advices on a remote `mm` — `process_madvise_remote_valid()` allows only COLD,
-PAGEOUT, WILLNEED and COLLAPSE. The cost is a handful of extra injections per
-process, and the payoff is that the anonymous memory (the actual prize) still
-merges while code pages stay untouched. `ScannerStats::exec_vmas_protected`
-reports the count, so the protection is visible rather than assumed.
+PAGEOUT, WILLNEED and COLLAPSE. `ScannerStats::exec_vmas_protected` reports the
+count at marking time, and `exec_vmas_reprotected` reports it on later cycles,
+so coverage is observable rather than assumed.
+
+**But the withdrawal is not sufficient, and browsers are blocked by default.**
+
+A supervised live run with both counters firing (`exec_vmas_protected=403`,
+`exec_vmas_reprotected=96`) still produced the identical crash 60 seconds in:
+
+```text
+traps: chrome[1228652] trap invalid opcode ip:560f6177d0c0 sp:7ffc9523a490
+error:0 in chrome[6d9d0c0,560f5c07b000+e32d000]
+```
+
+Same binary, same `0x6d9e0c0` offset, same stack pointer as the unguarded
+crashes. So `MADV_UNMERGEABLE` on every `r-xp` VMA did not prevent it. Candidate
+explanations, none confirmed against the crash-time VMA state: `MADV_UNMERGEABLE`
+may only stop *future* scans and leave already-merged pages pointed at their
+shared copy; a renderer's fresh JIT region may be created and faulted before the
+next 30 s pass; and ptrace injection into a sandboxed renderer may be refused.
+
+Rather than keep guessing, browsers are in the default blocklist. Their
+anonymous memory is JIT-heavy and fork-heavy by construction, which is precisely
+the profile where a userspace guard cannot keep up. The blocked set is
+`chrome`, `chromium`, `firefox`, `msedge`, `brave`, `opera`, `vivaldi` and
+`electron`.
+
+The guard remains — it protects ordinary processes, where the exec surface is
+static at startup — but it is not claimed as browser-safe. Removing an entry
+from the blocklist is a deliberate, at-your-own-risk override.
 
 One injection replaces what used to be one `madvise()` per eligible region, and
 no address/length pair is needed for the marking itself. `/proc/PID/maps` is
@@ -179,7 +205,7 @@ interval_secs = 30               # how often to scan processes, in seconds
 min_anon_rss_mb = 100            # only consider processes above this anonymous RSS, in MiB
 duplicate_ratio_threshold = 0.15 # fraction (0,1] of anon pages that look duplicated
 max_candidates_per_cycle = 5     # top-K processes marked per scan cycle
-blocklist = ["animaksm", "ksmd", "systemd", "sshd"]  # process names never touched (replaces the default list)
+blocklist = ["animaksm", "ksmd", "systemd", "sshd"]  # replaces the default list
 target_cgroups = []              # empty = scan all user processes
 ```
 
@@ -189,6 +215,12 @@ target_cgroups = []              # empty = scan all user processes
 > just quietly leaves `max_candidates_per_cycle` at its default. Check key
 > names against `crates/common/src/config.rs`, and remember that list-valued
 > keys like `blocklist` *replace* the default list rather than extending it.
+>
+> **That replacement has teeth.** The default `blocklist` contains the browsers
+> (`chrome`, `chromium`, `firefox`, `msedge`, `brave`, `opera`, `vivaldi`,
+> `electron`). Writing your own `blocklist` — even the four lines shown above —
+> silently drops all of them and re-opens the SIGILL crash. Copy the full list
+> from `config/animaksm.toml` into your config.
 
 ### Run
 ```bash

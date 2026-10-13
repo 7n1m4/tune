@@ -134,6 +134,22 @@ impl Default for ScannerConfig {
                 "ksmd".to_string(),
                 "systemd".to_string(),
                 "sshd".to_string(),
+                // Browsers are blocked by default, not by configuration. Their
+                // anonymous memory is dominated by JIT-compiled code that is
+                // mapped, written, and re-forked far faster than any userspace
+                // guard can track, and merging executable pages across
+                // renderer processes crashes them with SIGILL. Chromium's
+                // kernel comm is `chrome` (PR_SET_NAME truncates to 15 chars);
+                // the names below cover Chromium builds under other comms and
+                // the Firefox family.
+                "chrome".to_string(),
+                "chromium".to_string(),
+                "firefox".to_string(),
+                "msedge".to_string(),
+                "brave".to_string(),
+                "opera".to_string(),
+                "vivaldi".to_string(),
+                "electron".to_string(),
             ],
             target_cgroups: vec![],
             max_candidates_per_cycle: 5,

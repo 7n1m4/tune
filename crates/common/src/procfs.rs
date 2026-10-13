@@ -404,6 +404,34 @@ mod tests {
         assert!(!is_blocklisted("firefox", &blocklist));
     }
 
+    /// Browsers must be blocked by the shipped defaults, not left to the
+    /// operator. This guards the default blocklist against a regression:
+    /// marking Chromium's renderers crashed them live with SIGILL at a fixed
+    /// `.text` offset (`traps: chrome[...] trap invalid opcode`), twice — once
+    /// unguarded and once with the executable-VMA guard demonstrably firing.
+    ///
+    /// Kernel `comm` is at most 15 chars and Chromium sets it to `chrome`.
+    #[test]
+    fn test_default_blocklist_excludes_browsers() {
+        let defaults = crate::config::ScannerConfig::default();
+        for browser in [
+            "chrome",
+            "chromium",
+            "firefox",
+            "firefox-nightly",
+            "msedge",
+            "brave",
+            "opera",
+            "vivaldi",
+            "electron",
+        ] {
+            assert!(
+                is_blocklisted(browser, &defaults.blocklist),
+                "{browser} must be in the default scanner blocklist"
+            );
+        }
+    }
+
     #[test]
     fn test_parse_kb_value() {
         assert_eq!(parse_kb_value("  12345 kB"), 12345);
