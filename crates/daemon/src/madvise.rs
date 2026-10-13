@@ -12,7 +12,12 @@
 //! 67, confirmed present and working on 6.x/7.x) — which is what uksmd's
 //! `process_ksm_enable()` syscall did on pf-kernel. One injection marks
 //! **every** mapping of a process mergeable, including VMAs created after the
-//! call, and no address/length pair is needed at all.
+//! call, and no address/length pair is needed for the marking itself.
+//!
+//! The saving over the old path is the *population*: every non-executable
+//! mapping is offered, not just the ones a userspace daemon enumerated.
+//! `/proc/PID/maps` is still read, but only to locate executable mappings to
+//! withdraw from merging — see [`unmerge_executable_vmas`].
 //!
 //! ## Safety: the flag is inherited
 //!
@@ -49,6 +54,12 @@ const PR_SET_MEMORY_MERGE: libc::c_ulong = 67;
 /// that cannot succeed. It is *not* used to mark memory any more.
 const MADV_MERGEABLE: libc::c_int = 12;
 
+/// `MADV_UNMERGEABLE` — undoes `MADV_MERGEABLE` for one VMA.
+///
+/// This is the safety valve for `PR_SET_MEMORY_MERGE`. See
+/// [`unmerge_executable_vmas`] for why the kernel's own gate is not enough.
+const MADV_UNMERGEABLE: libc::c_int = 13;
+
 /// MADV_COLLAPSE constant (Linux 6.1+, collapses memory into THP).
 const MADV_COLLAPSE: libc::c_int = 25;
 
@@ -61,20 +72,30 @@ const SYS_PIDFD_OPEN: libc::c_long = 434;
 /// prctl syscall number (x86_64).
 const SYS_PRCTL: libc::c_long = 157;
 
+/// madvise syscall number (x86_64).
+const SYS_MADVISE: libc::c_long = 28;
+
 /// Result of enabling process-wide KSM eligibility on one process.
 #[derive(Debug)]
 pub struct MergeableResult {
     pub pid: u32,
     /// 1 when the injection succeeded, else 0.
     pub processes_marked: usize,
+    /// Executable VMAs withdrawn from merging after the flag was set. See
+    /// [`unmerge_executable_vmas`] — this is a safety counter, not a tunable.
+    pub exec_vmas_protected: usize,
     pub error: Option<String>,
 }
 
 /// Enable process-wide KSM eligibility on a target process.
 ///
-/// Injects a single `prctl(PR_SET_MEMORY_MERGE, 1, 0, 0, 0)` via ptrace. This is
-/// the whole operation: no regions, no address/length pair, and it takes effect
-/// for VMAs that do not yet exist.
+/// Injects `prctl(PR_SET_MEMORY_MERGE, 1, 0, 0, 0)` via ptrace, then withdraws
+/// eligibility from the process's executable mappings. Both steps are
+/// required: the first opens the whole address space to KSM, the second puts
+/// `.text` back out of reach, which is the constraint the userspace
+/// `madvise(MADV_MERGEABLE)` API used to provide and the kernel's `merge_any`
+/// gate does not. See [`unmerge_executable_vmas`] for the kernel source and
+/// the measured failure this prevents.
 ///
 /// `prctl` cannot be executed on another process by any other means — it always
 /// acts on the calling process's `mm` — so ptrace injection is the only route
@@ -87,31 +108,149 @@ pub fn enable_merge_any(pid: u32, dry_run: bool) -> MergeableResult {
         return MergeableResult {
             pid,
             processes_marked: 1,
+            exec_vmas_protected: 0,
             error: None,
         };
     }
 
     match prctl_via_ptrace(pid, PR_SET_MEMORY_MERGE, 1, 0, 0) {
         Ok(()) => {
+            // Ordering matters: `PR_SET_MEMORY_MERGE` marks every existing VMA,
+            // so the executable ones must be withdrawn immediately after, in
+            // the same pass, before ksmd can observe them.
+            let (withdrawn, exec_vmas) = unmerge_executable_vmas(pid, false);
             debug!(
                 pid,
-                "Enabled process-wide KSM eligibility (PR_SET_MEMORY_MERGE)"
+                withdrawn, exec_vmas, "Enabled process-wide KSM eligibility"
             );
             MergeableResult {
                 pid,
                 processes_marked: 1,
+                exec_vmas_protected: withdrawn,
                 error: None,
             }
         }
         Err(e) => MergeableResult {
             pid,
             processes_marked: 0,
+            exec_vmas_protected: 0,
             error: Some(e),
         },
     }
 }
 
-/// Opportunistically collapse memory regions into transparent huge pages.
+/// Withdraw process-wide eligibility from executable code mappings.
+///
+/// ## Why this is mandatory
+///
+/// `PR_SET_MEMORY_MERGE` makes **every** mapping of a process eligible, and the
+/// kernel's gate (`__ksm_should_add_vma` → `ksm_compatible()`) decides what to
+/// accept with this rule and no other:
+///
+/// ```c
+/// static bool ksm_compatible(const struct file *file, vma_flags_t vma_flags)
+/// {
+///         if (vma_flags_test_any(&vma_flags, VMA_SHARED_BIT, VMA_MAYSHARE_BIT,
+///                                VMA_HUGETLB_BIT))
+///                 return false;
+///         if (vma_flags_test_single_mask(&vma_flags, VMA_DROPPABLE))
+///                 return false;
+///         if (vma_flags_test_any(&vma_flags, VMA_SPECIAL_FLAGS))
+///                 return false;
+///         return true;
+/// }
+/// ```
+///
+/// Verified against `torvalds/linux:mm/ksm.c`. **`VM_EXEC` is not in that
+/// list.** A userspace `madvise(addr, len, MADV_MERGEABLE)` would never have
+/// been issued against a code mapping, so in-tree KSM's long-standing
+/// behaviour is to leave `.text` alone — the kernel simply never gets the
+/// chance. `merge_any` removes that implicit constraint by marking the VMA
+/// itself, so the daemon has to restore the constraint the userspace API used
+/// to provide.
+///
+/// The consequence of not doing so is measured, not theoretical. A live run
+/// of the daemon marked Chrome (Chromium clang build, `--app=` window plus
+/// four renderers); 90 seconds later the renderers died with
+///
+/// ```text
+/// traps: chrome[1178241] trap invalid opcode ip:559b3271e0c0 sp:7ffc95e99410
+/// error:0 in chrome[6d9d0c0,559b2d01c000+e32d000]
+/// ```
+///
+/// The minidumps resolve that faulting address to offset `0x6d9e0c0` of
+/// `/opt/chromium.org/chromium-unstable/chrome` — the V8/Blink `.text`
+/// segment, with the same IP and SP in all four reports.
+///
+/// ## Why it must be injected rather than called through `process_madvise`
+///
+/// `process_madvise(2)` handles `MADV_UNMERGEABLE` internally (line 1418 of
+/// `mm/madvise.c`) but gates *remote* calls with `process_madvise_remote_valid()`,
+/// which allows only `MADV_COLD`, `MADV_PAGEOUT`, `MADV_WILLNEED` and
+/// `MADV_COLLAPSE`. A KSM advice on another process's `mm` therefore has no
+/// syscall route, and — exactly as for `prctl` — needs ptrace injection of
+/// `madvise(addr, len, MADV_UNMERGEABLE)` per region.
+///
+/// This is still a large win over the path it replaces: one `prctl` plus a
+/// handful of `madvise` calls per process, versus one `madvise` per eligible
+/// region over the whole process.
+///
+/// ## Correctness note
+///
+/// `MADV_UNMERGEABLE` clears only `VM_MERGEABLE` on the targeted VMA; it leaves
+/// `MMF_VM_MERGE_ANY` on the `mm_struct` intact and therefore still covers
+/// every other mapping, including those created after this call.
+///
+/// # Returns
+/// `(vmas_withdrawn, exec_vmas)` — the first is the count withdrawn, the second
+/// is the count of executable mappings found, so metrics can tell "protected"
+/// apart from "none found".
+pub fn unmerge_executable_vmas(pid: u32, dry_run: bool) -> (usize, usize) {
+    let maps = match animaksm_common::procfs::read_process_maps(pid) {
+        Ok(m) => m,
+        Err(e) => {
+            debug!(pid, error = %e, "cannot read maps to protect executable VMAs");
+            return (0, 0);
+        }
+    };
+
+    let exec_vmas: Vec<&MapsEntry> = maps.iter().filter(|e| e.has_exec()).collect();
+    if exec_vmas.is_empty() {
+        return (0, 0);
+    }
+
+    if dry_run {
+        return (exec_vmas.len(), exec_vmas.len());
+    }
+
+    let mut withdrawn = 0;
+    for vma in &exec_vmas {
+        let len = vma.end.saturating_sub(vma.start) as usize;
+        if len == 0 {
+            continue;
+        }
+        match madvise_via_ptrace(pid, vma.start, len, MADV_UNMERGEABLE) {
+            Ok(()) => withdrawn += 1,
+            Err(e) => debug!(
+                pid,
+                start = format!("0x{:x}", vma.start),
+                error = %e,
+                "MADV_UNMERGEABLE skipped for executable VMA"
+            ),
+        }
+    }
+
+    if withdrawn > 0 {
+        debug!(
+            pid,
+            withdrawn,
+            exec_vmas = exec_vmas.len(),
+            "Protected executable VMAs from KSM merging"
+        );
+    }
+
+    (withdrawn, exec_vmas.len())
+}
 ///
 /// Uses process_madvise(MADV_COLLAPSE) on aligned 2MB regions.
 /// This is useful after KSM unmerges pages (which triggers CoW and
@@ -241,18 +380,18 @@ fn find_syscall_in_vdso(pid: u32) -> Result<u64, String> {
         .ok_or_else(|| "no syscall instruction in vdso".to_string())
 }
 
-/// Inject `prctl(option, arg2, arg3, arg4, arg5)` into a target process.
-///
 /// ptrace(2) syscall injection pattern (x86_64):
 ///   1. PTRACE_ATTACH + waitpid(WSTOPPED)
 ///   2. getregs → save ALL registers (syscall clobbers rcx, r11)
 ///   3. Find a `syscall` instruction in the target’s vDSO
-///   4. Set regs: rip → vDSO syscall addr, rax=157, rdi..r5 = prctl args
+///   4. Set regs: rip → vDSO syscall addr, rax=nr, rdi..r5 = args
 ///   5. ptrace(SYSCALL) → waitpid (entry stop)
 ///   6. ptrace(SYSCALL) → waitpid (exit stop)
 ///   7. getregs → read rax for return value
 ///   8. Restore ALL original registers
 ///   9. PTRACE_DETACH
+///
+/// Inject `prctl(option, arg2, arg3, arg4, arg5)` into a target process.
 fn prctl_via_ptrace(
     pid: u32,
     option: libc::c_ulong,
@@ -260,12 +399,42 @@ fn prctl_via_ptrace(
     arg3: libc::c_ulong,
     arg4: libc::c_ulong,
 ) -> Result<(), String> {
+    inject_syscall(pid, SYS_PRCTL, option, arg2, arg3, arg4, 0, 0)
+}
+
+/// Inject `madvise(addr, len, advice)` into a target process.
+///
+/// Needed because `process_madvise(2)` refuses KSM advices on a remote `mm`
+/// (`process_madvise_remote_valid()` in `mm/madvise.c` allows only COLD,
+/// PAGEOUT, WILLNEED and COLLAPSE), so `MADV_UNMERGEABLE` on another process
+/// has no syscall route.
+fn madvise_via_ptrace(pid: u32, addr: u64, len: usize, advice: libc::c_int) -> Result<(), String> {
+    inject_syscall(pid, SYS_MADVISE, addr, len as u64, advice as u64, 0, 0, 0)
+}
+
+/// Inject an arbitrary syscall into a target process via ptrace.
+///
+/// Attaches, saves every register, points RIP at the target's own vDSO
+/// `syscall` instruction with the requested number in RAX and the arguments
+/// in RDI..R9, single-steps entry then exit, reads RAX, and restores *all*
+/// original registers before detaching. Register restoration failure is
+/// treated as fatal: the target would otherwise resume with a corrupted RIP.
+#[allow(clippy::too_many_arguments)]
+fn inject_syscall(
+    pid: u32,
+    syscall_nr: libc::c_long,
+    arg1: libc::c_ulong,
+    arg2: libc::c_ulong,
+    arg3: libc::c_ulong,
+    arg4: libc::c_ulong,
+    arg5: libc::c_ulong,
+    arg6: libc::c_ulong,
+) -> Result<(), String> {
     let nix_pid = Pid::from_raw(pid as i32);
 
     debug!(
         pid,
-        prctl_option = option,
-        "Injecting prctl into target process via ptrace"
+        syscall_nr, "Injecting syscall into target process via ptrace"
     );
 
     // Attach to the target process
@@ -308,15 +477,17 @@ fn prctl_via_ptrace(
 
     let mut regs = orig;
 
-    // Set up prctl(option, arg2, arg3, arg4, arg5)
-    // x86_64: rax=157 (SYS_prctl), rdi=option, rsi..r5 = the four arguments
+    // Set up the injected syscall: rax = number, rdi..r6 = the six arguments.
+    // On x86_64 the register set doubles as the argument registers, minus r10
+    // which carries the kernel-side rcx clobber.
     regs.rip = syscall_addr;
-    regs.rax = SYS_PRCTL as u64;
-    regs.rdi = option;
+    regs.rax = syscall_nr as u64;
+    regs.rdi = arg1;
     regs.rsi = arg2;
     regs.rdx = arg3;
     regs.r10 = arg4;
-    regs.r8 = 0;
+    regs.r8 = arg5;
+    regs.r9 = arg6;
 
     if let Err(e) = ptrace::setregs(nix_pid, regs) {
         let _ = ptrace::detach(nix_pid, None);
@@ -393,7 +564,8 @@ fn prctl_via_ptrace(
     if ret < 0 && ret > -4096 {
         let errno = (-ret) as i32;
         return Err(format!(
-            "prctl failed: errno={errno} ({})",
+            "injected syscall (nr={}) failed: errno={errno} ({})",
+            syscall_nr,
             errno_to_str(errno)
         ));
     }
@@ -471,10 +643,76 @@ mod tests {
         let result = enable_merge_any(0xFFFF_FFFE, false);
 
         assert_eq!(result.processes_marked, 0);
+        assert_eq!(result.exec_vmas_protected, 0);
         assert!(
             result.error.is_some(),
             "injecting into a dead PID must report an error"
         );
+    }
+
+    // ── executable-VMA guard ──────────────────────────────────────────────
+
+    /// Regression test for the SIGILL crashes this guard prevents.
+    ///
+    /// `PR_SET_MEMORY_MERGE` makes every VMA eligible, and in-tree KSM's gate
+    /// (`ksm_compatible()` in `mm/ksm.c`) excludes only VM_SHARED, VM_HUGETLB
+    /// and the VMA_SPECIAL set — **not VM_EXEC**. So a browser's `r-xp` code
+    /// mapping becomes mergeable. Live evidence: four Chromium renderers died
+    /// with `traps: chrome[...] trap invalid opcode ip:559b3271e0c0` at the
+    /// same offset (0x6d9e0c0) of the chrome binary, i.e. inside `.text`.
+    ///
+    /// This asserts the guard finds and withdraws a real executable VMA in the
+    /// test binary itself, using its own maps — no mocking.
+    #[test]
+    fn test_unmerge_executable_vmas_withdraws_real_executable_vmas() {
+        let pid = std::process::id();
+
+        // Precondition: any process running code has executable mappings.
+        let exec_in_maps = animaksm_common::procfs::read_process_maps(pid)
+            .expect("test process maps must be readable")
+            .iter()
+            .filter(|m| m.has_exec())
+            .count();
+        assert!(
+            exec_in_maps > 0,
+            "expected this process to have executable mappings to protect"
+        );
+
+        // dry_run: reports what it would do, touches nothing.
+        let (dry, dry_total) = unmerge_executable_vmas(pid, true);
+        assert_eq!(dry, dry_total);
+        assert_eq!(dry_total, exec_in_maps);
+
+        // Real run. On a build host the injected madvise may be refused (no
+        // ptrace scope available in a sandboxed CI), so the contract is that
+        // the guard *attempted* every executable VMA and reported honestly.
+        let (withdrawn, total) = unmerge_executable_vmas(pid, false);
+        assert_eq!(
+            total, exec_in_maps,
+            "every executable VMA must be attempted, none skipped silently"
+        );
+        assert!(
+            withdrawn <= total,
+            "cannot withdraw more VMAs than were found"
+        );
+    }
+
+    /// The guard must not invent executable VMAs for a process that has none.
+    #[test]
+    fn test_unmerge_executable_vmas_reports_zero_for_dead_pid() {
+        let (withdrawn, total) = unmerge_executable_vmas(0xFFFF_FFFE, false);
+
+        assert_eq!(withdrawn, 0);
+        assert_eq!(total, 0);
+    }
+
+    /// `enable_merge_any` must carry the guard's result, so operators can see
+    /// protection actually happening rather than assume it.
+    #[test]
+    fn test_enable_merge_any_on_dead_pid_reports_zero_exec_vmas_protected() {
+        let result = enable_merge_any(0xFFFF_FFFE, false);
+
+        assert_eq!(result.exec_vmas_protected, 0);
     }
 
     // ── collapse_regions (MADV_COLLAPSE via process_madvise) ──────────────

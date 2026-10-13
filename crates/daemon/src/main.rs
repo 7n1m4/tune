@@ -4,10 +4,10 @@
 //! scanning aggressiveness based on memory pressure, and proactively
 //! marking duplicate-heavy processes for KSM merging.
 
-mod governor;
-mod madvise;
-mod metrics;
-mod scanner;
+pub mod governor;
+pub mod madvise;
+pub mod metrics;
+pub mod scanner;
 
 use std::fs;
 use std::future::Future;

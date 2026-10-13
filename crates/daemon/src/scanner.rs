@@ -36,6 +36,10 @@ pub struct ScannerStats {
     pub processes_filtered_l2: u64,
     pub processes_filtered_l25_profit: u64,
     pub processes_marked: u64,
+    /// Executable VMAs withdrawn from KSM eligibility after marking. Non-zero
+    /// means the guard in `madvise::enable_merge_any` ran; the guard exists
+    /// because in-tree KSM's `merge_any` gate does not exclude `VM_EXEC`.
+    pub exec_vmas_protected: u64,
     pub injection_failures: u64,
     pub scan_cycles: u64,
     pub skipped_stabilization: u64,
@@ -145,10 +149,11 @@ where
         debug!("No Level 3 targets after eligibility filters");
     }
 
-    // Process-wide eligibility needs no address ranges, so `/proc/PID/maps` —
-    // by far the most expensive step of the scan — is never read. Only the PID
-    // matters now, which is what makes this dramatically cheaper than the
-    // per-region `madvise` approach it replaces.
+    // Process-wide eligibility needs no address ranges, so the merge population
+    // is never derived from `/proc/PID/maps` — that is what makes this
+    // dramatically cheaper than the per-region `madvise` approach it replaces.
+    // Maps is still read once per marked PID, but only to withdraw executable
+    // VMAs (see `madvise::unmerge_executable_vmas`).
     l25_candidates
 }
 
@@ -249,6 +254,7 @@ impl Scanner {
         for candidate in &candidates {
             let result = madvise::enable_merge_any(candidate.pid, self.dry_run);
             self.stats.processes_marked += result.processes_marked as u64;
+            self.stats.exec_vmas_protected += result.exec_vmas_protected as u64;
 
             if let Some(error) = result.error {
                 // A target can exit, or be un-injectable (kernel threads, and
@@ -301,6 +307,7 @@ impl Scanner {
             l25_profit_filtered = self.stats.processes_filtered_l25_profit,
             targeted = candidates.len(),
             processes_marked = self.stats.processes_marked,
+            exec_vmas_protected = self.stats.exec_vmas_protected,
             thp_collapsed = self.stats.thp_collapsed,
             skipped_stab = self.stats.skipped_stabilization,
             "Scanner cycle complete"
@@ -411,6 +418,7 @@ mod tests {
         assert_eq!(stats.processes_filtered_l2, 0);
         assert_eq!(stats.processes_filtered_l25_profit, 0);
         assert_eq!(stats.processes_marked, 0);
+        assert_eq!(stats.exec_vmas_protected, 0);
         assert_eq!(stats.injection_failures, 0);
         assert_eq!(stats.skipped_stabilization, 0);
         assert_eq!(stats.thp_collapsed, 0);

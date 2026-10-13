@@ -75,9 +75,39 @@ Because the flag lives on `mm_struct`, it is **inherited across `fork` and
 init would therefore mark everything it ever spawns, so the blocklist and
 `max_candidates_per_cycle` are the guard, not an optimisation.
 
-One injection replaces what used to be one `madvise()` per region, and it needs
-no address ranges at all — so `/proc/PID/maps`, the most expensive part of the
-scan, is never read.
+### Why executable VMAs are withdrawn
+
+`PR_SET_MEMORY_MERGE` accepts every mapping, and the kernel's own gate
+(`ksm_compatible()` in `mm/ksm.c`) excludes only `VM_SHARED`, `VM_HUGETLB` and a
+small set of "special" mappings — **`VM_EXEC` is not among them**. Marking a
+process therefore makes its code mergeable, which the userspace
+`madvise(MADV_MERGEABLE)` API used to prevent implicitly (it was never called
+against a code mapping).
+
+This was measured, not theorised. The first version of this injection path did
+not guard against it, and Chromium died 90 seconds after being marked:
+
+```text
+traps: chrome[1178241] trap invalid opcode ip:559b3271e0c0 sp:7ffc95e99410
+error:0 in chrome[6d9d0c0,559b2d01c000+e32d000]
+```
+
+The faulting address resolves to offset `0x6d9e0c0` of the chrome binary
+(V8/Blink `.text`), the same in all four renderer crashes.
+
+So AKSMD injects `madvise(MADV_UNMERGEABLE)` on every `r-xp` mapping right after
+setting the flag. That has to be injected too: `process_madvise(2)` refuses KSM
+advices on a remote `mm` — `process_madvise_remote_valid()` allows only COLD,
+PAGEOUT, WILLNEED and COLLAPSE. The cost is a handful of extra injections per
+process, and the payoff is that the anonymous memory (the actual prize) still
+merges while code pages stay untouched. `ScannerStats::exec_vmas_protected`
+reports the count, so the protection is visible rather than assumed.
+
+One injection replaces what used to be one `madvise()` per eligible region, and
+no address/length pair is needed for the marking itself. `/proc/PID/maps` is
+still read — but only to find the executable mappings to withdraw, which is a
+few dozen reads per process rather than one per merged region, and it is never
+used to enumerate the merge population.
 
 ---
 
