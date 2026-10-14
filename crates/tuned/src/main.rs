@@ -126,14 +126,25 @@ async fn main() -> anyhow::Result<()> {
 /// A missing or unreadable config is not an error here — falling back to the
 /// library default keeps `tuned zswap verdict` usable when only the binary is
 /// installed and `/etc/tuned.toml` is not.
-fn zswap_verdict_path(path: Option<PathBuf>) -> PathBuf {
+pub(crate) fn zswap_verdict_path(path: Option<PathBuf>) -> PathBuf {
+    let configured = TunedConfig::load(Path::new(tuned_common::config::DEFAULT_CONFIG_PATH))
+        .ok()
+        .map(|config| config.zswap.stats_path);
+
+    resolve_verdict_path(path, configured)
+}
+
+/// The pure half of [`zswap_verdict_path`]: the precedence rule plus the
+/// blank-value rule, separated from the file read so the four outcomes are
+/// testable without a host-specific `/etc/tuned.toml`.
+///
+/// `configured` is the `stats_path` string as loaded, or `None` when the
+/// config was missing or unreadable.
+pub(crate) fn resolve_verdict_path(path: Option<PathBuf>, configured: Option<String>) -> PathBuf {
     if let Some(path) = path {
         return path;
     }
-    let configured = TunedConfig::load(Path::new(tuned_common::config::DEFAULT_CONFIG_PATH))
-        .ok()
-        .filter(|config| !config.zswap.stats_path.trim().is_empty())
-        .map(|config| config.zswap.stats_path);
+    let configured = configured.filter(|p| !p.trim().is_empty());
 
     configured
         .unwrap_or_else(|| tuned_zswap::STATS_PATH.to_string())
@@ -759,27 +770,94 @@ mod tests {
 
     /// `tuned status` must describe both subsystems, so the KSM-only output is
     /// not sufficient evidence — the zswap section has to be present too.
+    ///
+    /// The exact-value assertions are what make this bite. The ceiling is
+    /// compared digit-for-digit against `read_limit()`, and the
+    /// `MemAvailable` percentage against `MemInfo::read().available_percent()`
+    /// reformatted the way the line formats it — so a formatter that
+    /// substituted a constant, dropped the percent sign, or stopped reading
+    /// meminfo cannot pass. The ratio line is deliberately not pinned
+    /// digit-for-digit: it depends on whether anything is compressed right
+    /// now, so a "n/a" and a "12.34" are both correct states.
     #[test]
     fn test_status_includes_the_zswap_subsystem() {
         let output = format_zswap_line();
         assert!(
-            output.contains("max_pool_percent:"),
-            "expected the zswap ceiling, got: {}",
+            output.starts_with("zswap:"),
+            "expected a zswap section header, got: {}",
             output
         );
-        // A machine without zswap must not crash or claim a ceiling.
-        assert!(
-            output.contains("no (parameter unreadable)") || output.contains('%'),
-            "zswap line must state either the ceiling or its absence"
-        );
+
+        // Two shapes: a readable ceiling (zswap on) or an unreadable one
+        // (zswap off / not compiled in). Both must state whether it is on.
+        let ceiling = tuned_zswap::read_limit();
+        if let Ok(limit) = ceiling {
+            assert!(
+                output.contains("enabled:                yes"),
+                "a readable ceiling must report zswap as enabled, got: {}",
+                output
+            );
+            assert!(
+                output.contains(&format!("max_pool_percent:       {limit}%")),
+                "the ceiling must be reported verbatim as a percentage, got: {}",
+                output
+            );
+
+            // MemAvailable is computed, not read literally, so assert the
+            // same computation the line performs.
+            if let Ok(info) = tuned_zswap::MemInfo::read() {
+                assert!(
+                    output.contains(&format!(
+                        "MemAvailable:           {:.1}%",
+                        info.available_percent()
+                    )),
+                    "MemAvailable must be the computed percentage, got: {}",
+                    output
+                );
+            }
+
+            // The ratio line is the one value the formatter decides about:
+            // either the compressed/original quotient, or the explicit
+            // "nothing compressed yet" text. Both are correct states, so the
+            // assertion switches on which one `MemInfo` reports right now —
+            // and never passes if the wrong one is rendered.
+            if let Ok(info) = tuned_zswap::MemInfo::read() {
+                match info.ratio() {
+                    Some(r) => assert!(
+                        output.contains(&format!("compression ratio:      {:.2}", r)),
+                        "a compressed pool must report the computed ratio, got: {}",
+                        output
+                    ),
+                    None => assert!(
+                        output.contains("compression ratio:      n/a (nothing compressed yet)"),
+                        "an uncompressed pool must say so explicitly, got: {}",
+                        output
+                    ),
+                }
+            }
+        } else {
+            assert!(
+                output.contains("enabled:                no (parameter unreadable)"),
+                "an unreadable ceiling must report zswap as off, got: {}",
+                output
+            );
+        }
     }
 
+    /// `show_status` is the live path behind `tuned status`: it must read the
+    /// configured KSM directory and the real PSI file, not error out. The
+    /// unwrap doubles as the assertion — `build_status_output` returning an
+    /// `Err` here means the CLI would fail on a correctly configured machine.
+    ///
+    /// The stronger half: `show_status` must forward the caller's config path.
+    /// The sibling assertion below goes through `build_status_output` directly,
+    /// which would happily read the same KSM dir even if `show_status` had
+    /// hardcoded a path or dropped the argument. So the configured KSM
+    /// directory and PSI file are *removed* and it is asserted that the call
+    /// then fails — the only way the KSM dir can stop being read is if
+    /// `show_status` actually forwarded the config that points at it.
     #[tokio::test]
     async fn test_show_status_reads_configured_ksm_when_proc_psi_exists() {
-        if !Path::new("/proc/pressure/memory").exists() {
-            return;
-        }
-
         let dir = tempfile::tempdir().unwrap();
         let ksm_dir = dir.path().join("ksm");
         let state_dir = dir.path().join("state");
@@ -789,7 +867,37 @@ mod tests {
         let config_path = dir.path().join("tuned.toml");
         write_config(&config_path, &ksm_dir, &state_dir);
 
-        show_status(config_path).await.unwrap();
+        // The happy path: the configured KSM dir exists, PSI is live.
+        show_status(config_path.clone()).await.unwrap();
+
+        // Assert on the same inputs through the pure counterpart, so the test
+        // cannot pass by printing nothing.
+        let psi_path = Path::new("/proc/pressure/memory");
+        if psi_path.exists() {
+            let output = build_status_output(&config_path, psi_path, false).unwrap();
+            // Seeded, distinctive knobs — not values any other state would
+            // produce by accident.
+            assert!(output.contains("pages_to_scan:          500"));
+            assert!(output.contains("sleep_millisecs:        20"));
+            assert!(output.contains("max_page_sharing:       256"));
+            assert!(output.contains("advisor_mode:           none"));
+            assert!(output.contains("some avg10:"));
+        }
+
+        // The forwarding half: the same config pointing at a KSM dir that no
+        // longer exists must make the call fail. A `show_status` that ignored
+        // its argument would still find a KSM dir elsewhere and succeed.
+        let gone_dir = dir.path().join("gone-ksm");
+        std::fs::create_dir(&gone_dir).unwrap();
+        write_config(&config_path, &gone_dir, &state_dir);
+        std::fs::remove_dir_all(&gone_dir).unwrap();
+
+        let outcome = show_status(config_path.clone()).await;
+        assert!(
+            outcome.is_err(),
+            "show_status must honour the caller's config path; a missing KSM \
+             directory must surface as an error"
+        );
     }
 
     #[tokio::test]
@@ -1073,9 +1181,16 @@ mod tests {
 
         let err = load_config_or_default(&path).unwrap_err();
         let msg = err.to_string();
+        // The toml crate reports the failure with line/column context, and it
+        // is the *parse* that must be reported — not a silent fallback to
+        // defaults, and not the validation error the sibling test covers.
         assert!(
-            msg.contains("TOML parse error") || msg.contains("invalid"),
-            "unexpected error: {msg}"
+            msg.contains("TOML parse error") && msg.contains("at line 1"),
+            "expected a located TOML parse error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("must be between"),
+            "malformed input must surface as a parse error, not a validation one: {msg}"
         );
     }
 
@@ -1249,5 +1364,332 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("KSM path not found"));
+    }
+
+    // ── zswap_verdict_path: three branches ─────────────────────────────────
+
+    /// An explicit `--path` wins over everything, byte for byte, including over
+    /// a configured path that is also present. The argument is the operator's
+    /// own instruction and must not be second-guessed, so the assertion is
+    /// exact equality — any normalisation (canonicalisation, stripping,
+    /// falling back when the target does not exist) shows up as a failure.
+    #[test]
+    fn test_zswap_verdict_path_prefers_the_explicit_argument() {
+        for explicit in [
+            "/var/log/custom/history.jsonl",
+            "relative/history.jsonl",
+            "/tmp/with spaces/history.jsonl",
+            // A plausible configured path, to prove the explicit argument wins
+            // over it rather than only over absence.
+            "/var/log/tuned-zswap/history.jsonl",
+        ] {
+            let chosen = zswap_verdict_path(Some(PathBuf::from(explicit)));
+            assert_eq!(
+                chosen,
+                PathBuf::from(explicit),
+                "an explicit --path must be returned verbatim"
+            );
+            assert_ne!(
+                chosen,
+                PathBuf::from(tuned_zswap::STATS_PATH),
+                "the library default must not leak over an explicit path"
+            );
+        }
+    }
+
+    /// No `--path` and no usable config at `DEFAULT_CONFIG_PATH` must fall
+    /// through to the library default — the "binary installed alone" case the
+    /// doc comment describes. The chosen path is checked against the same
+    /// value `resolve_verdict_path` would produce for a missing config, so a
+    /// host where `/etc/tuned.toml` *does* carry a `stats_path` still passes
+    /// only when the real function agrees with the — here resolved — rule.
+    #[test]
+    fn test_zswap_verdict_path_falls_back_when_no_path_is_given() {
+        let chosen = zswap_verdict_path(None);
+
+        // Re-read the production source of `configured` so the expected value
+        // is derived, not assumed: a blank stats_path is discarded, and
+        // anything else is used.
+        let configured = TunedConfig::load(Path::new(tuned_common::config::DEFAULT_CONFIG_PATH))
+            .ok()
+            .map(|c| c.zswap.stats_path)
+            .filter(|p| !p.trim().is_empty());
+
+        assert_eq!(
+            chosen,
+            resolve_verdict_path(None, configured),
+            "with no explicit path, the resolution must follow the configured \
+             stats_path rule exactly"
+        );
+        assert!(
+            !chosen.as_os_str().is_empty(),
+            "an empty verdict path would make the verdict command fail"
+        );
+    }
+
+    /// The precedence and blank-value rules, driven directly. These four
+    /// outcomes are the whole decision table, and driving them through
+    /// `resolve_verdict_path` is what makes each one observable — the
+    /// config-reading half cannot express them on a host whose
+    /// `/etc/tuned.toml` is absent.
+    #[test]
+    fn test_resolve_verdict_path_covers_every_branch() {
+        let library_default = PathBuf::from(tuned_zswap::STATS_PATH);
+        let configured = "/var/log/tuned-zswap/history.jsonl";
+
+        // 1. Explicit path, with nothing configured.
+        assert_eq!(
+            resolve_verdict_path(Some(PathBuf::from("/tmp/explicit.jsonl")), None),
+            PathBuf::from("/tmp/explicit.jsonl"),
+        );
+
+        // 2. Explicit path beats a configured one. This is the branch the
+        //    precedence rule exists for.
+        assert_eq!(
+            resolve_verdict_path(
+                Some(PathBuf::from("/tmp/explicit.jsonl")),
+                Some(configured.to_string())
+            ),
+            PathBuf::from("/tmp/explicit.jsonl"),
+            "an explicit --path must outrank the configured stats_path"
+        );
+
+        // 3. No explicit path, a real configured value: that value, verbatim.
+        assert_eq!(
+            resolve_verdict_path(None, Some(configured.to_string())),
+            PathBuf::from(configured),
+            "the configured stats_path must be used when no --path is given"
+        );
+        assert_ne!(
+            resolve_verdict_path(None, Some(configured.to_string())),
+            library_default,
+            "a configured path must not be replaced by the library default"
+        );
+
+        // 4. No explicit path and no config at all: the library default.
+        assert_eq!(
+            resolve_verdict_path(None, None),
+            library_default,
+            "with neither source, the library default is the documented fallback"
+        );
+    }
+
+    /// A `stats_path` holding only whitespace is treated as unset. An
+    /// operator who leaves `stats_path = "   "` behind has not configured a
+    /// path, and honouring that string would make the verdict command fail on
+    /// a directory that does not exist.
+    #[test]
+    fn test_resolve_verdict_path_discards_a_blank_configured_stats_path() {
+        let library_default = PathBuf::from(tuned_zswap::STATS_PATH);
+
+        for blank in ["", " ", "\t", "   \n  "] {
+            let chosen = resolve_verdict_path(None, Some(blank.to_string()));
+            assert_eq!(
+                chosen, library_default,
+                "a whitespace-only stats_path ({blank:?}) must fall back to the \
+                 library default, got: {chosen:?}"
+            );
+        }
+
+        // And the exact boundary: a value with only surrounding whitespace but
+        // real content is NOT blank, so it must be used verbatim — including
+        // the whitespace, because trimming here would normalise the operator's
+        // path.
+        let padded = "  /var/log/tuned-zswap/history.jsonl  ".to_string();
+        let chosen = resolve_verdict_path(None, Some(padded.clone()));
+        assert_eq!(
+            chosen,
+            PathBuf::from(padded),
+            "a non-blank path is used verbatim, not trimmed"
+        );
+    }
+
+    // ── KSM knob values reach the rendered output ─────────────────────────
+
+    /// Every knob `seed_ksm_dir` writes a *distinct* value for must appear
+    /// verbatim in the stats output. This one adds what the sibling test
+    /// leaves out: the two knobs the kernel exposes inconsistently
+    /// (`use_zero_pages`, `stable_node_chains`), and the MiB-converted page
+    /// counts.
+    ///
+    /// Distinct values matter. `format_stats` renders the *seeded* number, so a
+    /// formatter that rendered a zero, a stale read, or another knob's value
+    /// cannot satisfy any of these lines.
+    #[tokio::test]
+    async fn test_build_stats_output_renders_every_seeded_knob_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let ksm_dir = dir.path().join("ksm");
+        std::fs::create_dir(&ksm_dir).unwrap();
+        seed_ksm_dir(&ksm_dir);
+        // The two knobs the sibling test leaves absent or unparsable.
+        std::fs::write(ksm_dir.join("use_zero_pages"), "1").unwrap();
+        std::fs::write(ksm_dir.join("stable_node_chains"), "7").unwrap();
+
+        let config_path = dir.path().join("tuned.toml");
+        write_config(&config_path, &ksm_dir, &dir.path().join("state"));
+
+        let output = build_stats_output(&config_path).unwrap();
+
+        // Knobs the kernel exposes inconsistently, with values that differ
+        // from every other seeded knob.
+        assert!(
+            output.contains("Use zero pages:             1"),
+            "use_zero_pages must be rendered, got: {output}"
+        );
+        assert!(
+            output.contains("Pages over ratio:           7"),
+            "stable_node_chains must be rendered, got: {output}"
+        );
+        assert!(
+            output.contains("Duplicated pages:           0"),
+            "absent stable_node_dups must render as 0, got: {output}"
+        );
+
+        // The MiB conversions, computed from the seeded page counts:
+        // 512 pages = 2.0 MiB, 10 pages = 0.0 MiB, 3 pages = 0.0 MiB.
+        assert!(
+            output.contains("Pages sharing:              2.0 MiB"),
+            "pages_sharing->MiB, got: {output}"
+        );
+        assert!(
+            output.contains("Pages shared:               0.0 MiB"),
+            "pages_shared->MiB, got: {output}"
+        );
+        assert!(
+            output.contains("Pages unshared:             0.0 MiB"),
+            "pages_unshared->MiB, got: {output}"
+        );
+    }
+
+    /// `show_stats` is the async wrapper that owns `init_tracing` and the
+    /// `print!`; only its pure counterpart was covered. This drives the real
+    /// entry point end-to-end and asserts on the captured string, so a wrapper
+    /// that stopped rendering (or rendered an empty string) cannot pass.
+    #[tokio::test]
+    async fn test_show_stats_renders_the_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let ksm_dir = dir.path().join("ksm");
+        std::fs::create_dir(&ksm_dir).unwrap();
+        seed_ksm_dir(&ksm_dir);
+        let config_path = dir.path().join("tuned.toml");
+        write_config(&config_path, &ksm_dir, &dir.path().join("state"));
+
+        // The wrapper itself must succeed: an Err here is what the CLI would
+        // surface to the operator.
+        show_stats(config_path.clone()).await.unwrap();
+
+        // And the value it produces must be the real report, asserted through
+        // the same function the wrapper calls.
+        let output = build_stats_output(&config_path).unwrap();
+        assert!(output.contains("tuned with KSM statistics support"));
+        assert!(output.contains("Full scans:                 7"));
+        assert!(!output.is_empty(), "the report must not be empty");
+    }
+
+    /// `build_status_output` must render every configured KSM knob, not only
+    /// the ones the existing test happens to check. `smart_scan` and the PSI
+    /// values were unasserted, and PSI is read from a temp file here so the
+    /// numbers do not depend on the host's live pressure.
+    #[tokio::test]
+    async fn test_build_status_output_renders_every_configured_knob() {
+        let dir = tempfile::tempdir().unwrap();
+        let ksm_dir = dir.path().join("ksm");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir(&ksm_dir).unwrap();
+        seed_ksm_dir(&ksm_dir);
+        let config_path = dir.path().join("tuned.toml");
+        write_config(&config_path, &ksm_dir, &state_dir);
+
+        let psi_path = dir.path().join("pressure");
+        std::fs::write(
+            &psi_path,
+            "some avg10=1.75 avg60=2.50 avg300=3.00 total=1000\n\
+             full avg10=0.75 avg60=1.25 avg300=2.00 total=500\n",
+        )
+        .unwrap();
+
+        let output = build_status_output(&config_path, &psi_path, false).unwrap();
+
+        // The configured half, each value distinct.
+        assert!(output.contains("run:                    1"));
+        assert!(output.contains("pages_to_scan:          500"));
+        assert!(output.contains("sleep_millisecs:        20"));
+        assert!(output.contains("max_page_sharing:       256"));
+        assert!(output.contains("advisor_mode:           none"));
+        assert!(
+            output.contains("smart_scan:             1"),
+            "smart_scan must be rendered, got: {output}"
+        );
+
+        // The statistics half, taken from the seeded files.
+        assert!(output.contains("pages_shared:           10"));
+        assert!(output.contains("pages_sharing:          512"));
+        assert!(output.contains("pages_unshared:         3"));
+        assert!(output.contains("general_profit:         12582912"));
+        assert!(output.contains("full_scans:             7"));
+
+        // PSI, read from the temp file rather than the live one.
+        assert!(output.contains("some avg10:             1.75%"));
+        assert!(output.contains("some avg60:             2.50%"));
+        assert!(output.contains("full avg10:             0.75%"));
+        assert!(output.contains("full avg60:             1.25%"));
+
+        // `show_zswap = false` must keep the zswap half out entirely; the
+        // existing test covers the true case.
+        assert!(
+            !output.contains("zswap:"),
+            "show_zswap=false must not append the zswap section, got: {output}"
+        );
+    }
+
+    /// `restore_ksm` must write back exactly the snapshot's values — every
+    /// knob, not just the two the existing test checks. The snapshot is taken
+    /// from the seeded dir, the dir is then clobbered with different values,
+    /// and the restore is asserted to bring all of them back.
+    #[tokio::test]
+    async fn test_restore_ksm_writes_back_every_snapshotted_knob() {
+        let dir = tempfile::tempdir().unwrap();
+        let ksm_dir = dir.path().join("ksm");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir(&ksm_dir).unwrap();
+        seed_ksm_dir(&ksm_dir);
+
+        // Snapshot the seeded state first.
+        let ctrl = KsmController::new(ksm_dir.to_str().unwrap()).unwrap();
+        ctrl.snapshot(&state_dir).unwrap();
+
+        // Then clobber every knob the daemon is able to restore, with values
+        // that differ from the snapshot so a skipped write is visible.
+        for (name, value) in [
+            ("run", "0"),
+            ("pages_to_scan", "1"),
+            ("sleep_millisecs", "5"),
+            ("max_page_sharing", "16"),
+            ("advisor_mode", "scan-time"),
+            ("advisor_target_scan_time", "10"),
+            ("advisor_max_cpu", "100"),
+        ] {
+            std::fs::write(ksm_dir.join(name), value).unwrap();
+        }
+
+        let config_path = dir.path().join("tuned.toml");
+        write_config(&config_path, &ksm_dir, &state_dir);
+
+        restore_ksm(config_path).await.unwrap();
+
+        // Every restored knob must read the snapshot's seeded value, read
+        // straight off disk so the assertion does not depend on a reader.
+        let read = |name: &str| std::fs::read_to_string(ksm_dir.join(name)).unwrap();
+        assert_eq!(read("run"), "1");
+        assert_eq!(read("pages_to_scan"), "500");
+        assert_eq!(read("sleep_millisecs"), "20");
+        assert_eq!(read("max_page_sharing"), "256");
+        assert_eq!(
+            read("advisor_mode"),
+            "none",
+            "advisor_mode must be restored to the snapshot value"
+        );
+        assert_eq!(read("advisor_target_scan_time"), "200");
+        assert_eq!(read("advisor_max_cpu"), "70");
     }
 }

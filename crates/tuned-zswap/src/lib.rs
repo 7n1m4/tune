@@ -696,6 +696,9 @@ pub enum PollAction {
 }
 
 impl PollAction {
+    /// Kept as part of the crate's public outcome API: callers that record
+    /// what a poll did use this instead of matching the variants themselves.
+    #[allow(dead_code)]
     pub fn changed(&self) -> bool {
         matches!(self, PollAction::Applied { .. })
     }
@@ -2135,39 +2138,6 @@ Zswapped:         723448 kB
     }
 
     #[test]
-    fn evidence_devices_match_recorded_kernel_names() {
-        // The evidence list is written as device nodes; the recorded names are
-        // kernel names. The report must still line them up.
-        for node in WRITE_EVIDENCE_DEVICES {
-            let kernel_name = node.rsplit('/').next().unwrap_or(node);
-            assert!(node.len() > kernel_name.len(), "{} has a path", node);
-            let line = format!(
-                "{{\"devices\":[{{\"device\":\"{}\",\"used_bytes\":1}}]}}",
-                kernel_name
-            );
-            assert_eq!(json_device_bytes(&line, kernel_name), Some(1), "{}", node);
-            assert!(
-                node.len() > kernel_name.len(),
-                "{} should be a node path",
-                node
-            );
-        }
-    }
-
-    #[test]
-    fn swap_backing_devices_uses_kernel_names() {
-        // /proc/swaps ships "/dev/md0"; diskstats wants "md0".
-        let text = "Filename\t\t\t\tType\t\tSize\tUsed\tPriority\n/dev/md0\t\t\t\tpartition\t16766972\t13411316\t100\n/dev/sda1\t\t\t\tpartition\t16777212\t108956\t10\n";
-        let names: Vec<String> = text
-            .lines()
-            .skip(1)
-            .filter_map(|line| line.split_whitespace().next())
-            .map(|name| name.rsplit('/').next().unwrap_or(name).to_string())
-            .collect();
-        assert_eq!(names, vec!["md0".to_string(), "sda1".to_string()]);
-    }
-
-    #[test]
     fn record_interval_env_override_is_validated() {
         assert_eq!(record_interval(), RECORD_INTERVAL);
         env::set_var(RECORD_INTERVAL_ENV, "3");
@@ -2181,22 +2151,194 @@ Zswapped:         723448 kB
     }
 
     #[test]
-    fn diskstats_sectors_convert_to_bytes() {
-        // The kernel reports sectors written in 512-byte units, in the tenth
-        // whitespace-separated field (major, minor, name, then the counters).
-        let line = "   8       1 sda1 14198 5 117824 4427 20897 21491 339736 18373";
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        assert_eq!(fields[3 - 1], "sda1");
-        // Counter fields start at index 3; sectors written is the seventh.
-        assert_eq!(fields[3 + 6], "339736", "sectors written");
-        assert_eq!(fields[3 + 6].parse::<u64>().unwrap() * 512, 173944832);
-    }
-
-    #[test]
     fn json_escape_covers_record_hostiles() {
         assert_eq!(json_escape("plain"), "plain");
         assert_eq!(json_escape("a\"b"), "a\\\"b");
         assert_eq!(json_escape("a\\b"), "a\\\\b");
         assert_eq!(json_escape("/dev/md0"), "/dev/md0");
+    }
+
+    // ── json_escape: the raw control characters ─────────────────────────
+
+    /// The four escapes the doc comment enumerates are all covered by the
+    /// sibling test except the three control characters. Each is asserted as
+    /// the exact two-character sequence, so an arm that fell through to
+    /// `other` (pushing the raw byte, which is what a JSON parser would then
+    /// reject) cannot pass.
+    #[test]
+    fn json_escape_escapes_control_characters_as_their_json_spelling() {
+        // \n -> backslash + 'n'. Writing the expected value as a literal
+        // two-char sequence, not "\n" (which in Rust source is one byte).
+        assert_eq!(
+            json_escape("\n"),
+            "\\n",
+            "newline must become a backslash-n"
+        );
+        assert_eq!(
+            json_escape("\r"),
+            "\\r",
+            "carriage return must become a backslash-r"
+        );
+        assert_eq!(json_escape("\t"), "\\t", "tab must become a backslash-t");
+
+        // And the arms survive being embedded in the surrounding text, not
+        // only standing alone.
+        assert_eq!(json_escape("a\tb"), "a\\tb");
+        assert_eq!(json_escape("line1\nline2"), "line1\\nline2");
+
+        // The raw byte must not survive into the output: a JSON writer that
+        // left the control byte in place would produce a document no parser
+        // can read.
+        for raw in ["\n", "\r", "\t"] {
+            let escaped = json_escape(raw);
+            assert!(
+                !escaped.contains(raw),
+                "raw control character {raw:?} leaked into the escaped output"
+            );
+        }
+
+        // In combination with the escapes the sibling test already pins, so a
+        // match-arm reordering (falling into `other` early) shows up.
+        assert_eq!(json_escape("\t\n\r"), "\\t\\n\\r");
+        assert_eq!(json_escape("a\"b\tc"), "a\\\"b\\tc");
+    }
+
+    // ── Group::write_mib: the untested twin ──────────────────────────────
+
+    /// `write_mib` is the sibling of two covered accessors and renders the
+    /// corroborating-device column of the report. Its value is asserted against
+    /// the exact byte count the fixture attributes to each ceiling, so it
+    /// cannot silently report a different field (the swap-backing writes and
+    /// the stored/written page counts are all different numbers).
+    #[test]
+    fn fixture_write_mib_matches_the_attributed_write_bytes() {
+        let groups = fixture_groups();
+
+        // 179_201_024 B / 2^20 = 170.8994140625 MiB. An exact `assert_eq!`
+        // rather than a tolerance, so a wrong divisor or a wrong field source
+        // cannot land on it.
+        let low = group(&groups, 25);
+        assert_eq!(low.write_bytes, 179_201_024);
+        assert_eq!(low.write_mib(), 170.8994140625);
+
+        // 274_121_216 B / 2^20 = 261.42236328125 MiB.
+        let high = group(&groups, 50);
+        assert_eq!(high.write_bytes, 274_121_216);
+        assert_eq!(high.write_mib(), 261.42236328125);
+
+        // The accessor divides by the same 2^20 as its siblings, so the three
+        // differ only by which byte count they report — a swapped source would
+        // show up as a different number here.
+        assert_ne!(low.write_mib(), low.stored_mib());
+        assert_ne!(low.write_mib(), low.written_mib());
+    }
+
+    // ── parse_records: the missing-field problem arms ───────────────────
+
+    /// A record missing `limit` must yield exactly one problem naming
+    /// `limit`, and no record at all — the four required fields are extracted
+    /// before anything is pushed, so a partial record would silently corrupt
+    /// every interval derived from it.
+    #[test]
+    fn parse_records_reports_a_missing_limit_as_exactly_one_problem() {
+        let text = r#"{"ts":100,"stored_pages":1000,"written_back_pages":0,"md0":0,"sda1":0}"#;
+        let (records, problems) = parse_records(text);
+
+        assert_eq!(problems.len(), 1, "exactly one problem, got: {problems:?}");
+        assert_eq!(
+            problems[0], "line 1: missing or invalid \"limit\"",
+            "the problem must name the field"
+        );
+        assert!(
+            records.is_empty(),
+            "a record with a missing required field must not be emitted"
+        );
+    }
+
+    /// The same contract for a second field, so the arms are not accidentally
+    /// aliased to one shared code path that always names `ts`.
+    #[test]
+    fn parse_records_reports_a_missing_stored_pages_as_exactly_one_problem() {
+        let text = r#"{"ts":100,"limit":25,"written_back_pages":50,"md0":0,"sda1":0}"#;
+        let (records, problems) = parse_records(text);
+
+        assert_eq!(problems.len(), 1, "exactly one problem, got: {problems:?}");
+        assert_eq!(
+            problems[0], "line 1: missing or invalid \"stored_pages\"",
+            "the problem must name the field"
+        );
+        assert!(records.is_empty(), "no record must be emitted");
+    }
+
+    /// Every arm reports its own field name: four well-formed records each
+    /// with one field removed produce four distinct messages, one per line.
+    #[test]
+    fn parse_records_names_the_specific_missing_field_per_line() {
+        let complete = r#"{"ts":100,"limit":25,"stored_pages":1000,"written_back_pages":50}"#;
+
+        // Remove the whole `"field":value` pair, leaving the surrounding
+        // commas, so `json_num` cannot find the needle at all.
+        for (field, pair) in [
+            ("ts", "\"ts\":100"),
+            ("limit", "\"limit\":25"),
+            ("stored_pages", "\"stored_pages\":1000"),
+            ("written_back_pages", "\"written_back_pages\":50"),
+        ] {
+            let missing = complete.replace(pair, "");
+            let (records, problems) = parse_records(&missing);
+            assert_eq!(
+                problems.len(),
+                1,
+                "removing {field} must yield exactly one problem, got: {problems:?}"
+            );
+            assert!(
+                problems[0].contains(field),
+                "the problem must name {field} and nothing else, got: {:?}",
+                problems[0]
+            );
+            assert!(records.is_empty(), "no record may be emitted for {field}");
+
+            // The "or invalid" half: the key is present but the value is not a
+            // number, which must route to the same arm rather than parse as 0.
+            let invalid = complete.replace(pair, &format!("\"{field}\":null"));
+            let (records, problems) = parse_records(&invalid);
+            assert_eq!(
+                problems.len(),
+                1,
+                "a null {field} must yield exactly one problem, got: {problems:?}"
+            );
+            assert!(
+                problems[0].contains(field),
+                "the problem must name {field}, got: {:?}",
+                problems[0]
+            );
+            assert!(records.is_empty());
+        }
+    }
+
+    // ── opt(): the n/a invariant ─────────────────────────────────────────
+
+    /// A genuine 0 and an absent counter are different facts and must print
+    /// differently. Both directions are pinned in one test because the
+    /// invariant is the pair: if `opt` mapped `Some(0)` to `n/a` the pool would
+    /// read "never hit" when zswap had actually filled and rejected, and if it
+    /// mapped `None` to `"0"` an unreadable debugfs would read as a hard zero.
+    #[test]
+    fn opt_distinguishes_an_absent_counter_from_a_real_zero() {
+        assert_eq!(opt(None), "n/a", "an absent counter must render n/a");
+        assert_eq!(
+            opt(Some(0)),
+            "0",
+            "a present zero is a real measurement, not n/a"
+        );
+
+        // And other values round-trip verbatim, so the mapping is not just a
+        // two-case switch that happens to differ.
+        assert_eq!(opt(Some(1)), "1");
+        assert_eq!(opt(Some(9_876_543_210)), "9876543210");
+
+        // The two results must differ from each other, which is the whole
+        // invariant: the same string for both would make them indistinguishable.
+        assert_ne!(opt(None), opt(Some(0)));
     }
 }

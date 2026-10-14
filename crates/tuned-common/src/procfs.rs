@@ -73,6 +73,9 @@ pub struct KsmProcStat {
 }
 
 /// An anonymous memory region scored for KSM merge potential.
+/// Kept as public API: the scanner scored candidates before merging moved to
+/// a per-process eligibility model, and downstream consumers still read it.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct MergeCandidate {
     pub pid: u32,
@@ -309,6 +312,10 @@ pub fn is_blocklisted(name: &str, blocklist: &[String]) -> bool {
 }
 
 /// Get the comm (short name) of a process.
+///
+/// Kept as public API: the scanner now reads comm through its own eligibility
+/// path, but the name is the natural handle for any per-process report.
+#[allow(dead_code)]
 pub fn read_process_comm(pid: u32) -> Result<String> {
     read_process_comm_from(Path::new("/proc"), pid)
 }
@@ -661,31 +668,6 @@ mod tests {
     // ── read_ksm_stat format ────────────────────────────────────────────
 
     #[test]
-    fn test_parse_ksm_stat_content() {
-        // parse the raw format that /proc/PID/ksm_stat produces
-        let content = "ksm_rmap_items 42\nksm_merging_pages 7\nksm_process_profit 12345\nksm_merge_any 1\nksm_mergeable yes\n";
-        let mut stat = KsmProcStat::default();
-        for line in content.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 {
-                match parts[0] {
-                    "ksm_rmap_items" => stat.rmap_items = parts[1].parse().unwrap_or(0),
-                    "ksm_merging_pages" => stat.merging_pages = parts[1].parse().unwrap_or(0),
-                    "ksm_process_profit" => stat.process_profit = parts[1].parse().unwrap_or(0),
-                    "ksm_merge_any" => stat.merge_any = parts[1] == "1" || parts[1] == "yes",
-                    "ksm_mergeable" => stat.mergeable = parts[1] == "1" || parts[1] == "yes",
-                    _ => {}
-                }
-            }
-        }
-        assert_eq!(stat.rmap_items, 42);
-        assert_eq!(stat.merging_pages, 7);
-        assert_eq!(stat.process_profit, 12345);
-        assert!(stat.merge_any);
-        assert!(stat.mergeable);
-    }
-
-    #[test]
     fn test_parse_ksm_stat_unknown_field_skipped() {
         let content = "ksm_unknown_field 99\nksm_rmap_items 5\n";
         let mut stat = KsmProcStat::default();
@@ -696,23 +678,6 @@ mod tests {
             }
         }
         assert_eq!(stat.rmap_items, 5);
-    }
-
-    // ── MergeCandidate ───────────────────────────────────────────────────
-
-    #[test]
-    fn test_merge_candidate_construction() {
-        let mc = MergeCandidate {
-            pid: 100,
-            process_name: "test_proc".into(),
-            start: 0x10000,
-            end: 0x20000,
-            size_bytes: 0x10000,
-            anon_rss_kb: 64,
-        };
-        assert_eq!(mc.pid, 100);
-        assert_eq!(mc.size_bytes, 65536);
-        assert_eq!(mc.anon_rss_kb, 64);
     }
 
     // ── file-backed /proc helpers ───────────────────────────────────────
@@ -929,15 +894,33 @@ mod tests {
     }
 
     #[test]
-    fn test_read_pagemap_pfn_reports_missing_real_process() {
-        let err = read_pagemap_pfn(u32::MAX, 0).unwrap_err();
+    fn test_read_pagemap_pfn_reports_missing_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_pagemap_pfn_from(dir.path(), u32::MAX, 0).unwrap_err();
         assert!(err.to_string().contains("cannot open"));
     }
 
     #[test]
     fn test_read_pagemap_range_reads_empty_range_for_current_process() {
-        let pfns = read_pagemap_range(std::process::id(), 0, 0).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = proc_pid(dir.path(), std::process::id());
+
+        // A zero-length range must not be attempted: `read` on an empty buffer
+        // returns 0 bytes, so the PFN list stays empty.
+        std::fs::write(pid_dir.join("pagemap"), [0u8; 8]).unwrap();
+        let pfns = read_pagemap_range_from(dir.path(), std::process::id(), 0, 0).unwrap();
         assert!(pfns.is_empty());
+
+        // A file shorter than the requested range is read as far as it goes:
+        // one entry present, one absent, one page the file never reached.
+        let entries = [(1u64 << 63) | 0x111, 0x54321u64];
+        let mut bytes = Vec::new();
+        for entry in entries {
+            bytes.extend_from_slice(&entry.to_ne_bytes());
+        }
+        std::fs::write(pid_dir.join("pagemap"), bytes).unwrap();
+        let pfns = read_pagemap_range_from(dir.path(), std::process::id(), 0, 3 * 4096).unwrap();
+        assert_eq!(pfns, vec![0x111]);
     }
 
     #[test]

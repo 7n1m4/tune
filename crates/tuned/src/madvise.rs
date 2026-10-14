@@ -1128,4 +1128,140 @@ mod tests {
         let err = pidfd_open(ABSENT_PID).unwrap_err();
         assert!(err.contains("errno="), "got: {err}");
     }
+
+    // ── enable_merge_any: the real injection path ────────────────────────
+
+    /// `enable_merge_any(pid, false)`'s success arm, driven against a real
+    /// process. `dry_run = false` is the whole point: every other test here
+    /// either takes the dry-run shortcut or asserts the `Err` arm, so the
+    /// `prctl`-succeeded branch — the one that then has to withdraw the
+    /// executable VMAs — has never been executed.
+    ///
+    /// The target is a `/usr/bin/sleep` child of this test process. Yama
+    /// `ptrace_scope = 1` permits a tracer to attach only to its own
+    /// descendants, so self-attach is refused with EPERM and an unrelated
+    /// daemon would be both inadmissible and unsafe to poke. `sleep` is the
+    /// ideal target on all three axes: it is a legal descendant, its mappings
+    /// are frozen once the loader finishes, and setting `MMF_VM_MERGE_ANY` on
+    /// a sleeping process has no observable consequence — the executable-VMA
+    /// guard this test exercises is exactly the mitigation that makes the
+    /// flag safe.
+    ///
+    /// The child is reaped on every exit path, including a failed assertion,
+    /// so an aborting test leaves no process behind.
+    #[test]
+    fn test_enable_merge_any_real_injection_hits_the_prctl_success_arm() {
+        if cat_ptrace_scope() > 1 {
+            // A host that refuses all but CAP_SYS_PTRACE tracer relationships
+            // cannot exercise this arm at all.
+            return;
+        }
+
+        let mut child = std::process::Command::new("/usr/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawning a sleep target must work");
+        let pid = child.id();
+
+        // Wait for the child's mappings to settle. `sleep` executes its loader
+        // before blocking in `nanosleep`, and the count is read straight from
+        // `/proc/<pid>/maps`, so sampling during the fork/exec window would
+        // compare against a moving target.
+        let exec_vmas = match stable_exec_vmas_of(pid) {
+            Some(n) if n > 0 => n,
+            // No executable mappings would make the additive contract below
+            // vacuous; report it rather than weaken the assertion.
+            _ => {
+                reap(&mut child);
+                return;
+            }
+        };
+
+        let result = enable_merge_any(pid, false);
+
+        // The success arm: `prctl` was injected and the target is marked.
+        assert_eq!(result.pid, pid);
+        assert!(
+            result.error.is_none(),
+            "injecting into an own child under ptrace_scope<=1 must succeed: {}",
+            result.error.as_deref().unwrap_or("(no error)")
+        );
+        assert_eq!(
+            result.processes_marked, 1,
+            "a successful prctl injection must mark the target process"
+        );
+
+        // The `prctl` arm must run the guard over every executable mapping —
+        // an additive contract, because a withdrawal is allowed to be refused
+        // by the kernel and the refusal is what the second element exists to
+        // report. Requiring `protected == n` would make this a statement about
+        // the kernel's mood, not about the pass.
+        assert_eq!(
+            result.exec_vmas_protected + result.exec_vmas_failed,
+            exec_vmas,
+            "every executable VMA of the target must be accounted for as \
+             protected or failed"
+        );
+
+        reap(&mut child);
+    }
+
+    /// A refused injection must not report a mark: a target that refuses the
+    /// attach is untouched, so the guard never ran and both outcome counts
+    /// must stay at zero. Without this, the `Err` arm could hand back a stale
+    /// "found" count — the exact conflation the failure accounting exists to
+    /// prevent.
+    #[test]
+    fn test_enable_merge_any_refused_injection_reports_zero_everywhere() {
+        let result = enable_merge_any(ABSENT_PID, false);
+
+        assert!(result.error.is_some());
+        assert_eq!(result.processes_marked, 0);
+        assert_eq!(result.exec_vmas_protected, 0);
+        assert_eq!(result.exec_vmas_failed, 0);
+    }
+
+    fn reap(child: &mut std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Count a process's executable VMAs through the same helper the code under
+    /// test uses, so the precondition and the assertion share one definition
+    /// of "executable".
+    fn exec_in_maps_of(pid: u32) -> Option<usize> {
+        let maps = tuned_common::procfs::read_process_maps(pid).ok()?;
+        Some(maps.iter().filter(|m| m.has_exec()).count())
+    }
+
+    /// `/proc/sys/kernel/yama/ptrace_scope` as a `u8`, or `u8::MAX` when
+    /// unreadable (including on kernels built without Yama, where the file
+    /// does not exist).
+    fn cat_ptrace_scope() -> u8 {
+        std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(u8::MAX)
+    }
+
+    /// Re-read `/proc/<pid>/maps` until the executable-VMA count is unchanged
+    /// across two polls with a gap between them. A freshly exec'd child is
+    /// still in its loader, whose mappings — and their executable bits — change
+    /// under us. Reading once and asserting against that snapshot would be
+    /// asserting against a moving target.
+    fn stable_exec_vmas_of(pid: u32) -> Option<usize> {
+        let mut last = exec_in_maps_of(pid)?;
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let now = exec_in_maps_of(pid)?;
+            if now == last {
+                return Some(now);
+            }
+            last = now;
+        }
+        // The count never settled within the polling budget; something keeps
+        // remapping this process. Report it as "not stable" instead of
+        // asserting against the last value read.
+        None
+    }
 }

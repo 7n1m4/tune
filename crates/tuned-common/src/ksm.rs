@@ -731,6 +731,191 @@ mod tests {
     }
 
     #[test]
+    fn test_restore_advisor_branch_reenables_scan_time_advisor() {
+        // The `advisor_mode == "scan-time"` branch of `restore`. The kernel
+        // rejects direct writes to `pages_to_scan` while a scan-time advisor is
+        // active, so `restore` must first disable the advisor, write the
+        // parameters, and then RE-ENABLE it — a controller that leaves the
+        // advisor off has silently dropped the operator's configuration, and
+        // the governor would then be the only controller of `pages_to_scan`,
+        // which is exactly the two-controllers fight Option B exists to avoid.
+        //
+        // Every sysfs file is seeded with a value different from the snapshot,
+        // so every assertion below distinguishes a write from a coincidence.
+        let t = seeded![
+            ("run", "0"),
+            ("pages_to_scan", "100"),
+            ("sleep_millisecs", "5000"),
+            ("max_page_sharing", "4096"),
+            ("advisor_mode", "none"),
+            ("advisor_target_scan_time", "10"),
+            ("advisor_max_cpu", "10"),
+            ("advisor_min_pages_to_scan", "5000"),
+            ("advisor_max_pages_to_scan", "1000"),
+        ];
+        let state_dir = t.dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        // All snapshot values are inside `PARAM_RANGES`, so nothing is clamped
+        // and each write lands verbatim: run 1 (0-2), pages_to_scan 700
+        // (100-30000), sleep_millisecs 11 (5-10000), max_page_sharing 2048
+        // (16-4096), advisor_target_scan_time 250 (10-3600), advisor_max_cpu 90
+        // (10-100).
+        let snapshot = KsmSnapshot {
+            config: KsmConfig {
+                run: 1,
+                pages_to_scan: 700,
+                sleep_millisecs: 11,
+                max_page_sharing: 2048,
+                smart_scan: 1,
+                advisor_mode: "scan-time".to_string(),
+                advisor_target_scan_time: 250,
+                advisor_max_cpu: 90,
+                advisor_min_pages_to_scan: 400,
+                advisor_max_pages_to_scan: 9000,
+            },
+            timestamp: chrono_now(),
+        };
+        std::fs::write(
+            state_dir.join(SNAPSHOT_FILENAME),
+            serde_json::to_string_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let mut ctrl = KsmController {
+            base_path: t.dir.path().to_path_buf(),
+            last_update: Instant::now() - std::time::Duration::from_secs(60),
+            dry_run: false,
+        };
+        ctrl.restore(&state_dir).unwrap();
+
+        // Every parameter `restore` is documented to write, restored exactly.
+        assert_eq!(ctrl.read_string("advisor_mode").unwrap(), "scan-time");
+        assert_eq!(ctrl.read_u64("run").unwrap(), 1);
+        assert_eq!(ctrl.read_u64("pages_to_scan").unwrap(), 700);
+        assert_eq!(ctrl.read_u64("sleep_millisecs").unwrap(), 11);
+        assert_eq!(ctrl.read_u64("max_page_sharing").unwrap(), 2048);
+        assert_eq!(ctrl.read_u64("advisor_target_scan_time").unwrap(), 250);
+        assert_eq!(ctrl.read_u64("advisor_max_cpu").unwrap(), 90);
+    }
+
+    #[test]
+    fn test_restore_advisor_branch_leaves_advisor_page_bounds_untouched() {
+        // Companion to the test above: `restore` never writes
+        // `advisor_min_pages_to_scan` / `advisor_max_pages_to_scan`, so the
+        // two page-bound tunables survive on disk with whatever the kernel
+        // already had. Asserting the *seeded* values proves those two code
+        // paths are genuinely absent rather than merely unwritten by accident.
+        let t = seeded![
+            ("run", "0"),
+            ("pages_to_scan", "100"),
+            ("sleep_millisecs", "5000"),
+            ("max_page_sharing", "4096"),
+            ("advisor_mode", "none"),
+            ("advisor_target_scan_time", "10"),
+            ("advisor_max_cpu", "10"),
+            ("advisor_min_pages_to_scan", "5000"),
+            ("advisor_max_pages_to_scan", "1000"),
+        ];
+        let state_dir = t.dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let snapshot = KsmSnapshot {
+            config: KsmConfig {
+                run: 1,
+                pages_to_scan: 700,
+                sleep_millisecs: 11,
+                max_page_sharing: 2048,
+                smart_scan: 1,
+                advisor_mode: "scan-time".to_string(),
+                advisor_target_scan_time: 250,
+                advisor_max_cpu: 90,
+                advisor_min_pages_to_scan: 400,
+                advisor_max_pages_to_scan: 9000,
+            },
+            timestamp: chrono_now(),
+        };
+        std::fs::write(
+            state_dir.join(SNAPSHOT_FILENAME),
+            serde_json::to_string_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let mut ctrl = KsmController {
+            base_path: t.dir.path().to_path_buf(),
+            last_update: Instant::now() - std::time::Duration::from_secs(60),
+            dry_run: false,
+        };
+        ctrl.restore(&state_dir).unwrap();
+
+        // The snapshot's 400 / 9000 must NOT reach sysfs: only the on-disk
+        // kernel values survive.
+        assert_eq!(ctrl.read_u64("advisor_min_pages_to_scan").unwrap(), 5000);
+        assert_eq!(ctrl.read_u64("advisor_max_pages_to_scan").unwrap(), 1000);
+        // And a parameter that IS written proves this restore actually ran,
+        // so the two untouched values above are not a vacuous early return.
+        assert_eq!(ctrl.read_u64("sleep_millisecs").unwrap(), 11);
+    }
+
+    #[test]
+    fn test_restore_non_scan_time_advisor_branch_restores_advisor_off() {
+        // The other half of the advisor branch: the snapshot recorded the
+        // advisor as `none`, so `restore` must take the direct path (write the
+        // advisor mode first, then the parameters) and end with the advisor off.
+        // The live kernel only ever has `advisor_mode == "scan-time"` under the
+        // governor, so this branch is weak in the round-trip test above.
+        let t = seeded![
+            ("run", "0"),
+            ("pages_to_scan", "100"),
+            ("sleep_millisecs", "5000"),
+            ("max_page_sharing", "4096"),
+            ("advisor_mode", "scan-time"),
+            ("advisor_target_scan_time", "10"),
+            ("advisor_max_cpu", "10"),
+            ("advisor_min_pages_to_scan", "5000"),
+            ("advisor_max_pages_to_scan", "1000"),
+        ];
+        let state_dir = t.dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let snapshot = KsmSnapshot {
+            config: KsmConfig {
+                run: 0,
+                pages_to_scan: 700,
+                sleep_millisecs: 11,
+                max_page_sharing: 2048,
+                smart_scan: 1,
+                advisor_mode: "none".to_string(),
+                advisor_target_scan_time: 250,
+                advisor_max_cpu: 90,
+                advisor_min_pages_to_scan: 400,
+                advisor_max_pages_to_scan: 9000,
+            },
+            timestamp: chrono_now(),
+        };
+        std::fs::write(
+            state_dir.join(SNAPSHOT_FILENAME),
+            serde_json::to_string_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let mut ctrl = KsmController {
+            base_path: t.dir.path().to_path_buf(),
+            last_update: Instant::now() - std::time::Duration::from_secs(60),
+            dry_run: false,
+        };
+        ctrl.restore(&state_dir).unwrap();
+
+        assert_eq!(ctrl.read_string("advisor_mode").unwrap(), "none");
+        assert_eq!(ctrl.read_u64("run").unwrap(), 0);
+        assert_eq!(ctrl.read_u64("pages_to_scan").unwrap(), 700);
+        assert_eq!(ctrl.read_u64("sleep_millisecs").unwrap(), 11);
+        assert_eq!(ctrl.read_u64("max_page_sharing").unwrap(), 2048);
+        assert_eq!(ctrl.read_u64("advisor_target_scan_time").unwrap(), 250);
+        assert_eq!(ctrl.read_u64("advisor_max_cpu").unwrap(), 90);
+    }
+
+    #[test]
     fn test_restore_invalid_snapshot_json_returns_error() {
         let t = seeded![("run", "1")];
         let state_dir = t.dir.path().join("state");

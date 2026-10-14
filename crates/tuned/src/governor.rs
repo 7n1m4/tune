@@ -515,6 +515,52 @@ mod tests {
         }
     }
 
+    /// Build a governor over a temp directory seeded with every KSM stat file
+    /// and every parameter file, wired to a **real** (non-dry-run) controller
+    /// so the writes can be read back off disk.
+    ///
+    /// The controller's 500 ms rate limiter is not an obstacle: `KsmController::
+    /// new` already seeds `last_update` at now − 500 ms, and `write_param`
+    /// never advances it, so every write lands on the first attempt.
+    ///
+    /// Returns the governor alongside its `TempDir`; dropping the dir first
+    /// makes any post-drop write fail rather than silently pass.
+    fn seeded_gov(f: impl FnOnce(&mut GovernorConfig)) -> (Governor, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, value) in [
+            ("pages_shared", "10"),
+            ("pages_sharing", "20"),
+            ("pages_unshared", "5"),
+            ("pages_volatile", "1"),
+            ("pages_scanned", "100"),
+            ("pages_skipped", "2"),
+            ("full_scans", "3"),
+            ("general_profit", "4096"),
+            ("ksm_zero_pages", "0"),
+            ("stable_node_chains", "0"),
+            ("stable_node_dups", "0"),
+            ("run", "1"),
+            ("pages_to_scan", "100"),
+            ("sleep_millisecs", "500"),
+            ("max_page_sharing", "256"),
+            ("advisor_mode", "scan-time"),
+            ("advisor_target_scan_time", "200"),
+            ("advisor_max_cpu", "70"),
+            ("advisor_min_pages_to_scan", "500"),
+            ("advisor_max_pages_to_scan", "30000"),
+        ] {
+            std::fs::write(dir.path().join(name), value).unwrap();
+        }
+        let mut config = GovernorConfig {
+            ksm_path: dir.path().to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        f(&mut config);
+        let mut ctrl = KsmController::new(&config.ksm_path).unwrap();
+        ctrl.set_dry_run(false);
+        (Governor::new(config, ctrl), dir)
+    }
+
     fn ksm_stats(pages_sharing: u64, general_profit: i64, full_scans: u64) -> KsmStats {
         KsmStats {
             pages_shared: pages_sharing / 2,
@@ -1374,5 +1420,309 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    /// Seed a temp sysfs so its `sleep_millisecs` / `max_page_sharing` hold the
+    /// values of the level-3 profile. Starting from a level-3 baseline means
+    /// any later observation of level-4 values proves a write happened, rather
+    /// than the level-3 file simply being left at its initial value.
+    fn seed_level_three_params(dir: &std::path::Path) {
+        std::fs::write(dir.join("sleep_millisecs"), "20").unwrap();
+        std::fs::write(dir.join("max_page_sharing"), "512").unwrap();
+    }
+
+    fn read_param(dir: &std::path::Path, name: &str) -> String {
+        std::fs::read_to_string(dir.join(name))
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    // ── tick(): real PSI, real KSM stats, real sysfs ───────────────────
+
+    /// `tick()` end-to-end against a real KSM directory: read the live PSI,
+    /// classify it, drive the governor once, and require the resulting level
+    /// *and* the sysfs files to match what the transition logic chose.
+    ///
+    /// Both PSI thresholds are set to 0.0, so classification collapses to
+    /// `score >= 20 → Critical, else High` — the `full.avg10 >= 0.0` half of
+    /// the High rule is always true. The test therefore cannot be perturbed by
+    /// whatever pressure the host happens to be under, and never depends on a
+    /// specific number from `/proc/pressure/memory`.
+    #[tokio::test]
+    async fn test_tick_applies_selected_profile_writes_sysfs_from_real_psi() {
+        let (mut gov, dir) = seeded_gov(|c| {
+            c.stabilization_secs = 0;
+            c.psi_some_threshold = 0.0;
+            c.psi_full_threshold = 0.0;
+        });
+        // Level 0 with a jump of at least two levels ramps immediately, so one
+        // tick is enough to reach the classified target.
+        gov.current_level = 0;
+        seed_level_three_params(dir.path());
+        let state = new_shared_state();
+
+        // Read the same live PSI `tick()` will read, so the expected level is
+        // derived rather than assumed.
+        let psi_now = PsiStats::read_memory().expect("live PSI must be readable");
+        let expected_pressure = psi_now.classify(0.0, 0.0);
+        let expected_level = gov.pressure_to_level(expected_pressure);
+
+        // The classify() rules above leave exactly one boundary — the 20.0
+        // score separating Critical from High. If the host sits near it, the
+        // tick's own reading could land on the other side of the boundary and
+        // the assertion would be testing the read, not the governor. Skip in
+        // that band, and also skip if a second read reclassifies differently.
+        let score = 0.7 * psi_now.full.avg10 + 0.3 * psi_now.some.avg10;
+        if (score - 20.0).abs() < 8.0 {
+            return;
+        }
+        if PsiStats::read_memory()
+            .expect("live PSI must be readable")
+            .classify(0.0, 0.0)
+            != expected_pressure
+        {
+            return;
+        }
+
+        gov.tick(&state).await;
+
+        // The level the transition logic chose, reached through the real tick.
+        assert_eq!(gov.current_level, expected_level);
+        assert!(
+            matches!(
+                expected_pressure,
+                PressureLevel::High | PressureLevel::Critical
+            ),
+            "zero thresholds must classify as High or Critical, got {expected_pressure:?}"
+        );
+
+        // The non-vacuity anchors: `tick()` must have actually read the KSM
+        // stats, and propagated them into the shared state. These are values
+        // that appear nowhere in the governor's logic.
+        let s = state.read().await;
+        assert_eq!(s.pages_sharing, 20, "tick must publish KSM pages_sharing");
+        assert_eq!(s.general_profit, 4096, "tick must publish KSM profit");
+        assert_eq!(s.current_pressure, expected_pressure);
+        assert_eq!(s.ksm_level, expected_level);
+        assert!(s.last_adjustment.elapsed() < Duration::from_secs(5));
+        drop(s);
+
+        // The selected profile must have been written to sysfs. In advisor
+        // mode the governor owns only the two bias knobs, so `pages_to_scan`
+        // must keep its seeded value — otherwise the daemon would be fighting
+        // the kernel's advisor for that parameter.
+        let profile = &PROFILES[expected_level as usize];
+        assert_eq!(
+            read_param(dir.path(), "sleep_millisecs"),
+            profile.sleep_millisecs.to_string(),
+            "profile {expected_level} sleep_millisecs must be applied"
+        );
+        assert_eq!(
+            read_param(dir.path(), "max_page_sharing"),
+            profile.max_page_sharing.to_string(),
+            "profile {expected_level} max_page_sharing must be applied"
+        );
+        assert_eq!(
+            read_param(dir.path(), "pages_to_scan"),
+            "100",
+            "advisor mode must not write pages_to_scan"
+        );
+    }
+
+    /// `tick()` must return before touching anything when the KSM stats cannot
+    /// be read: a missing sysfs directory is the daemon being run on a kernel
+    /// without KSM, and publishing stale-looking zeros for a dead subsystem is
+    /// worse than publishing nothing.
+    #[tokio::test]
+    async fn test_tick_aborts_without_mutating_state_when_ksm_reads_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctrl = KsmController::new(&dir.path().to_string_lossy()).unwrap();
+        ctrl.set_dry_run(false);
+        let mut gov = Governor::new(GovernorConfig::default(), ctrl);
+
+        // Preconditions that make this test non-vacuous: the KSM read must fail
+        // (the code path under test) and the PSI read must succeed (otherwise
+        // the tick would bail out earlier and every sentinel would trivially
+        // survive, flattering the assertion).
+        assert!(
+            gov.ksm.read_stats().is_err(),
+            "an empty KSM directory must fail the stats read"
+        );
+        assert!(
+            PsiStats::read_memory().is_ok(),
+            "PSI must be readable or this test proves nothing"
+        );
+
+        let state = new_shared_state();
+        {
+            let mut s = state.write().await;
+            s.current_pressure = PressureLevel::High;
+            s.ksm_level = 3;
+            s.pages_sharing = 777;
+            s.general_profit = -999;
+            s.last_adjustment = Instant::now() - Duration::from_secs(10);
+        }
+        let last_adjustment_before = state.read().await.last_adjustment;
+
+        gov.tick(&state).await;
+
+        let s = state.read().await;
+        assert_eq!(
+            s.current_pressure,
+            PressureLevel::High,
+            "pressure must not be overwritten by a failed tick"
+        );
+        assert_eq!(s.ksm_level, 3);
+        assert_eq!(s.pages_sharing, 777);
+        assert_eq!(s.general_profit, -999);
+        assert_eq!(
+            s.last_adjustment, last_adjustment_before,
+            "last_adjustment is written inside tick_with_readings, so its \
+             survival proves the tick returned before that block"
+        );
+        // And the governor itself never saw a reading, so it never classified
+        // or transitioned either.
+        assert_eq!(gov.current_level, 0);
+        assert!(gov.last_psi.is_none());
+    }
+
+    /// The negative-profit step-down, observed in sysfs rather than in RAM.
+    ///
+    /// `compact` loses its meaning if the governor stops at the level change
+    /// without writing the new profile: the daemon's whole effect on the host
+    /// is the sysfs writes, so an in-memory level change that never lands is a
+    /// no-op for every other consumer.
+    #[tokio::test]
+    async fn test_negative_profit_step_down_writes_lower_profile_to_sysfs() {
+        let (mut gov, dir) = seeded_gov(|c| {
+            c.stabilization_secs = 0;
+            c.hysteresis_readings = 2;
+            // Keep the default 30 s `min_level_duration_secs`: the Idle
+            // classification below wants to step 5 -> 4 via the ramp-down path,
+            // which is blocked by that cooldown on the first tick. So any level
+            // change observed here is attributable to the profit monitor and
+            // nothing else.
+        });
+        gov.current_level = 5;
+        gov.full_scans_at_level = 0;
+        seed_level_three_params(dir.path());
+        let state = new_shared_state();
+
+        // Idle PSI (score 0.07) and a loss of 500 bytes well past the
+        // 10-full-scan guard: the profit monitor must step down one level.
+        gov.tick_with_readings(&state, psi(0.0, 0.1), ksm_stats(100, -500, 20))
+            .await;
+
+        assert_eq!(
+            gov.current_level, 4,
+            "negative profit after sustained scanning must reduce aggressiveness"
+        );
+        // The level-4 profile reached the kernel, not just the struct.
+        assert_eq!(
+            read_param(dir.path(), "sleep_millisecs"),
+            "10",
+            "level 4 sleep_millisecs must be written on step-down"
+        );
+        assert_eq!(
+            read_param(dir.path(), "max_page_sharing"),
+            "768",
+            "level 4 max_page_sharing must be written on step-down"
+        );
+        assert_eq!(
+            read_param(dir.path(), "pages_to_scan"),
+            "100",
+            "advisor mode must not write pages_to_scan"
+        );
+
+        let s = state.read().await;
+        assert_eq!(s.ksm_level, 4);
+        assert_eq!(s.general_profit, -500);
+        assert_eq!(s.pages_sharing, 100);
+    }
+
+    /// When only the profit monitor moves the level, the stabilization window
+    /// must not swallow the write either — a KSM run that loses memory while
+    /// thrashing CPU cannot afford to wait for the cooldown to expire.
+    #[tokio::test]
+    async fn test_negative_profit_step_down_ignores_stabilization_window() {
+        let (mut gov, dir) = seeded_gov(|c| {
+            // A long window, and a governor action that just happened: every
+            // stabilization path is closed.
+            c.stabilization_secs = 3600;
+            c.min_level_duration_secs = 3600;
+            c.hysteresis_readings = 2;
+        });
+        gov.current_level = 5;
+        gov.full_scans_at_level = 0;
+        seed_level_three_params(dir.path());
+        let state = new_shared_state();
+        {
+            let mut s = state.write().await;
+            s.last_governor_action = Instant::now();
+        }
+
+        gov.tick_with_readings(&state, psi(30.0, 25.0), ksm_stats(100, -500, 20))
+            .await;
+
+        assert_eq!(gov.current_level, 4);
+        assert_eq!(
+            read_param(dir.path(), "sleep_millisecs"),
+            "10",
+            "the profit step-down must not be deferred by stabilization"
+        );
+    }
+
+    /// Stabilization deferral, observed in sysfs.
+    ///
+    /// The existing test asserts only that the in-memory level and the shared
+    /// state survived; this one pins the stronger property that the *files*
+    /// still hold the old profile, so a deferred level change genuinely leaves
+    /// the host untouched rather than writing a profile the governor will not
+    /// report having applied.
+    #[tokio::test]
+    async fn test_stabilization_deferral_leaves_sysfs_files_untouched() {
+        let (mut gov, dir) = seeded_gov(|c| c.stabilization_secs = 30);
+        gov.current_level = 0;
+        seed_level_three_params(dir.path());
+        let state = new_shared_state();
+        {
+            let mut s = state.write().await;
+            s.last_governor_action = Instant::now();
+            s.last_global_action = Instant::now();
+        }
+        let governor_action_before = state.read().await.last_governor_action;
+
+        // Score 26.5 → Critical → target 5 → a two-level jump from level 0, so
+        // the transition is immediate and the only thing gating it is the
+        // stabilization window.
+        gov.tick_with_readings(&state, psi(30.0, 25.0), ksm_stats(10, 20, 1))
+            .await;
+
+        assert_eq!(
+            gov.current_level, 0,
+            "level must not move inside the window"
+        );
+        assert_eq!(
+            read_param(dir.path(), "sleep_millisecs"),
+            "20",
+            "a deferred transition must not rewrite sysfs"
+        );
+        assert_eq!(
+            read_param(dir.path(), "max_page_sharing"),
+            "512",
+            "a deferred transition must not rewrite sysfs"
+        );
+
+        let s = state.read().await;
+        assert_eq!(s.current_pressure, PressureLevel::Critical);
+        assert_eq!(s.ksm_level, 0);
+        assert_eq!(s.pages_sharing, 10);
+        assert_eq!(s.general_profit, 20);
+        assert_eq!(
+            s.last_governor_action, governor_action_before,
+            "no profile write, so the governor timestamp must be untouched"
+        );
+        assert!(s.last_adjustment.elapsed() < Duration::from_secs(5));
     }
 }

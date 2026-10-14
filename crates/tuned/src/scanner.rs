@@ -1426,4 +1426,133 @@ mod tests {
         scanner.stats.exec_vmas_reprotected += totals.withdrawn as u64;
         assert!(scanner.stats.exec_vmas_reprotected > 0);
     }
+
+    // ── scan_cycle: the marking loop's accounting contract ──────────────
+
+    /// The injection loop runs `enable_merge_any` once per candidate, so the
+    /// two outcome counters must always partition the candidate set exactly:
+    /// a candidate is either marked or failed, never both, never neither.
+    ///
+    /// `min_anon_rss_mb = 0` makes every readable status pass Level 1
+    /// (`anon_rss_mb < 0` is false for a `u64`), so the candidate count is a
+    /// property of the host rather than of a hand-fed fixture — and it is
+    /// derived from the *public* counters, so a scanner that silently stopped
+    /// injecting cannot make the arithmetic look right.
+    ///
+    /// `dry_run = true`: no ptrace attach happens at all, so nothing on this
+    /// host is touched and no injection can fail.
+    #[tokio::test]
+    async fn test_scan_cycle_partitions_candidates_into_marked_and_failed() {
+        let config = ScannerConfig {
+            min_anon_rss_mb: 0,
+            max_candidates_per_cycle: 64,
+            blocklist: Vec::new(),
+            ..ScannerConfig::default()
+        };
+        let mut scanner = Scanner::new(
+            config.clone(),
+            /* dry_run */ true,
+            /* stabilization */ 0,
+        );
+        let state = Arc::new(RwLock::new(GovernorState::default()));
+        {
+            let mut s = state.write().await;
+            s.last_scanner_action = Instant::now() - Duration::from_secs(120);
+            s.last_global_action = Instant::now() - Duration::from_secs(120);
+            s.last_governor_action = Instant::now() - Duration::from_secs(120);
+        }
+        let governor_action_before = state.read().await.last_governor_action;
+
+        scanner.scan_cycle(&state).await;
+
+        // `to_mark` after truncation. Neither `filtered_l2` nor
+        // `filtered_l25_profit` is truncated, so their difference is the
+        // pre-truncation candidate count and the budget clips it.
+        let selected = (scanner.stats.processes_filtered_l2
+            - scanner.stats.processes_filtered_l25_profit)
+            .min(config.max_candidates_per_cycle as u64);
+
+        assert!(
+            selected >= 1,
+            "a zero RSS floor must admit at least one process on any host \
+             (l1={}, l2={}, l25={})",
+            scanner.stats.processes_filtered_l1,
+            scanner.stats.processes_filtered_l2,
+            scanner.stats.processes_filtered_l25_profit
+        );
+
+        assert_eq!(
+            scanner.stats.processes_marked + scanner.stats.injection_failures,
+            selected,
+            "every candidate must be accounted for as marked or failed"
+        );
+        assert_eq!(
+            scanner.stats.injection_failures, 0,
+            "a dry-run injection attaches nothing, so nothing can fail"
+        );
+        assert_eq!(
+            scanner.stats.processes_marked, selected,
+            "the dry run must report one mark per candidate"
+        );
+
+        // The cycle "actually did something", so both of its own timestamps
+        // advance — while the governor's must not, because the scanner has no
+        // business touching a tier it does not own.
+        let s = state.read().await;
+        assert!(
+            s.last_scanner_action.elapsed() < Duration::from_secs(5),
+            "a cycle that marked processes must refresh last_scanner_action"
+        );
+        assert!(
+            s.last_global_action.elapsed() < Duration::from_secs(5),
+            "a cycle that marked processes must refresh last_global_action"
+        );
+        assert_eq!(
+            s.last_governor_action, governor_action_before,
+            "the scanner must never touch the governor's timestamp"
+        );
+    }
+
+    /// The other half of the timestamp contract: a cycle that found no
+    /// candidates must not claim it acted. Leaving `stabilization_secs` at 0
+    /// is deliberate — the cycle has to reach candidate selection and return
+    /// from *there*, which is the only way this test can tell the difference
+    /// between "deferred by the window" and "nothing to do".
+    #[tokio::test]
+    async fn test_scan_cycle_advances_no_timestamp_when_no_candidate_is_found() {
+        let mut scanner = Scanner::new(
+            ScannerConfig {
+                min_anon_rss_mb: u64::MAX,
+                ..ScannerConfig::default()
+            },
+            true,
+            0,
+        );
+        let state = Arc::new(RwLock::new(GovernorState::default()));
+        {
+            let mut s = state.write().await;
+            s.last_scanner_action = Instant::now() - Duration::from_secs(120);
+            s.last_global_action = Instant::now() - Duration::from_secs(120);
+        }
+        let (scanner_before, global_before) = {
+            let s = state.read().await;
+            (s.last_scanner_action, s.last_global_action)
+        };
+
+        scanner.scan_cycle(&state).await;
+
+        assert_eq!(
+            scanner.stats.processes_filtered_l1, 0,
+            "an impossible RSS floor must filter every process at Level 1"
+        );
+        let s = state.read().await;
+        assert_eq!(
+            s.last_scanner_action, scanner_before,
+            "a cycle that did nothing must not refresh last_scanner_action"
+        );
+        assert_eq!(
+            s.last_global_action, global_before,
+            "a cycle that did nothing must not refresh last_global_action"
+        );
+    }
 }
