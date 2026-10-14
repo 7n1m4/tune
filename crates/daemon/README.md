@@ -476,7 +476,8 @@ PRs welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## License
 
-Dual-licensed under **MIT** or **Apache-2.0** at your option.
+MIT. The `tune` workspace is MIT as a whole, including this crate — see the
+workspace-root `LICENSE`.
 
 ---
 

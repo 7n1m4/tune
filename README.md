@@ -62,4 +62,4 @@ surfaces its pre-merge history.
 
 ## Licence
 
-MIT. See `crates/zswap-tune/LICENSE`, `LICENSE-MIT`.
+MIT for the whole workspace — see `LICENSE`.
