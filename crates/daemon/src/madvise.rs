@@ -83,7 +83,17 @@ pub struct MergeableResult {
     pub processes_marked: usize,
     /// Executable VMAs withdrawn from merging after the flag was set. See
     /// [`unmerge_executable_vmas`] — this is a safety counter, not a tunable.
+    ///
+    /// Read this together with [`MergeableResult::exec_vmas_failed`]. A zero
+    /// `exec_vmas_protected` with a non-zero `exec_vmas_failed` is the
+    /// dangerous shape: the process is marked but unprotected, with every
+    /// executable mapping still mergeable. Zero of both means there was
+    /// nothing to protect, which is benign.
     pub exec_vmas_protected: usize,
+    /// Executable VMAs that could not be withdrawn — ptrace refused, or the
+    /// process exited mid-pass. Non-zero is a silent hazard unless it is
+    /// surfaced, because `MMF_VM_MERGE_ANY` is already set on the target.
+    pub exec_vmas_failed: usize,
     pub error: Option<String>,
 }
 
@@ -109,6 +119,7 @@ pub fn enable_merge_any(pid: u32, dry_run: bool) -> MergeableResult {
             pid,
             processes_marked: 1,
             exec_vmas_protected: 0,
+            exec_vmas_failed: 0,
             error: None,
         };
     }
@@ -118,15 +129,16 @@ pub fn enable_merge_any(pid: u32, dry_run: bool) -> MergeableResult {
             // Ordering matters: `PR_SET_MEMORY_MERGE` marks every existing VMA,
             // so the executable ones must be withdrawn immediately after, in
             // the same pass, before ksmd can observe them.
-            let (withdrawn, exec_vmas) = unmerge_executable_vmas(pid, false);
+            let (withdrawn, failed) = unmerge_executable_vmas(pid, false);
             debug!(
                 pid,
-                withdrawn, exec_vmas, "Enabled process-wide KSM eligibility"
+                withdrawn, failed, "Enabled process-wide KSM eligibility"
             );
             MergeableResult {
                 pid,
                 processes_marked: 1,
                 exec_vmas_protected: withdrawn,
+                exec_vmas_failed: failed,
                 error: None,
             }
         }
@@ -134,6 +146,7 @@ pub fn enable_merge_any(pid: u32, dry_run: bool) -> MergeableResult {
             pid,
             processes_marked: 0,
             exec_vmas_protected: 0,
+            exec_vmas_failed: 0,
             error: Some(e),
         },
     }
@@ -202,9 +215,22 @@ pub fn enable_merge_any(pid: u32, dry_run: bool) -> MergeableResult {
 /// every other mapping, including those created after this call.
 ///
 /// # Returns
-/// `(vmas_withdrawn, exec_vmas)` — the first is the count withdrawn, the second
-/// is the count of executable mappings found, so metrics can tell "protected"
-/// apart from "none found".
+///
+/// `(vmas_withdrawn, exec_vmas_failed)`. The second element is the point of
+/// this function's contract: a caller that only sees `withdrawn` cannot tell
+/// "this process has no executable mappings" from "every injection was
+/// refused", and those two cases demand opposite responses. Zero of both is
+/// benign; a non-zero `failed` means the target is still mergeable through its
+/// executable mappings.
+///
+/// This is not merely cosmetic. A live run of the marking path recorded
+/// `withdrawn=0 exec_vmas=9` where the prctl succeeded but every subsequent
+/// ptrace attach returned `EPERM` — the process was marked and unprotected,
+/// which is precisely the state that faulted Chromium. Collapsing that into a
+/// bare zero hid it from the metrics and from the person reading them.
+///
+/// Maps that cannot be read return `(0, 0)`: an unreadable target is a target
+/// that no longer exists, not a target with a broken guard.
 pub fn unmerge_executable_vmas(pid: u32, dry_run: bool) -> (usize, usize) {
     let maps = match animaksm_common::procfs::read_process_maps(pid) {
         Ok(m) => m,
@@ -220,10 +246,11 @@ pub fn unmerge_executable_vmas(pid: u32, dry_run: bool) -> (usize, usize) {
     }
 
     if dry_run {
-        return (exec_vmas.len(), exec_vmas.len());
+        return (exec_vmas.len(), 0);
     }
 
     let mut withdrawn = 0;
+    let mut failed = 0;
     for vma in &exec_vmas {
         let len = vma.end.saturating_sub(vma.start) as usize;
         if len == 0 {
@@ -231,12 +258,15 @@ pub fn unmerge_executable_vmas(pid: u32, dry_run: bool) -> (usize, usize) {
         }
         match madvise_via_ptrace(pid, vma.start, len, MADV_UNMERGEABLE) {
             Ok(()) => withdrawn += 1,
-            Err(e) => debug!(
-                pid,
-                start = format!("0x{:x}", vma.start),
-                error = %e,
-                "MADV_UNMERGEABLE skipped for executable VMA"
-            ),
+            Err(e) => {
+                failed += 1;
+                debug!(
+                    pid,
+                    start = format!("0x{:x}", vma.start),
+                    error = %e,
+                    "MADV_UNMERGEABLE skipped for executable VMA"
+                );
+            }
         }
     }
 
@@ -244,12 +274,20 @@ pub fn unmerge_executable_vmas(pid: u32, dry_run: bool) -> (usize, usize) {
         debug!(
             pid,
             withdrawn,
+            failed,
             exec_vmas = exec_vmas.len(),
             "Protected executable VMAs from KSM merging"
         );
+    } else {
+        debug!(
+            pid,
+            failed,
+            exec_vmas = exec_vmas.len(),
+            "Could not protect any executable VMA: target is mergeable through its code"
+        );
     }
 
-    (withdrawn, exec_vmas.len())
+    (withdrawn, failed)
 }
 ///
 /// Uses process_madvise(MADV_COLLAPSE) on aligned 2MB regions.
@@ -644,9 +682,33 @@ mod tests {
 
         assert_eq!(result.processes_marked, 0);
         assert_eq!(result.exec_vmas_protected, 0);
+        assert_eq!(result.exec_vmas_failed, 0);
         assert!(
             result.error.is_some(),
             "injecting into a dead PID must report an error"
+        );
+    }
+
+    #[test]
+    fn test_unmerge_reports_failure_separately_from_nothing_to_do() {
+        // The conflation bug: `unmerge_executable_vmas` used to return the
+        // *found* count as its second element, so "9 executable VMAs, all
+        // refused" and "no executable VMAs" both read as `(0, 0)` at the call
+        // site after a first-element-only consumer. A live run hit exactly the
+        // dangerous shape — prctl succeeded, all nine MADV_UNMERGEABLE attaches
+        // returned EPERM — and the metric could not show it.
+        //
+        // A dead PID has no readable maps: `(0, 0)`, i.e. nothing to do.
+        let dead = unmerge_executable_vmas(0xFFFF_FFFE, false);
+        assert_eq!(dead, (0, 0), "unreadable maps must report nothing to do");
+
+        // The dry-run branch must never claim a failure — it performs no
+        // injection, so there is nothing that could have failed.
+        let (withdrawn, failed) = unmerge_executable_vmas(std::process::id(), true);
+        assert_eq!(failed, 0, "dry run does not inject, so cannot fail");
+        assert!(
+            withdrawn > 0,
+            "the test binary has executable mappings to protect"
         );
     }
 
@@ -679,21 +741,19 @@ mod tests {
         );
 
         // dry_run: reports what it would do, touches nothing.
-        let (dry, dry_total) = unmerge_executable_vmas(pid, true);
-        assert_eq!(dry, dry_total);
-        assert_eq!(dry_total, exec_in_maps);
+        let (dry, dry_failed) = unmerge_executable_vmas(pid, true);
+        assert_eq!(dry_failed, 0, "dry run injects nothing, so nothing fails");
+        assert_eq!(dry, exec_in_maps, "dry run reports every executable VMA");
 
         // Real run. On a build host the injected madvise may be refused (no
         // ptrace scope available in a sandboxed CI), so the contract is that
-        // the guard *attempted* every executable VMA and reported honestly.
-        let (withdrawn, total) = unmerge_executable_vmas(pid, false);
+        // the guard attempted every executable VMA and reported *which of the
+        // two outcomes* each had: withdrawn, or failed.
+        let (withdrawn, failed) = unmerge_executable_vmas(pid, false);
         assert_eq!(
-            total, exec_in_maps,
-            "every executable VMA must be attempted, none skipped silently"
-        );
-        assert!(
-            withdrawn <= total,
-            "cannot withdraw more VMAs than were found"
+            withdrawn + failed,
+            exec_in_maps,
+            "every executable VMA must be accounted for as withdrawn or failed"
         );
     }
 

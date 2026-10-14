@@ -50,6 +50,13 @@ pub struct ScannerStats {
     /// means the guard in `madvise::enable_merge_any` ran; the guard exists
     /// because in-tree KSM's `merge_any` gate does not exclude `VM_EXEC`.
     pub exec_vmas_protected: u64,
+    /// Executable VMAs that could **not** be withdrawn — the ptrace attach was
+    /// refused or the target vanished mid-pass. This is the counter that makes
+    /// `exec_vmas_protected` readable: zero protected *with* zero failed means
+    /// the target had no executable mappings, whereas zero protected *with*
+    /// non-zero failed means the target is mergeable through its code and the
+    /// guard could not stop it. A live Chromium fault is exactly the latter.
+    pub exec_vmas_unprotected: u64,
     /// Executable VMAs withdrawn again on processes already holding the flag.
     /// A browser maps new `r-xp` regions (JIT, fresh renderers) after it was
     /// flagged, so the guard must re-run, not merely run once.
@@ -201,6 +208,9 @@ struct ReprotectTotals {
     processes: usize,
     /// Executable VMAs withdrawn across those processes.
     withdrawn: usize,
+    /// Executable VMAs that could not be withdrawn. Non-zero means the target
+    /// stays mergeable through its code, so the guard is not protecting it.
+    failed: usize,
     /// Processes deferred by the per-PID rate limit rather than protected.
     rate_limited: usize,
 }
@@ -333,6 +343,7 @@ impl Scanner {
             let result = madvise::enable_merge_any(candidate.pid, self.dry_run);
             self.stats.processes_marked += result.processes_marked as u64;
             self.stats.exec_vmas_protected += result.exec_vmas_protected as u64;
+            self.stats.exec_vmas_unprotected += result.exec_vmas_failed as u64;
 
             if let Some(error) = result.error {
                 // A target can exit, or be un-injectable (kernel threads, and
@@ -346,6 +357,23 @@ impl Scanner {
                 );
                 self.stats.injection_failures += 1;
             } else {
+                // The flag is set, so the process is eligible; the question is
+                // whether its code is protected. `prctl` succeeding does not
+                // imply the withdrawals did — a ptrace attach can be refused
+                // (EPERM) for the very same target, leaving it mergeable
+                // through its executable mappings. That is the state that
+                // faulted Chromium, so it must not be silent.
+                if result.exec_vmas_failed > 0 {
+                    warn!(
+                        pid = result.pid,
+                        name = %candidate.name,
+                        marked = result.processes_marked,
+                        protected = result.exec_vmas_protected,
+                        unprotected = result.exec_vmas_failed,
+                        "Marked process is NOT fully protected: executable VMAs \
+                         remain mergeable"
+                    );
+                }
                 injected.push(candidate.pid);
             }
         }
@@ -359,6 +387,11 @@ impl Scanner {
         let reprotected =
             self.reprotect_exec_vmas(&targets.already_flagged, madvise::unmerge_executable_vmas);
         self.stats.exec_vmas_reprotected += reprotected.withdrawn as u64;
+        // The re-protection pass acts on processes that already hold the flag
+        // from an earlier cycle, so a failure here is not a missed opportunity
+        // — it is an already-mergeable target left mergeable. Count it, and
+        // surface the total in the cycle line so it cannot be read as health.
+        self.stats.exec_vmas_unprotected += reprotected.failed as u64;
         if reprotected.rate_limited > 0 {
             debug!(
                 rate_limited = reprotected.rate_limited,
@@ -402,6 +435,7 @@ impl Scanner {
             targeted = candidates.len(),
             processes_marked = self.stats.processes_marked,
             exec_vmas_protected = self.stats.exec_vmas_protected,
+            exec_vmas_unprotected = self.stats.exec_vmas_unprotected,
             exec_vmas_reprotected = self.stats.exec_vmas_reprotected,
             reprotect_processes = reprotected.processes,
             reprotect_rate_limited = reprotected.rate_limited,
@@ -468,9 +502,9 @@ impl Scanner {
             // A target that exited between listing and injection has no maps to
             // read, so the withdrawal reports zero rather than an error: the
             // cycle continues with the remaining targets.
-            let (withdrawn, found) = unmerge(candidate.pid, self.dry_run);
+            let (withdrawn, failed) = unmerge(candidate.pid, self.dry_run);
 
-            if found == 0 {
+            if withdrawn + failed == 0 {
                 debug!(
                     pid = candidate.pid,
                     name = %candidate.name,
@@ -482,11 +516,24 @@ impl Scanner {
             self.reprotect_ledger.record(candidate.pid, now);
             totals.processes += 1;
             totals.withdrawn += withdrawn;
+            totals.failed += failed;
+            if failed > 0 {
+                // The flag is already set on this process from an earlier
+                // cycle, so a failed withdrawal leaves it mergeable through its
+                // code. Warn rather than debug: this is the crash shape.
+                warn!(
+                    pid = candidate.pid,
+                    name = %candidate.name,
+                    withdrawn, failed,
+                    "Already-flagged process is NOT fully protected: executable \
+                     VMAs remain mergeable"
+                );
+            }
             debug!(
                 pid = candidate.pid,
                 name = %candidate.name,
                 withdrawn,
-                found,
+                failed,
                 "Re-protected executable VMAs on an already-flagged process"
             );
         }
@@ -1050,14 +1097,60 @@ mod tests {
     /// A withdrawal closure that reports `(withdrawn, found)` per PID and
     /// records every PID it was called on.
     fn recording_unmerge(
-        found: usize,
         withdrawn: usize,
+        failed: usize,
         calls: std::rc::Rc<std::cell::RefCell<Vec<u32>>>,
     ) -> impl FnMut(u32, bool) -> (usize, usize) {
         move |pid, _dry_run| {
             calls.borrow_mut().push(pid);
-            (withdrawn, found)
+            (withdrawn, failed)
         }
+    }
+
+    #[test]
+    fn test_reprotect_exec_vmas_counts_failures_instead_of_swallowing_them() {
+        // The real bug this guards against: `unmerge_executable_vmas` used to
+        // report `(0, found)` when the prctl succeeded but every ptrace attach
+        // was refused, so a *completely failed* guard looked like a healthy
+        // one. A live run showed exactly that — `withdrawn=0 exec_vmas=9`, all
+        // nine returns EPERM — leaving a process mergeable through its code.
+        let mut scanner = Scanner::new(
+            ScannerConfig {
+                interval_secs: 30,
+                max_candidates_per_cycle: 4,
+                ..ScannerConfig::default()
+            },
+            false,
+            0,
+        );
+        scanner.daemon_pid = u32::MAX;
+
+        let targets = vec![reprotect_candidate(4242, "app", 256)];
+
+        // Every injection refused. Withdrawn is zero, so the target is left
+        // unprotected, and the pass must say so rather than reporting nothing.
+        let totals = scanner.reprotect_exec_vmas(
+            &targets,
+            recording_unmerge(0, 9, std::rc::Rc::new(std::cell::RefCell::new(Vec::new()))),
+        );
+
+        assert_eq!(totals.withdrawn, 0, "nothing was withdrawn");
+        assert_eq!(
+            totals.failed, 9,
+            "nine refused withdrawals must be reported as failures"
+        );
+        assert_eq!(
+            totals.processes, 1,
+            "a fully-failed target is still a process the pass ran on"
+        );
+
+        // And the counter `scan_cycle` maintains must carry it.
+        scanner.stats.exec_vmas_unprotected += totals.failed as u64;
+        assert_eq!(scanner.stats.exec_vmas_unprotected, 9);
+        assert_eq!(
+            scanner.stats.exec_vmas_reprotected, 0,
+            "a failed guard must not increment the success counter"
+        );
     }
 
     #[test]
@@ -1080,7 +1173,7 @@ mod tests {
 
         let totals = scanner.reprotect_exec_vmas(
             &targets,
-            recording_unmerge(3, 3, std::rc::Rc::clone(&calls)),
+            recording_unmerge(3, 0, std::rc::Rc::clone(&calls)),
         );
 
         assert_eq!(
@@ -1088,6 +1181,7 @@ mod tests {
             ReprotectTotals {
                 processes: 2,
                 withdrawn: 6,
+                failed: 0,
                 rate_limited: 0,
             },
             "every already-flagged process must be offered the guard again"
@@ -1154,7 +1248,7 @@ mod tests {
                 // `unmerge_executable_vmas` returns for an unreadable maps.
                 match pid {
                     4241 => (0, 0),
-                    _ => (4, 4),
+                    _ => (4, 0),
                 }
             }
         });
@@ -1164,6 +1258,7 @@ mod tests {
             ReprotectTotals {
                 processes: 1,
                 withdrawn: 4,
+                failed: 0,
                 rate_limited: 0,
             },
             "a target exiting mid-pass must be skipped, not abort the cycle"
@@ -1179,7 +1274,7 @@ mod tests {
         let calls_after = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         scanner.reprotect_exec_vmas(
             &[reprotect_candidate(4241, "gone", 512)],
-            recording_unmerge(1, 1, std::rc::Rc::clone(&calls_after)),
+            recording_unmerge(1, 0, std::rc::Rc::clone(&calls_after)),
         );
         assert_eq!(*calls_after.borrow(), vec![4241]);
     }
@@ -1205,7 +1300,7 @@ mod tests {
         let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let totals = scanner.reprotect_exec_vmas(
             &targets,
-            recording_unmerge(2, 2, std::rc::Rc::clone(&calls)),
+            recording_unmerge(2, 0, std::rc::Rc::clone(&calls)),
         );
 
         assert!(!calls.borrow().contains(&daemon_pid));
@@ -1233,7 +1328,7 @@ mod tests {
         let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let second = scanner.reprotect_exec_vmas(
             &targets,
-            recording_unmerge(3, 3, std::rc::Rc::clone(&calls)),
+            recording_unmerge(3, 0, std::rc::Rc::clone(&calls)),
         );
 
         assert!(calls.borrow().is_empty());
@@ -1264,7 +1359,7 @@ mod tests {
         let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let totals = scanner.reprotect_exec_vmas(
             &targets,
-            recording_unmerge(1, 1, std::rc::Rc::clone(&calls)),
+            recording_unmerge(1, 0, std::rc::Rc::clone(&calls)),
         );
 
         assert_eq!(totals.processes, 2);

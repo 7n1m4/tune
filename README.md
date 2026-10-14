@@ -99,8 +99,32 @@ So AKSMD injects `madvise(MADV_UNMERGEABLE)` on every `r-xp` mapping right after
 setting the flag. That has to be injected too: `process_madvise(2)` refuses KSM
 advices on a remote `mm` — `process_madvise_remote_valid()` allows only COLD,
 PAGEOUT, WILLNEED and COLLAPSE. `ScannerStats::exec_vmas_protected` reports the
-count at marking time, and `exec_vmas_reprotected` reports it on later cycles,
-so coverage is observable rather than assumed.
+count at marking time, `exec_vmas_reprotected` reports it on later cycles, so
+coverage is observable rather than assumed.
+
+`ScannerStats::exec_vmas_unprotected` reports the VMAs that could **not** be
+withdrawn. The two counters must be read together, because they were not at
+first: `unmerge_executable_vmas` used to report `(withdrawn, found)`, and a
+caller that read only the first element could not distinguish "no executable
+mappings" from "every injection refused". A live run hit exactly the latter —
+the `prctl` succeeded, then all nine `MADV_UNMERGEABLE` attaches returned
+`EPERM`:
+
+```text
+Enabled process-wide KSM eligibility pid=1284938 withdrawn=0 exec_vmas=9
+MADV_UNMERGEABLE skipped for executable VMA pid=1284938
+  error=ptrace attach failed: EPERM: Operation not permitted
+```
+
+That process was marked and entirely unprotected, and the metric said nothing.
+The contract is now `(withdrawn, failed)` on both paths, the cycle line carries
+`exec_vmas_unprotected`, and a marked-but-unprotected target logs at `warn`.
+A non-zero `exec_vmas_unprotected` is not a tuning signal, it is an open crash.
+
+This was not the cause of the crashes below — it fired once, on one short-lived
+non-browser process, long after Chromium last faulted. It is reported because it
+was invisible, and an invisible failure of the guard is what made the earlier
+crashes impossible to reason about.
 
 **But the withdrawal is not sufficient, and browsers are blocked by default.**
 
@@ -270,6 +294,15 @@ $ journalctl -u animaksm -f | grep 'scanner cycle'
 `exec_vmas_reprotected` should start becoming non-zero on later cycles once a
 browser or JIT-using process is flagged.
 
+`exec_vmas_unprotected` should stay **zero**. It is the one counter with no
+acceptable non-zero reading: it counts executable VMAs that stayed mergeable
+because the withdrawal was refused. If it climbs, stop the daemon and restart
+the affected process — the flag is sticky, so it does not clear by itself.
+
+```bash
+$ sudo systemctl stop animaksm     # restores KSM state from the snapshot
+```
+
 **3. Check for the failure the guard prevents** — the whole point of the run:
 
 ```bash
@@ -326,7 +359,7 @@ collector) can pick up directly:
 animaksm: ksm pages_shared=0 pages_sharing=0 general_profit=0 full_scans=0
 animaksm: governor level=3 pressure=medium target=3 psi_some=0.66 psi_full=0.65
 animaksm: scanner targeted=3 processes_marked=3 exec_vmas_protected=104 \
-          exec_vmas_reprotected=0 thp_collapsed=0 cycles=4
+          exec_vmas_unprotected=0 exec_vmas_reprotected=0 thp_collapsed=0 cycles=4
 ```
 
 `exec_vmas_protected` counts executable VMAs withdrawn at marking time;
@@ -335,6 +368,12 @@ holding the flag, because a browser keeps mapping new `r-xp` regions (JIT,
 fresh renderers) after it was flagged. A healthy long-running daemon shows the
 second number non-zero — if it is permanently zero while browsers are targeted,
 the guard is not re-running and the process is unprotected again.
+
+`exec_vmas_unprotected` counts the VMAs that could **not** be withdrawn at all.
+It should stay at zero. Anything else means a target was marked and left
+mergeable through its code — `prctl` succeeded while the withdrawals were
+refused — which is the crash shape, so treat it as a page-worthy alert, not a
+metric to trend.
 
 To alert on KSM effectiveness, watch `general_profit` (saved memory minus
 overhead) and `pages_sharing` — the two numbers that say whether KSM is
