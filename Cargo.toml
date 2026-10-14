@@ -1,6 +1,14 @@
 [workspace]
-members = ["crates/common", "crates/daemon"]
+# `tune` — kernel memory-reclaim tooling.
+#
+# Two independent binaries, deliberately NOT fused:
+#   animaksm     KSM governor + ptrace process scanner  (async, third-party deps)
+#   zswap-tune   zswap max_pool_percent tuner            (std-only, zero deps)
+#
+# `zswap-tune` must stay dependency-free (see AGENTS.md), so it lives in its own
+# crate and inherits no workspace.dependencies. Its release profile below.
 resolver = "2"
+members = ["crates/common", "crates/daemon", "crates/zswap-tune"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -15,4 +23,8 @@ nix = { version = "0.29", features = ["mman", "ptrace", "signal", "process", "fs
 libc = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "signal", "fs", "net", "time", "io-util", "sync", "macros"] }
 clap = { version = "4", features = ["derive"] }
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Matches the release profile zswap-tune had as a standalone crate.
+[profile.release]
+opt-level = 2
+lto = true

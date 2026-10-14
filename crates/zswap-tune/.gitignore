@@ -1,0 +1,1 @@
+# no intermediate artifacts for the zero-dependency crate; workspace target/ is gitignored at root
