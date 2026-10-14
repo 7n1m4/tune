@@ -3,7 +3,7 @@
 //! Provides functions to enumerate processes, read their memory maps,
 //! and extract KSM-relevant statistics from /proc.
 
-use crate::error::{AnimaksmError, Result};
+use crate::error::{Result, TunedError};
 use std::fs;
 use std::path::Path;
 
@@ -90,7 +90,7 @@ pub fn list_pids() -> Result<Vec<u32>> {
 
 fn list_pids_from(proc_path: &Path) -> Result<Vec<u32>> {
     let mut pids = Vec::new();
-    let entries = fs::read_dir(proc_path).map_err(|e| AnimaksmError::Procfs {
+    let entries = fs::read_dir(proc_path).map_err(|e| TunedError::Procfs {
         pid: 0,
         detail: format!("cannot read {}: {e}", proc_path.display()),
     })?;
@@ -113,7 +113,7 @@ pub fn read_process_status(pid: u32) -> Result<ProcessStatus> {
 
 fn read_process_status_from(proc_path: &Path, pid: u32) -> Result<ProcessStatus> {
     let path = proc_path.join(pid.to_string()).join("status");
-    let content = fs::read_to_string(&path).map_err(|e| AnimaksmError::Procfs {
+    let content = fs::read_to_string(&path).map_err(|e| TunedError::Procfs {
         pid,
         detail: format!("cannot read {}: {e}", path.display()),
     })?;
@@ -143,7 +143,7 @@ pub fn read_process_maps(pid: u32) -> Result<Vec<MapsEntry>> {
 
 fn read_process_maps_from(proc_path: &Path, pid: u32) -> Result<Vec<MapsEntry>> {
     let path = proc_path.join(pid.to_string()).join("maps");
-    let content = fs::read_to_string(&path).map_err(|e| AnimaksmError::Procfs {
+    let content = fs::read_to_string(&path).map_err(|e| TunedError::Procfs {
         pid,
         detail: format!("cannot read {}: {e}", path.display()),
     })?;
@@ -165,7 +165,7 @@ pub fn read_ksm_stat(pid: u32) -> Result<KsmProcStat> {
 
 fn read_ksm_stat_from(proc_path: &Path, pid: u32) -> Result<KsmProcStat> {
     let path = proc_path.join(pid.to_string()).join("ksm_stat");
-    let content = fs::read_to_string(&path).map_err(|e| AnimaksmError::Procfs {
+    let content = fs::read_to_string(&path).map_err(|e| TunedError::Procfs {
         pid,
         detail: format!("cannot read {}: {e}", path.display()),
     })?;
@@ -192,7 +192,7 @@ fn read_ksm_stat_from(proc_path: &Path, pid: u32) -> Result<KsmProcStat> {
 /// Read PIDs belonging to a specific cgroup (cgroup v2).
 pub fn read_cgroup_procs(cgroup_path: &str) -> Result<Vec<u32>> {
     let procs_path = format!("{cgroup_path}/cgroup.procs");
-    let content = fs::read_to_string(&procs_path).map_err(|e| AnimaksmError::Procfs {
+    let content = fs::read_to_string(&procs_path).map_err(|e| TunedError::Procfs {
         pid: 0,
         detail: format!("cannot read {procs_path}: {e}"),
     })?;
@@ -216,23 +216,22 @@ fn read_pagemap_pfn_from(proc_path: &Path, pid: u32, vaddr: u64) -> Result<Optio
     let offset = (vaddr / 4096) * 8; // 8 bytes per page
 
     use std::io::{Read, Seek, SeekFrom};
-    let mut file = fs::File::open(&path).map_err(|e| AnimaksmError::Procfs {
+    let mut file = fs::File::open(&path).map_err(|e| TunedError::Procfs {
         pid,
         detail: format!("cannot open {}: {e}", path.display()),
     })?;
 
     file.seek(SeekFrom::Start(offset))
-        .map_err(|e| AnimaksmError::Procfs {
+        .map_err(|e| TunedError::Procfs {
             pid,
             detail: format!("cannot seek pagemap: {e}"),
         })?;
 
     let mut buf = [0u8; 8];
-    file.read_exact(&mut buf)
-        .map_err(|e| AnimaksmError::Procfs {
-            pid,
-            detail: format!("cannot read pagemap entry: {e}"),
-        })?;
+    file.read_exact(&mut buf).map_err(|e| TunedError::Procfs {
+        pid,
+        detail: format!("cannot read pagemap entry: {e}"),
+    })?;
 
     let entry = u64::from_ne_bytes(buf);
 
@@ -260,7 +259,7 @@ fn read_pagemap_range_from(proc_path: &Path, pid: u32, start: u64, end: u64) -> 
     let mut file = match fs::File::open(&path) {
         Ok(f) => f,
         Err(e) => {
-            return Err(AnimaksmError::Procfs {
+            return Err(TunedError::Procfs {
                 pid,
                 detail: format!("cannot open {}: {e}", path.display()),
             });
@@ -318,7 +317,7 @@ fn read_process_comm_from(proc_path: &Path, pid: u32) -> Result<String> {
     let path = proc_path.join(pid.to_string()).join("comm");
     fs::read_to_string(&path)
         .map(|s| s.trim().to_string())
-        .map_err(|e| AnimaksmError::Procfs {
+        .map_err(|e| TunedError::Procfs {
             pid,
             detail: format!("cannot read {}: {e}", path.display()),
         })
@@ -398,8 +397,8 @@ mod tests {
 
     #[test]
     fn test_is_blocklisted() {
-        let blocklist = vec!["animaksm".to_string(), "ksmd".to_string()];
-        assert!(is_blocklisted("animaksm-daemon", &blocklist));
+        let blocklist = vec!["tuned".to_string(), "ksmd".to_string()];
+        assert!(is_blocklisted("tuned-daemon", &blocklist));
         assert!(is_blocklisted("ksmd", &blocklist));
         assert!(!is_blocklisted("firefox", &blocklist));
     }

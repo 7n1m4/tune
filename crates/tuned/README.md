@@ -8,9 +8,9 @@
 ### The spiritual successor to uksmd — a modern, Rust-based userspace KSM daemon with PTrace-powered process-wide KSM eligibility
 
 <!--
-[![Crates.io](https://img.shields.io/crates/v/animaksm-daemon.svg)](https://crates.io/crates.io/crates/animaksm-daemon)
-[![Documentation](https://docs.rs/animaksm-daemon/badge.svg)](https://docs.rs/animaksm-daemon)
-[![Build Status](https://github.com/animaios/animaksm/workflows/CI/badge.svg)](https://github.com/animaios/animaksm/actions)
+[![Crates.io](https://img.shields.io/crates/v/tuned-daemon.svg)](https://crates.io/crates.io/crates/tuned-daemon)
+[![Documentation](https://docs.rs/tuned-daemon/badge.svg)](https://docs.rs/tuned-daemon)
+[![Build Status](https://github.com/animaios/tuned/workflows/CI/badge.svg)](https://github.com/animaios/tuned/actions)
 -->
 
 [![DeepSource](https://app.deepsource.com/gh/animaios/aksmd.svg/?label=code+coverage&show_trend=true&token=iBvsQ1aAT0R9zi6jTngKW_VR)](https://app.deepsource.com/gh/animaios/aksmd/)
@@ -166,54 +166,58 @@ used to enumerate the merge population.
 ### Install (Arch Linux / CachyOS)
 ```bash
 # From AUR
-yay -S animaksmd-git
+yay -S tuned-git
 
 # Or build from source
-cargo install --locked animaksm-daemon --git https://github.com/animaios/animaksmd
+cargo install --locked tuned-daemon --git https://github.com/animaios/tuned
 ```
 
 ### Install (Other Distros)
+
+Run from the **workspace root** (`config/` and `systemd/` live there, not in this
+crate):
+
 ```bash
-# Build from source (requires Rust 1.75+)
-git clone https://github.com/animaios/animaksmd
-cd animaksmd
-cargo build --release --bin animaksm
-  
-# Install the binary
-sudo cp target/release/animaksm /usr/local/bin/
-  
+# Build the daemon
+cargo build --release -p tuned-daemon
+
+# Install the binary — it is called `tuned`
+sudo install -m 755 target/release/tuned /usr/local/bin/
+
 # Install the config file. The repo ships a fully-commented example at
-# config/animaksm.toml; there is no /etc/animaksm.toml and no `make install`
+# config/tuned.toml; there is no /etc/tuned.toml and no `make install`
 # target, so copy it into place yourself.
-sudo mkdir -p /var/lib/animaksm
-sudo cp config/animaksm.toml /etc/animaksm.toml
-  
-# Install the systemd unit (its ExecStart expects /usr/local/bin/animaksm
-# and /etc/animaksm.toml) and reload systemd
-sudo cp systemd/animaksm.service /etc/systemd/system/
+sudo mkdir -p /var/lib/tuned /var/log/tuned-zswap
+sudo cp config/tuned.toml /etc/tuned.toml
+
+# Install the systemd unit (its ExecStart expects /usr/local/bin/tuned and
+# /etc/tuned.toml) and reload systemd
+sudo cp systemd/tuned.service /etc/systemd/system/
+sudo install -m 644 systemd/tuned-logrotate.conf /etc/logrotate.d/tuned-zswap
 sudo systemctl daemon-reload
 ```
 
-> In the merged `tune` workspace, `config/` and `systemd/` live at the **workspace
-> root**, not in this crate. Run the install commands above from the workspace
-> root, and build with `cargo build -p animaksm-daemon --release`.
+The unit is `tuned.service`; it runs both subsystems. If you are replacing an
+older install, stop and remove the superseded `animaksm.service` and
+`zswap-tune.service` first — they would otherwise contend for the same sysfs
+paths.
 
 > **A missing config file is not an error.** If the path passed to `--config`
 > does not exist, the daemon logs `Config file not found, using defaults` and
 > runs entirely on built-in defaults — so forgetting to copy
-> `config/animaksm.toml` to `/etc/animaksm.toml` silently gives you a
+> `config/tuned.toml` to `/etc/tuned.toml` silently gives you a
 > default-tuned daemon instead of a failure. The systemd unit only gets
-> read access to `/etc/animaksm.toml` under its `ProtectSystem=strict`
+> read access to `/etc/tuned.toml` under its `ProtectSystem=strict`
 > sandbox, so that path must exist and be readable.
 
 ### Configure
 ```toml
-# /etc/animaksm.toml — every key below is a real key; unknown keys are ignored.
+# /etc/tuned.toml — every key below is a real key; unknown keys are ignored.
 
 [general]
 log_level = "info"               # tracing filter: error | warn | info | debug | trace
 poll_interval_ms = 2000          # main loop tick, in milliseconds
-state_dir = "/var/lib/animaksm"  # where the KSM state snapshot is kept
+state_dir = "/var/lib/tuned"  # where the KSM state snapshot is kept
 
 [governor]
 enabled = true                   # tune /sys/kernel/mm/ksm/* parameters
@@ -225,7 +229,7 @@ max_page_sharing_range = [256, 1024]     # bounds on max_page_sharing; min must 
 hysteresis_readings = 4          # consecutive readings before changing level (up and down)
 min_level_duration_secs = 30     # cooldown after a down-step before stepping down again
 stabilization_secs = 30          # min seconds between repeated actions in the same tier
-ksm_path = "/sys/kernel/mm/ksm"  # KSM sysfs directory (the only thing written to)
+ksm_path = "/sys/kernel/mm/ksm"  # KSM sysfs directory
 
 [scanner]
 enabled = true                   # enable process-wide KSM eligibility on other processes
@@ -233,47 +237,58 @@ interval_secs = 30               # how often to scan processes, in seconds
 min_anon_rss_mb = 100            # only consider processes above this anonymous RSS, in MiB
 duplicate_ratio_threshold = 0.15 # fraction (0,1] of anon pages that look duplicated
 max_candidates_per_cycle = 5     # top-K processes marked per scan cycle
-blocklist = ["animaksm", "ksmd", "systemd", "sshd"]  # replaces the default list
+blocklist = ["tuned", "ksmd", "systemd", "sshd"]  # replaces the default list
 target_cgroups = []              # empty = scan all user processes
+
+[zswap]
+enabled = true                   # false = leave max_pool_percent alone, record nothing
+interval_secs = 0               # 0 = library default (15 s)
+record_interval_secs = 0        # 0 = library default (60 s)
+stats_path = "/var/log/tuned-zswap/stats.jsonl"  # the JSONL recording history
 ```
 
 > **Unrecognised keys are silently ignored.** The config is deserialized with
 > `#[serde(default)]` and no `deny_unknown_fields`, so a typo'd or renamed key
 > has **no effect and produces no warning** — a misspelled `max_candidates`
 > just quietly leaves `max_candidates_per_cycle` at its default. Check key
-> names against `crates/common/src/config.rs`, and remember that list-valued
+> names against `crates/tuned-common/src/config.rs`, and remember that list-valued
 > keys like `blocklist` *replace* the default list rather than extending it.
 >
 > **That replacement has teeth.** The default `blocklist` contains the browsers
 > (`chrome`, `chromium`, `firefox`, `msedge`, `brave`, `opera`, `vivaldi`,
 > `electron`). Writing your own `blocklist` — even the four lines shown above —
 > silently drops all of them and re-opens the SIGILL crash. Copy the full list
-> from `config/animaksm.toml` into your config.
+> from `config/tuned.toml` into your config.
 
 ### Run
 ```bash
 # One-shot stats (like uksmdstats)
-animaksm stats
+tuned stats
 
-# Show current status
-animaksm status
+# Show current status of every subsystem, zswap included
+tuned status
 
 # Restore the KSM parameters captured in the state snapshot
-animaksm restore-ksm
+tuned restore-ksm
 
 # Dry-run to see what it would do (no sysfs writes, no madvise calls)
-animaksm run --dry-run
+tuned run --dry-run
 
 # Point any subcommand at a non-default config file
-animaksm run --config /etc/animaksm.toml
+tuned run --config /etc/tuned.toml
+
+# zswap operations, from the same binary
+tuned zswap-stats            # live snapshot
+tuned zswap-verdict          # per-ceiling deltas + verdict
+tuned zswap-once --dry-run   # one decision poll, no write
 
 # Run as daemon (systemd)
-sudo systemctl enable --now animaksm
+sudo systemctl enable --now tuned
 ```
 
-Every subcommand (`run`, `status`, `stats`, `restore-ksm`) takes
-`--config <path>`, defaulting to `/etc/animaksm.toml`; only `run` has
-`--dry-run`.
+Every KSM subcommand (`run`, `status`, `stats`, `restore-ksm`) takes
+`--config <path>`, defaulting to `/etc/tuned.toml`; only `run` has
+`--dry-run`. The `zswap-*` subcommands take no `--config`.
 
 ### Field-testing a live run
 
@@ -291,7 +306,7 @@ $ cat /sys/kernel/mm/ksm/run          # baseline, before starting the daemon
 live rather than theoretically present:
 
 ```bash
-$ journalctl -u animaksm -f | grep 'scanner cycle'
+$ journalctl -u tuned -f | grep 'scanner cycle'
 ```
 
 `exec_vmas_protected` should be non-zero the first time a process is marked, and
@@ -304,7 +319,7 @@ because the withdrawal was refused. If it climbs, stop the daemon and restart
 the affected process — the flag is sticky, so it does not clear by itself.
 
 ```bash
-$ sudo systemctl stop animaksm     # restores KSM state from the snapshot
+$ sudo systemctl stop tuned     # restores KSM state from the snapshot
 ```
 
 **3. Check for the failure the guard prevents** — the whole point of the run:
@@ -317,7 +332,7 @@ Any hit here involving your browser is the executable-VMA guard failing to keep
 up, not a coincidence. Stop the daemon, restart the browser, and file an issue.
 
 ```bash
-$ sudo systemctl stop animaksm        # restores KSM state from the snapshot
+$ sudo systemctl stop tuned        # restores KSM state from the snapshot
 ```
 
 The browser does not need restarting to clear the flag after the fixed code is
@@ -329,7 +344,7 @@ sticky and inherited.
 ## Example Output
 
 ```bash
-$ animaksm stats
+$ tuned stats
 ======================================================
 AKSMD with KSM statistics support
 ======================================================
@@ -360,9 +375,9 @@ counters and governor state as structured records, which journald (or your JSON
 collector) can pick up directly:
 
 ```
-animaksm: ksm pages_shared=0 pages_sharing=0 general_profit=0 full_scans=0
-animaksm: governor level=3 pressure=medium target=3 psi_some=0.66 psi_full=0.65
-animaksm: scanner targeted=3 processes_marked=3 exec_vmas_protected=104 \
+tuned: ksm pages_shared=0 pages_sharing=0 general_profit=0 full_scans=0
+tuned: governor level=3 pressure=medium target=3 psi_some=0.66 psi_full=0.65
+tuned: scanner targeted=3 processes_marked=3 exec_vmas_protected=104 \
           exec_vmas_unprotected=0 exec_vmas_reprotected=0 thp_collapsed=0 cycles=4
 ```
 
@@ -451,7 +466,7 @@ Yes. AKSMD:
 - Runs with minimal capabilities (CAP_SYS_PTRACE, CAP_DAC_READ_SEARCH)
 - Uses `ProtectSystem=strict`, `NoNewPrivileges=yes`
 - Snapshots KSM state on startup, restores on shutdown
-- Dry-run mode for safe testing (`animaksm run --dry-run`)
+- Dry-run mode for safe testing (`tuned run --dry-run`)
 - Graceful shutdown on SIGTERM/SIGINT
 
 ---
@@ -498,14 +513,14 @@ workspace-root `LICENSE`.
 
 ## Links
 
-- **Repository**: https://github.com/animaios/animaksmd
+- **Repository**: https://github.com/animaios/tuned
 - **Issues**: https://github.com/animaios/aksmd/issues
 
 <!--
 - **Discussions**: https://github.com/animaios/aksmd/discussions
-- **Matrix Chat**: https://matrix.to/#/#animaksm:matrix.org
-- **Crates.io**: https://crates.io/crates/animaksm-daemon
-- **Documentation**: https://docs.rs/animaksm-daemon
+- **Matrix Chat**: https://matrix.to/#/#tuned:matrix.org
+- **Crates.io**: https://crates.io/crates/tuned-daemon
+- **Documentation**: https://docs.rs/tuned-daemon
 -->
 
 ---

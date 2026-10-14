@@ -1,27 +1,30 @@
 # tune
 
-Two Rust binaries, one workspace, one job: **act on Linux kernel memory reclaim
+One Rust daemon, one workspace, one job: **act on Linux kernel memory reclaim
 and record the evidence.**
 
-They are deliberately separate. They target different kernel subsystems, have
-different runtime models, and one of them is required to have zero
-dependencies. Fusing them would break that.
+`tuned` drives two independent subsystems — KSM merging and the zswap `max_pool_percent`
+ceiling — from a single process, a single systemd unit and a single config file.
+The two subsystems stay independent *inside* the workspace: they share nothing but
+the process boundary, and the zswap half remains auditable on its own.
 
-| Crate | Binary | What it tunes | Constraints |
-|---|---|---|---|
-| [`crates/zswap-tune`](crates/zswap-tune/README.md) | `zswap-tune` | zswap `max_pool_percent` — does raising the ceiling buy RAM at an acceptable cost in flash writes? | **std-only, zero third-party crates**; decision semantics frozen |
-| [`crates/daemon`](crates/daemon/README.md) | `animaksm` | KSM — process-wide merge eligibility + a PSI-aware governor | `unsafe` confined to `madvise.rs`/`psi.rs`; tokio v1 |
+| Crate | Role | Constraints |
+|---|---|---|
+| [`crates/tuned-zswap`](crates/tuned-zswap/README.md) | zswap tuner **as a library** (`tuned_zswap`) plus a standalone `tuned-zswap` binary | **std-only, zero third-party crates**; decision semantics frozen |
+| [`crates/tuned`](crates/tuned/README.md) | the `tuned` binary: KSM governor + ptrace scanner + a driver loop for the zswap library | `unsafe` confined to `madvise.rs`/`psi.rs`; tokio v1 |
 
-`crates/common` is the shared crate `animaksm` uses (config, procfs, PSI, KSM,
-error). `zswap-tune` shares nothing by design — it does not even inherit
-`workspace.dependencies`.
+`crates/tuned` depends on `crates/tuned-zswap` by path; the dependency is
+one-directional. The zero-dependency rule attaches to the `tuned_zswap` crate and
+is provable — `cargo tree -p tuned-zswap --edges normal` prints only the crate
+itself. `crates/tuned-common` holds the config, procfs, PSI and KSM support the daemon
+shares, including the `[zswap]` section.
 
 ## Build
 
 ```console
-$ cargo build --workspace          # both binaries
-$ cargo build -p animaksm-daemon --release
-$ cargo build -p zswap-tune --release
+$ cargo build --workspace           # tuned + the standalone tuned-zswap helper
+$ cargo build -p tuned-daemon --release   # just the daemon
+$ cargo build -p tuned-zswap --release        # just the standalone zswap helper
 ```
 
 ## Test
@@ -37,26 +40,26 @@ $ make test
 ```
 tune/
 ├── crates/
-│   ├── zswap-tune/   # std-only, single main.rs, frozen decide()
-│   ├── common/       # shared animaksm support
-│   └── daemon/       # animaksm main binary
+│   ├── tuned-zswap/   # std-only lib.rs (frozen decide()) + thin bin
+│   ├── tuned-common/  # shared config, procfs, PSI, KSM
+│   └── tuned/         # the `tuned` binary
 ├── config/
-│   └── animaksm.toml
+│   └── tuned.toml   # includes the [zswap] section
 ├── systemd/
-│   ├── animaksm.service
-│   ├── zswap-tune.service
-│   └── logrotate-zswap-tune.conf
-├── docs/             # design notes
+│   ├── tuned.service
+│   └── tuned-logrotate.conf
 └── Makefile
 ```
 
-Both tools write to exactly one sysfs path each and degrade rather than panics
-when a `/proc` or debugfs read fails. Full constraints, including the behaviours
-an agent must not "fix", are in [AGENTS.md](AGENTS.md).
+The daemon writes to exactly two sysfs paths (`/sys/kernel/mm/ksm` and
+`/sys/module/zswap/parameters/max_pool_percent`) and degrades rather than
+panicking when a `/proc` or debugfs read fails. Full constraints, including the
+behaviours an agent must not "fix", are in [AGENTS.md](AGENTS.md).
 
 ## Provenance
 
-`main` is the joined history of both repos (animaksm 58 commits, zswap-tune 7),
+`main` is the joined history of the two predecessor repos (58 KSM commits,
+7 zswap commits),
 merged with `--allow-unrelated-histories`. `git log --follow` on a moved file
 surfaces its pre-merge history.
 

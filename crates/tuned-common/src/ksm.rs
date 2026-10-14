@@ -3,7 +3,7 @@
 //! Provides a safe abstraction over /sys/kernel/mm/ksm/ with
 //! validated writes, snapshot/restore, and rate limiting.
 
-use crate::error::{AnimaksmError, Result};
+use crate::error::{Result, TunedError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -78,7 +78,7 @@ impl KsmController {
     pub fn new(ksm_path: &str) -> Result<Self> {
         let base_path = PathBuf::from(ksm_path);
         if !base_path.exists() {
-            return Err(AnimaksmError::Sysfs {
+            return Err(TunedError::Sysfs {
                 path: base_path,
                 source: std::io::Error::new(std::io::ErrorKind::NotFound, "KSM path not found"),
             });
@@ -138,7 +138,7 @@ impl KsmController {
             timestamp: chrono_now(),
         };
         let json = serde_json::to_string_pretty(&snapshot)
-            .map_err(|e| AnimaksmError::Snapshot(e.to_string()))?;
+            .map_err(|e| TunedError::Snapshot(e.to_string()))?;
 
         fs::create_dir_all(state_dir)?;
         let path = state_dir.join(SNAPSHOT_FILENAME);
@@ -163,7 +163,7 @@ impl KsmController {
 
         let json = fs::read_to_string(&path)?;
         let snapshot: KsmSnapshot =
-            serde_json::from_str(&json).map_err(|e| AnimaksmError::Snapshot(e.to_string()))?;
+            serde_json::from_str(&json).map_err(|e| TunedError::Snapshot(e.to_string()))?;
 
         tracing::info!(
             timestamp = %snapshot.timestamp,
@@ -263,7 +263,7 @@ impl KsmController {
             return Ok(());
         }
 
-        fs::write(&path, value).map_err(|e| AnimaksmError::Sysfs {
+        fs::write(&path, value).map_err(|e| TunedError::Sysfs {
             path: path.clone(),
             source: e,
         })?;
@@ -300,7 +300,7 @@ impl KsmController {
     fn read_u64(&self, param: &str) -> Result<u64> {
         let path = self.base_path.join(param);
         let content =
-            fs::read_to_string(&path).map_err(|e| AnimaksmError::Sysfs { path, source: e })?;
+            fs::read_to_string(&path).map_err(|e| TunedError::Sysfs { path, source: e })?;
         // Handle advisor_mode style values like "[none] scan-time"
         let trimmed = content.trim();
         // Strip brackets if present (for enum-style values)
@@ -309,7 +309,7 @@ impl KsmController {
             .split(']')
             .next()
             .unwrap_or(trimmed);
-        cleaned.parse::<u64>().map_err(|_| AnimaksmError::Sysfs {
+        cleaned.parse::<u64>().map_err(|_| TunedError::Sysfs {
             path: self.base_path.join(param),
             source: std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -321,11 +321,11 @@ impl KsmController {
     fn read_i64(&self, param: &str) -> Result<i64> {
         let path = self.base_path.join(param);
         let content =
-            fs::read_to_string(&path).map_err(|e| AnimaksmError::Sysfs { path, source: e })?;
+            fs::read_to_string(&path).map_err(|e| TunedError::Sysfs { path, source: e })?;
         content
             .trim()
             .parse::<i64>()
-            .map_err(|_| AnimaksmError::Sysfs {
+            .map_err(|_| TunedError::Sysfs {
                 path: self.base_path.join(param),
                 source: std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -337,7 +337,7 @@ impl KsmController {
     fn read_string(&self, param: &str) -> Result<String> {
         let path = self.base_path.join(param);
         let content =
-            fs::read_to_string(&path).map_err(|e| AnimaksmError::Sysfs { path, source: e })?;
+            fs::read_to_string(&path).map_err(|e| TunedError::Sysfs { path, source: e })?;
         // Extract the active value from bracket notation.
         // Kernel advisor_mode outputs either "[none] scan-time" or "none [scan-time]"
         // In both cases, the active mode is the one inside brackets.

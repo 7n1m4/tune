@@ -1,9 +1,9 @@
 [package]
-name = "animaksm-common"
+name = "tuned-common"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Shared config, procfs, PSI and KSM interfaces for animaksm"
+description = "Shared config, procfs, PSI and KSM interfaces for tuned"
 
 [dependencies]
 serde.workspace = true

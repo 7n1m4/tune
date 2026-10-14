@@ -2,15 +2,23 @@
 
 Context for AI coding agents and maintainers working in this repository.
 
-`tune` is a Cargo workspace holding **two independent Rust binaries that both act
-on Linux kernel memory reclaim**. They are deliberately *not* fused: they have
-different runtime models and different hard constraints, and one is required to
-have zero dependencies.
+`tune` is a Cargo workspace whose single binary `tuned` (`crates/tuned`) acts on
+Linux kernel memory reclaim along **two independent axes**: KSM merging, and the
+zswap `max_pool_percent` ceiling.
 
-| Crate | Binary | Target | Constraint |
+The axes are fused into one process, one systemd unit and one config file, but
+**not into one module**. They have different runtime models and different hard
+constraints, and the zswap half is required to have zero dependencies. The
+façade therefore keeps the split: `crates/tuned` owns the async runtime and the
+CLI, and calls into `crates/tuned-zswap` as a dependency-free library.
+
+| Crate | Role | Target | Constraint |
 |---|---|---|---|
-| `crates/daemon` (+ `crates/common`) | `animaksm` | KSM: governor + ptrace scanner | `unsafe` confined to two files; tokio v1 only |
-| `crates/zswap-tune` | `zswap-tune` | zswap: `max_pool_percent` | **std-only, zero third-party crates**; decision semantics frozen |
+| `crates/tuned` (+ `crates/tuned-common`) | `tuned` | KSM governor + ptrace scanner **and** the zswap driver loop | `unsafe` confined to two files; tokio v1 only |
+| `crates/tuned-zswap` | `tuned_zswap` **library** + thin `tuned-zswap` binary | zswap: `max_pool_percent` | **std-only, zero third-party crates**; decision semantics frozen |
+
+`crates/tuned-zswap` may gain `pub` items and must not gain dependencies. It must
+never know the daemon exists. The dependency is one-directional.
 
 Build/test the whole workspace with `cargo build --workspace` / `cargo test
 --workspace`. Each crate's guidance lives in the sections below and applies to
@@ -18,15 +26,16 @@ that crate only.
 
 ---
 
-## animaksm
+## The fused daemon (`tuned`)
 
-`animaksm` is a Rust-based userspace daemon that drives Linux's Kernel Samepage
+`tuned` is a Rust-based userspace daemon. It drives Linux's Kernel Samepage
 Merging (KSM) subsystem with a PSI-aware governor, marks other processes'
-anonymous pages KSM-eligible by injecting `prctl(PR_SET_MEMORY_MERGE)`, and logs
-the resulting KSM statistics. It reduces memory use in cloud, container, and
-embedded workloads where many processes share identical pages.
+anonymous pages KSM-eligible by injecting `prctl(PR_SET_MEMORY_MERGE)`, tunes the
+zswap pool ceiling with the frozen `decide()` policy, and records both to
+evidence files.
 
-It is a KSM tool and nothing else. It writes only `/sys/kernel/mm/ksm/*`.
+It writes exactly two sysfs paths: `/sys/kernel/mm/ksm/*` and
+`/sys/module/zswap/parameters/max_pool_percent`. Nothing else.
 
 ### Structure
 
@@ -34,13 +43,12 @@ It is a KSM tool and nothing else. It writes only `/sys/kernel/mm/ksm/*`.
 tune/
 ├── Cargo.toml [workspace]
 ├── crates/
-│   ├── common/      # Shared: config, procfs, PSI, KSM, error
-│   ├── daemon/      # animaksm main binary
-│   └── zswap-tune/  # zswap-tune main binary (std-only)
+│   ├── tuned-common/  # Shared: config, procfs, PSI, KSM, error (+ the [zswap] section)
+│   ├── tuned/         # `tuned` main binary: governor, scanner, zswap.rs driver
+│   └── tuned-zswap/   # tuned_zswap library + `tuned-zswap` binary (std-only)
 ├── config/
-│   └── animaksm.toml  # Runtime configuration
-├── docs/            # Design notes
-└── systemd/         # Service units
+│   └── tuned.toml   # Runtime configuration, includes [zswap]
+└── systemd/         # tuned.service + tuned-logrotate.conf
 ```
 
 ### Build / test / run
@@ -49,14 +57,22 @@ tune/
 $ cargo build --workspace
 $ make check          # cargo check + fmt + clippy
 $ make test           # cargo test --workspace
-$ cargo run -p animaksm-daemon -- run --config config/animaksm.toml --dry-run
+$ cargo run -p tuned-daemon -- run --config config/tuned.toml --dry-run
 ```
 
 ### Architecture landmines
 
-- **Kernel/sysfs**: `/sys/kernel/mm/ksm`, `/proc` — dry-run only in local dev
-- **Systemd**: Service units in `systemd/` — document new capabilities
-- **Config**: `config/animaksm.toml` — keep defaults conservative
+- **Kernel/sysfs**: `/sys/kernel/mm/ksm`, `/sys/module/zswap/parameters`,
+  `/proc`, `/sys/kernel/debug/zswap` — dry-run only in local dev
+- **Systemd**: `systemd/tuned.service` — document new capabilities
+- **Config**: `config/tuned.toml` — keep defaults conservative
+- **The zswap poll is blocking inside an async task.** `zswap_tune::poll_once`
+  is synchronous std code doing file I/O, so `crates/tuned/src/zswap.rs` runs it
+  through `tokio::task::block_in_place`. Do not call it directly from the async
+  loop, and do not make the zswap library async to "fix" this.
+- **The `Debounce` outlives a single poll.** The lowering rule needs three
+  consecutive low-ratio readings, so the debounce state is created once outside
+  the loop behind one `parking_lot::Mutex`.
 
 ### Testing rules
 
@@ -70,19 +86,20 @@ $ cargo run -p animaksm-daemon -- run --config config/animaksm.toml --dry-run
 
 - Async runtime: only Tokio v1 (installed in the workspace)
 - `unsafe` is confined to the low-level kernel interfaces: the ptrace/prctl
-  injection and `process_madvise` calls in `crates/daemon/src/madvise.rs` (5
-  sites) and the PSI trigger fd handling in `crates/common/src/psi.rs` (2
+  injection and `process_madvise` calls in `crates/tuned/src/madvise.rs` (5
+  sites) and the PSI trigger fd handling in `crates/tuned-common/src/psi.rs` (2
   sites). Do not add it elsewhere.
-- `animaksm-daemon` is a binary crate, not a library — `cargo run --example`
-  cannot `use animaksm_daemon::…`. Probe behaviour through the live daemon with
-  `RUST_LOG`.
+- `tuned-daemon` produces the `tuned` binary. It is a bin crate, not a
+  library — `cargo run --example` cannot `use tuned_daemon::…`. Probe
+  behaviour through the live daemon with `RUST_LOG` (note that a poll which
+  succeeds but holds is `debug`, so `RUST_LOG=tuned=debug` is needed to see it).
 
 ### Security
 
 The daemon injects syscalls into other processes, so it needs
 `CAP_SYS_PTRACE` and `CAP_DAC_READ_SEARCH`. The systemd unit compensates
 with `ProtectSystem=strict`, `NoNewPrivileges=yes` and
-`ReadWritePaths=/var/lib/animaksm /sys/kernel/mm/ksm`.
+`ReadWritePaths=/var/lib/tuned /var/log/tuned-zswap /sys/kernel/mm/ksm /sys/module/zswap/parameters`.
 
 Never widen the write surface beyond the KSM sysfs directory.
 
@@ -118,12 +135,13 @@ No API keys or secrets are in scope. Dry-run mode is sufficient for local testin
 
 ---
 
-## zswap-tune
+## tuned-zswap
 
-A dependency-free (std-only) Rust binary that live-tunes one kernel parameter:
-`/sys/module/zswap/parameters/max_pool_percent`. The kernel re-reads that value
-on every zswap store, so the change takes effect immediately — no reboot, no
-module reload, no swap cycle.
+A dependency-free (std-only) Rust **library** that live-tunes one kernel
+parameter: `/sys/module/zswap/parameters/max_pool_percent`. The kernel re-reads
+that value on every zswap store, so the change takes effect immediately — no
+reboot, no module reload, no swap cycle. `crates/tuned-zswap/src/bin/main.rs`
+exposes the same code as a standalone `tuned-zswap` binary.
 
 It exists to answer one question: **does raising the zswap ceiling buy RAM at an
 acceptable cost in flash writes?** The daemon both acts and records, and
@@ -133,23 +151,24 @@ acceptable cost in flash writes?** The daemon both acts and records, and
 
 | Constraint | Why |
 |---|---|
-| **Zero third-party crates** | Deliberate. `crates/zswap-tune/Cargo.toml` has an empty `[dependencies]`. It must not inherit `workspace.dependencies` either. |
+| **Zero third-party crates** | Deliberate. `crates/tuned-zswap/Cargo.toml` has an empty `[dependencies]`. It must not inherit `workspace.dependencies` either. |
 | **Never blocks or panics** | A transient `/proc` or debugfs read failure is logged and skipped. The decision poll never stalls on a failed read. |
 | **Writes exactly one path** | `/sys/module/zswap/parameters/max_pool_percent`. Nothing else, ever. |
 | **Decision semantics frozen** | `decide()`, the 15 s poll, the 10 pp step and the `[25, 50]` clamp are pinned by the original 15 unit tests. Do not change them. |
+| **No async, no dependency on the daemon** | The library is synchronous std code. `crates/tuned` bridges to it via `block_in_place`; the library must never gain a runtime or import from the daemon. |
 
 ### Layout
 
-Single file by design — the whole tool is `crates/zswap-tune/src/main.rs`
-(~2160 lines):
+Logic lives in `crates/tuned-zswap/src/lib.rs` (~2240 lines); the CLI was split
+out to `crates/tuned-zswap/src/bin/main.rs` (~90 lines):
 
 | Region | Contents |
 |---|---|
-| `1–80` | Constants: paths, limits (`MIN_LIMIT`/`MAX_LIMIT`/`STEP`), policy thresholds, the usage text |
-| the rest | as per the region table in `crates/zswap-tune/README.md` |
+| `lib.rs` `1–80` | Constants: paths, limits (`MIN_LIMIT`/`MAX_LIMIT`/`STEP`), policy thresholds |
+| the rest | as per the region table in `crates/tuned-zswap/README.md` |
 
-Region numbering is preserved from the standalone crate; the file itself moved
-verbatim, so line numbers still hold.
+Region numbering is preserved from the standalone crate. Verify a change with the
+existing tests, not by diffing token streams — rustfmt re-wraps punctuation.
 
 ### Key behaviours an agent must not "fix"
 
@@ -193,23 +212,36 @@ is a **ceiling, not a reservation** — lowering it never frees RAM.
 
 ### CLI surface
 
+The standalone helper keeps its original flag surface, prefixed `tuned-zswap`.
+The fused daemon uses subcommands instead of flags.
+
 ```console
-$ zswap-tune                    # daemon: 15 s decision poll, 60 s JSONL record
-$ zswap-tune --once             # one poll, apply, print, exit
-$ zswap-tune --once --dry-run   # report the decision, never write sysfs
-$ zswap-tune --stats            # live snapshot
-$ zswap-tune --report [PATH]    # per-ceiling deltas + verdict
+$ tuned-zswap                    # daemon: 15 s decision poll, 60 s JSONL record
+$ tuned-zswap --once             # one poll, apply, print, exit
+$ tuned-zswap --once --dry-run   # report the decision, never write sysfs
+$ tuned-zswap --stats            # live snapshot
+$ tuned-zswap --report [PATH]    # per-ceiling deltas + verdict
+
+$ tuned zswap-stats              # same snapshot, from the fused daemon
+$ tuned zswap-verdict [PATH]     # same report; no PATH = configured stats_path
+$ tuned zswap-once [--dry-run]   # one poll from the fused daemon
+$ tuned run                      # both subsystems, one process
 ```
 
-`ZSWAP_TUNE_RECORD_INTERVAL=<seconds>` shortens the 60 s cadence for testing.
-`/run/zswap-tune.pin` holding an integer in `[25, 50]` replaces the decision path;
+`TUNED_ZSWAP_RECORD_INTERVAL=<seconds>` shortens the 60 s cadence for testing.
+`/run/tuned-zswap.pin` holding an integer in `[25, 50]` replaces the decision path;
 it is honoured verbatim, never clamped; removing it restores `decide()`.
 
 ### Operating note (this machine)
 
-The systemd unit `zswap-tune.service` is **enabled** and currently **running**
-(it starts at boot). Any local run of the binary alongside it will contend for
-the same sysfs path — prefer `--once`/`--stats`/`--report`, which do not conflict.
+The boot unit `zswap-tune.service` (the **pre-rename** name) is still
+**enabled and active** on this machine from an earlier install, while the
+workspace's `tuned` has not been installed as a unit. So a local `tuned run`
+without `--dry-run` contends with that old daemon for the same sysfs path —
+prefer `tuned run --dry-run`, `tuned zswap-stats`, `tuned zswap-verdict` and
+`tuned zswap-once`, which write nothing. Installing `tuned.service` is a
+deliberate deployment step that also requires stopping and removing that old
+unit.
 
 Do not `swapoff`/`swapon`, mount/unmount debugfs, or touch any kernel command
 line, initramfs, dracut, modprobe, fstab, grub or sysctl config. Memory-pressure
@@ -219,9 +251,9 @@ workload.
 ### Verifying a change
 
 ```console
-$ cargo test -p zswap-tune                          # all pass
-$ cargo run -p zswap-tune -- --stats                # unprivileged: degraded, exit 0
-$ sudo cargo run -p zswap-tune -- --report crates/zswap-tune/tests/fixtures/report.jsonl
+$ cargo test -p tuned-zswap                          # all pass
+$ cargo run -p tuned-zswap -- --stats                # unprivileged: degraded, exit 0
+$ sudo cargo run -p tuned-zswap -- --report crates/tuned-zswap/tests/fixtures/report.jsonl
 ```
 
 The fixture-driven tests are the deterministic proof of the analysis math; live
@@ -230,7 +262,7 @@ data is not required to validate `analyse`/`verdict`.
 ### Collecting a real 50-vs-25 verdict
 
 The unit tests prove the analysis math; they cannot produce a verdict from this
-machine's workload. `crates/zswap-tune/TESTING.md` covers the full collection
+machine's workload. `crates/tuned-zswap/TESTING.md` covers the full collection
 procedure, the drop rules that shrink a group, and a mid-flight progress script.
 Read it before attempting a live measurement — an idle pool drains, and a drained
 pool yields `insufficient data` rather than a number, by design.
@@ -250,10 +282,10 @@ feat(scope): description
 fix(scope): description
 ```
 
-`scope` is the crate: `animaksm` or `zswap-tune`.
+`scope` is the subsystem: `ksm` or `zswap`.
 
 ### Merge provenance
 
 `main` contains both projects' histories joined by an unrelated-history merge
-commit (animaksm 58 commits, zswap-tune 7 commits). Use `git log --follow` on a
+commit (58 commits from the KSM lineage, 7 from the zswap lineage). Use `git log --follow` on a
 file that moved to see its pre-merge history.

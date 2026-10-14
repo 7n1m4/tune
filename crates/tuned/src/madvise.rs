@@ -36,11 +36,11 @@
 
 use std::os::unix::io::RawFd;
 
-use animaksm_common::procfs::MapsEntry;
 use nix::sys::ptrace;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use tracing::{debug, info};
+use tuned_common::procfs::MapsEntry;
 
 /// `PR_SET_MEMORY_MERGE` — marks every mapping of the calling process
 /// KSM-eligible (`MMF_VM_MERGE_ANY` in `struct mm_struct`).
@@ -232,7 +232,7 @@ pub fn enable_merge_any(pid: u32, dry_run: bool) -> MergeableResult {
 /// Maps that cannot be read return `(0, 0)`: an unreadable target is a target
 /// that no longer exists, not a target with a broken guard.
 pub fn unmerge_executable_vmas(pid: u32, dry_run: bool) -> (usize, usize) {
-    let maps = match animaksm_common::procfs::read_process_maps(pid) {
+    let maps = match tuned_common::procfs::read_process_maps(pid) {
         Ok(m) => m,
         Err(e) => {
             debug!(pid, error = %e, "cannot read maps to protect executable VMAs");
@@ -657,7 +657,7 @@ fn process_madvise_single(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use animaksm_common::procfs::MapsEntry;
+    use tuned_common::procfs::MapsEntry;
 
     // ── enable_merge_any (dry-run) ────────────────────────────────────────
 
@@ -730,7 +730,7 @@ mod tests {
         let pid = std::process::id();
 
         // Precondition: any process running code has executable mappings.
-        let exec_in_maps = animaksm_common::procfs::read_process_maps(pid)
+        let exec_in_maps = tuned_common::procfs::read_process_maps(pid)
             .expect("test process maps must be readable")
             .iter()
             .filter(|m| m.has_exec())

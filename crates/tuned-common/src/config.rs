@@ -1,18 +1,25 @@
-//! Configuration schema for animaksm, deserialized from TOML.
+//! Configuration schema for tuned, deserialized from TOML.
 
 use serde::Deserialize;
 use std::path::Path;
 
+/// Where the daemon looks for its configuration when `--config` is not given.
+///
+/// The fused daemon and the `tuned-zswap` binary must agree, so this is one
+/// constant rather than a repeated string literal.
+pub const DEFAULT_CONFIG_PATH: &str = "/etc/tuned.toml";
+
 /// Top-level configuration.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
-pub struct AnimaksmConfig {
+pub struct TunedConfig {
     pub general: GeneralConfig,
     pub governor: GovernorConfig,
     pub scanner: ScannerConfig,
+    pub zswap: ZswapConfig,
 }
 
-impl AnimaksmConfig {
+impl TunedConfig {
     /// Load configuration from a TOML file path.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
@@ -47,6 +54,12 @@ impl AnimaksmConfig {
             anyhow::bail!("scanner.duplicate_ratio_threshold must be in (0, 1]");
         }
 
+        // A zero stats_path would make every recording attempt fail; the
+        // default path is always valid, so only reject an explicitly empty one.
+        if self.zswap.enabled && self.zswap.stats_path.trim().is_empty() {
+            anyhow::bail!("zswap.stats_path must not be empty when zswap.enabled");
+        }
+
         Ok(())
     }
 }
@@ -64,7 +77,7 @@ impl Default for GeneralConfig {
         Self {
             log_level: "info".to_string(),
             poll_interval_ms: 2000,
-            state_dir: "/var/lib/animaksm".to_string(),
+            state_dir: "/var/lib/tuned".to_string(),
         }
     }
 }
@@ -108,6 +121,45 @@ impl Default for GovernorConfig {
     }
 }
 
+/// The zswap subsystem, driven by the `tuned_zswap` library.
+///
+/// These are the *operational* switches only. The decision policy itself —
+/// the 15 s poll, the 10 pp step, the `[25, 50]` clamp, the 2.2/1.5 ratio
+/// thresholds and the 3-reading debounce — deliberately lives in
+/// `tuned_zswap`'s frozen constants. Making thresholds configurable here would
+/// create a second place to change behaviour and a config file that could
+/// silently disable the tuning; the reason those values are pinned is
+/// documented in the crate's own README.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ZswapConfig {
+    /// Run the zswap tuning task at all. False leaves `max_pool_percent`
+    /// untouched and records nothing.
+    pub enabled: bool,
+    /// Override the decision poll cadence. 0 means "use the library default"
+    /// (15 s); the value is not clamped, so a deliberately short test cadence
+    /// is expressible without a second mechanism.
+    pub interval_secs: u64,
+    /// Override the JSONL recording cadence. 0 means the library default
+    /// (60 s), which the `TUNED_ZSWAP_RECORD_INTERVAL` environment variable can
+    /// override at runtime for testing.
+    pub record_interval_secs: u64,
+    /// Where the JSONL history is written. The daemon's own logrotate unit
+    /// targets this path by default.
+    pub stats_path: String,
+}
+
+impl Default for ZswapConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: 0,
+            record_interval_secs: 0,
+            stats_path: "/var/log/tuned-zswap/stats.jsonl".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ScannerConfig {
@@ -130,7 +182,7 @@ impl Default for ScannerConfig {
             min_anon_rss_mb: 100,
             duplicate_ratio_threshold: 0.15,
             blocklist: vec![
-                "animaksm".to_string(),
+                "tuned".to_string(),
                 "ksmd".to_string(),
                 "systemd".to_string(),
                 "sshd".to_string(),
@@ -163,7 +215,7 @@ mod tests {
 
     #[test]
     fn test_default_config_validates() {
-        let cfg = AnimaksmConfig::default();
+        let cfg = TunedConfig::default();
         assert!(cfg.validate().is_ok());
     }
 
@@ -181,7 +233,7 @@ use_advisor = true
 [scanner]
 enabled = false
 "#;
-        let cfg: AnimaksmConfig = toml::from_str(toml_str).unwrap();
+        let cfg: TunedConfig = toml::from_str(toml_str).unwrap();
         assert!(cfg.validate().is_ok());
         assert_eq!(cfg.general.log_level, "debug");
         assert_eq!(cfg.general.poll_interval_ms, 1000);
@@ -189,8 +241,55 @@ enabled = false
     }
 
     #[test]
+    fn test_zswap_defaults_are_tuning_switches_only() {
+        let cfg = TunedConfig::default();
+        assert!(cfg.zswap.enabled);
+        // 0 means "use the library default"; the policy constants are not
+        // duplicated into the config schema.
+        assert_eq!(cfg.zswap.interval_secs, 0);
+        assert_eq!(cfg.zswap.record_interval_secs, 0);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_zswap_section_parses_from_toml() {
+        let toml_str = r#"
+[zswap]
+enabled = false
+interval_secs = 5
+stats_path = "/tmp/other.jsonl"
+"#;
+        let cfg: TunedConfig = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.zswap.enabled);
+        assert_eq!(cfg.zswap.interval_secs, 5);
+        assert_eq!(cfg.zswap.stats_path, "/tmp/other.jsonl");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_zswap_stats_path() {
+        let mut cfg = TunedConfig::default();
+        cfg.zswap.stats_path = "  ".to_string();
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("zswap.stats_path"));
+    }
+
+    #[test]
+    fn test_empty_stats_path_is_fine_when_zswap_is_off() {
+        // The path is only read when the subsystem runs; an operator who
+        // disabled zswap should not be forced to pick a path.
+        let mut cfg = TunedConfig::default();
+        cfg.zswap.enabled = false;
+        cfg.zswap.stats_path = String::new();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
     fn test_validate_rejects_invalid_governor_thresholds() {
-        let mut cfg = AnimaksmConfig::default();
+        let mut cfg = TunedConfig::default();
         cfg.governor.psi_some_threshold = -0.1;
         assert!(cfg
             .validate()
@@ -198,7 +297,7 @@ enabled = false
             .to_string()
             .contains("psi_some_threshold"));
 
-        cfg = AnimaksmConfig::default();
+        cfg = TunedConfig::default();
         cfg.governor.psi_full_threshold = 101.0;
         assert!(cfg
             .validate()
@@ -209,7 +308,7 @@ enabled = false
 
     #[test]
     fn test_validate_rejects_invalid_governor_ranges() {
-        let mut cfg = AnimaksmConfig::default();
+        let mut cfg = TunedConfig::default();
         cfg.governor.advisor_scan_time_range = (10, 10);
         assert!(cfg
             .validate()
@@ -217,7 +316,7 @@ enabled = false
             .to_string()
             .contains("advisor_scan_time_range"));
 
-        cfg = AnimaksmConfig::default();
+        cfg = TunedConfig::default();
         cfg.governor.max_page_sharing_range = (1024, 256);
         assert!(cfg
             .validate()
@@ -228,7 +327,7 @@ enabled = false
 
     #[test]
     fn test_validate_rejects_invalid_scanner_values() {
-        let mut cfg = AnimaksmConfig::default();
+        let mut cfg = TunedConfig::default();
         cfg.scanner.min_anon_rss_mb = 0;
         assert!(cfg
             .validate()
@@ -236,7 +335,7 @@ enabled = false
             .to_string()
             .contains("min_anon_rss_mb"));
 
-        cfg = AnimaksmConfig::default();
+        cfg = TunedConfig::default();
         cfg.scanner.duplicate_ratio_threshold = 0.0;
         assert!(cfg
             .validate()

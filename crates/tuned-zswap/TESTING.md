@@ -38,7 +38,7 @@ Run this at any time to see how far you are, without waiting for the whole run:
 ```console
 $ python3 - <<'EOF'
 import json, collections
-rows = [json.loads(l) for l in open('/var/log/zswap-tune/stats.jsonl') if l.strip()]
+rows = [json.loads(l) for l in open('/var/log/tuned-zswap/stats.jsonl') if l.strip()]
 PAGE = 4096
 groups = collections.defaultdict(lambda: [0, 0])
 prev = None
@@ -67,23 +67,23 @@ A ceiling is judgeable at **≥ 200 MiB**. Anything less will be reported as
 ### Step 1 — hold the low ceiling
 
 ```console
-$ sudo sh -c 'echo 25 > /run/zswap-tune.pin'
+$ sudo sh -c 'echo 25 > /run/tuned-zswap.pin'
 ```
 
 The pin is honoured verbatim, never clamped, and must be an integer in `[25, 50]`.
 Confirm it took effect (both are safe, non-mutating):
 
 ```console
-$ zswap-tune --once --dry-run | head -2
+$ tuned-zswap --once --dry-run | head -2
 current max_pool_percent : 50%
-limit source             : pinned to 25% (/run/zswap-tune.pin)
+limit source             : pinned to 25% (/run/tuned-zswap.pin)
 ```
 
 The line must read `pinned to 25% (...)`, not `auto (decide)`. The daemon's journal
 also flips from an `[auto]` to a `[pinned]` tag on each decision:
 
 ```
-zswap-tune: max_pool_percent=25% MemAvailable=41.0% ratio=2.9 [pinned] -> ...
+tuned-zswap: max_pool_percent=25% MemAvailable=41.0% ratio=2.9 [pinned] -> ...
 ```
 
 `--dry-run` reports the decision but never writes sysfs, so it is always safe.
@@ -103,7 +103,7 @@ not a minute.
 You do not have to pin 50. Remove the pin and let `decide()` walk the ceiling up:
 
 ```console
-$ sudo rm /run/zswap-tune.pin
+$ sudo rm /run/tuned-zswap.pin
 ```
 
 With `MemAvailable >= 25 %` and ratio `>= 2.2` it raises 10 pp per decision
@@ -113,7 +113,7 @@ Then keep working — 50 % needs ≥ 200 MiB of growth too, under the same rules
 ### Step 4 — report
 
 ```console
-$ zswap-tune --report
+$ tuned-zswap --report
 ```
 
 ---
@@ -154,10 +154,10 @@ verdict was withheld because the comparison genuinely cannot be made from a drai
 
 ## 6. Housekeeping
 
-* Records are written every **60 s**; `ZSWAP_TUNE_RECORD_INTERVAL=<seconds>` shortens
+* Records are written every **60 s**; `TUNED_ZSWAP_RECORD_INTERVAL=<seconds>` shortens
   the cadence for testing.
-* Log: `/var/log/zswap-tune/stats.jsonl`, rotated daily, 14 copies
-  (`/etc/logrotate.d/zswap-tune`).
+* Log: `/var/log/tuned-zswap/stats.jsonl`, rotated daily, 14 copies
+  (`/etc/logrotate.d/tuned-zswap`).
 * The service is enabled and runs; it contends for the sysfs path, so **never run a
   second copy** of the binary beside it. Use `--once --dry-run` for safe inspection.
 * Do not `swapoff`/`swapon` or touch kernel parameters during a run — it invalidates

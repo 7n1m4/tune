@@ -1,10 +1,10 @@
-# animaksm configuration
+# tuned configuration
 # Trades CPU cycles for effective RAM by dynamically tuning KSM and memory scanning.
 
 [general]
 log_level = "info"
 poll_interval_ms = 2000
-state_dir = "/var/lib/animaksm"
+state_dir = "/var/lib/tuned"
 
 [governor]
 enabled = true
@@ -32,5 +32,17 @@ max_candidates_per_cycle = 5    # top K by RSS per cycle (bounds the ptrace burs
 # unguarded, and once with the executable-VMA guard demonstrably firing
 # (exec_vmas_protected=403, exec_vmas_reprotected=96). Kernel comm is at most 15
 # chars and Chromium sets it to `chrome`; the others cover the same class.
-blocklist = ["animaksm", "ksmd", "systemd", "sshd", "chrome", "chromium", "firefox", "msedge", "brave", "opera", "vivaldi", "electron"]
+blocklist = ["tuned", "ksmd", "systemd", "sshd", "chrome", "chromium", "firefox", "msedge", "brave", "opera", "vivaldi", "electron"]
 target_cgroups = []             # empty = scan all user processes
+
+# The zswap tuner. Note what is *not* here: the 15 s poll, the 10 pp step, the
+# [25, 50] clamp, the 2.2/1.5 ratio thresholds and the 3-reading debounce are
+# frozen constants inside the tuned-zswap crate, not configuration. They are the
+# reason the tool's behaviour is provable, and making them tunable would create
+# a second, unverifiable place to change it. See crates/tuned-zswap/README.md.
+[zswap]
+enabled = true                  # false = leave max_pool_percent alone, record nothing
+interval_secs = 0               # 0 = library default (15 s)
+record_interval_secs = 0        # 0 = library default (60 s); TUNED_ZSWAP_RECORD_INTERVAL overrides for tests
+stats_path = "/var/log/tuned-zswap/stats.jsonl"   # matches LogsDirectory=tuned-zswap in systemd/tuned.service
+

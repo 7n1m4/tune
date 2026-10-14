@@ -5,11 +5,11 @@
 
 use std::time::Duration;
 
-use animaksm_common::ksm::KsmController;
-use animaksm_common::SharedGovernorState;
 use tokio::sync::watch;
 use tokio::time;
 use tracing::info;
+use tuned_common::ksm::KsmController;
+use tuned_common::SharedGovernorState;
 
 /// Run the metrics reporting loop.
 pub async fn run_metrics_loop(
@@ -46,7 +46,7 @@ async fn report_metrics(ksm: &KsmController, state: &SharedGovernorState) {
     let daemon_rss_kb = read_self_rss_kb();
 
     info!(
-        target = "animaksm::metrics",
+        target = "tuned::metrics",
         ksm_pages_shared = ksm_stats.pages_shared,
         ksm_pages_sharing = ksm_stats.pages_sharing,
         // ksm_general_profit is in BYTES per mm/ksm.c:general_profit_show()
@@ -79,7 +79,7 @@ fn read_self_rss_kb() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use animaksm_common::new_shared_state;
+    use tuned_common::new_shared_state;
 
     fn seed_ksm_stats(dir: &std::path::Path) {
         for (name, value) in [

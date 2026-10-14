@@ -1,11 +1,11 @@
-//! zswap-tune — a small daemon that live-tunes the kernel zswap pool ceiling.
+//! tuned-zswap — the zswap half of the `tuned` daemon.
 //!
 //! The kernel parameter `/sys/module/zswap/parameters/max_pool_percent` caps how much
 //! RAM the zswap compressed pool may occupy. The kernel re-reads it on every store, so
 //! writing it from user space takes effect immediately: no reboot, no kernel command
 //! line, no initramfs, no module reload.
 //!
-//! This tool reads `/proc/meminfo` on a timer and keeps that ceiling inside a sane
+//! This module reads `/proc/meminfo` on a timer and keeps that ceiling inside a sane
 //! range for the machine it runs on:
 //!
 //! * raise it when there is plenty of free RAM **and** the workload compresses well,
@@ -13,15 +13,25 @@
 //! * leave it alone in the deadband between the two, to avoid oscillation.
 //!
 //! `max_pool_percent` is a *ceiling*, not a reservation: lowering it never releases
-//! memory the pool already holds. This tool can only act prospectively.
+//! memory the pool already holds. This module can only act prospectively.
+//!
+//! ## Layout
+//!
+//! This crate is the frozen decision surface. It stays a **library** so the fused
+//! daemon (`crates/tuned`) can drive it; the `tuned` binary owns the timers and
+//! the logging. It deliberately keeps **zero third-party dependencies** and does not
+//! inherit `[workspace.dependencies]`, so the decision logic stays auditable on its
+//! own and its tests stay deterministic.
+//!
+//! [`run_once`] is the entry point the fused daemon uses: it performs one poll and
+//! returns a structured outcome instead of printing, so the caller decides whether
+//! the outcome goes to the journal or a terminal.
 
 use std::env;
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
-use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------
@@ -37,9 +47,9 @@ const MEMINFO_PATH: &str = "/proc/meminfo";
 const ZSWAP_DEBUGFS_DIR: &str = "/sys/kernel/debug/zswap";
 /// Optional pin file: an integer in `[MIN_LIMIT, MAX_LIMIT]` here replaces the
 /// decision path for as long as it exists.
-const PIN_PATH: &str = "/run/zswap-tune.pin";
+pub const PIN_PATH: &str = "/run/tuned-zswap.pin";
 /// Where the recorded history is appended, one JSON object per line.
-const STATS_PATH: &str = "/var/log/zswap-tune/stats.jsonl";
+pub const STATS_PATH: &str = "/var/log/tuned-zswap/stats.jsonl";
 
 /// Inclusive lower bound of the allowed range, in percent of RAM.
 const MIN_LIMIT: u8 = 25;
@@ -56,18 +66,18 @@ const LOWER_RATIO: f64 = 1.5;
 /// Free-memory fraction that counts as headroom for a raise, in percent of RAM.
 const RAISE_AVAILABILITY: f64 = 25.0;
 /// Consecutive low-ratio readings required before the limit is lowered.
-const DEBOUNCE: u8 = 3;
+pub const DEBOUNCE: u8 = 3;
 /// Delay between two polls in daemon mode.
-const INTERVAL: Duration = Duration::from_secs(15);
+pub const INTERVAL: Duration = Duration::from_secs(15);
 /// Delay between two recorded samples, as required by the recording contract.
-const RECORD_INTERVAL: Duration = Duration::from_secs(60);
+pub const RECORD_INTERVAL: Duration = Duration::from_secs(60);
 /// Environment override for the recording cadence, in seconds. Only exists so
 /// a short live verification window does not have to wait out real minutes;
 /// the daemon uses `RECORD_INTERVAL` whenever it is unset.
-const RECORD_INTERVAL_ENV: &str = "ZSWAP_TUNE_RECORD_INTERVAL";
+pub const RECORD_INTERVAL_ENV: &str = "TUNED_ZSWAP_RECORD_INTERVAL";
 
 /// The recording cadence, honouring the environment override when it parses.
-fn record_interval() -> Duration {
+pub fn record_interval() -> Duration {
     match env::var(RECORD_INTERVAL_ENV) {
         Ok(raw) => match raw.trim().parse::<u64>() {
             Ok(secs) if secs > 0 => Duration::from_secs(secs),
@@ -77,25 +87,25 @@ fn record_interval() -> Duration {
     }
 }
 
-const USAGE: &str = "\
-zswap-tune - live-tune the zswap max_pool_percent ceiling
+pub const USAGE: &str = "\
+tuned-zswap - live-tune the zswap max_pool_percent ceiling
 
 USAGE:
-    zswap-tune [OPTIONS]
+    tuned-zswap [OPTIONS]
 
 OPTIONS:
     --once             Perform a single poll, decide and apply, then exit
     --dry-run          Only valid with --once: report the decision, never write sysfs
     --stats            Print the current ceiling, pool size and counters, then exit
     --report [PATH]    Analyse a recorded stats file (default
-                       /var/log/zswap-tune/stats.jsonl) and judge the ceilings
+                       /var/log/tuned-zswap/stats.jsonl) and judge the ceilings
     -h, --help         Print this help
 
 Without options the tool runs as a daemon, polling every 15s until stopped, and
-appends one JSON sample to /var/log/zswap-tune/stats.jsonl every 60s
-(ZSWAP_TUNE_RECORD_INTERVAL=<seconds> shortens that for testing).
+appends one JSON sample to /var/log/tuned-zswap/stats.jsonl every 60s
+(TUNED_ZSWAP_RECORD_INTERVAL=<seconds> shortens that for testing).
 
-The pin file /run/zswap-tune.pin, when it holds an integer between 25 and 50,
+The pin file /run/tuned-zswap.pin, when it holds an integer between 25 and 50,
 replaces the decision path until it is removed.
 
 It only ever writes /sys/module/zswap/parameters/max_pool_percent.
@@ -106,7 +116,7 @@ It only ever writes /sys/module/zswap/parameters/max_pool_percent.
 // ---------------------------------------------------------------------------
 
 /// Clamp a computed limit into the allowed `[MIN_LIMIT, MAX_LIMIT]` range.
-fn clamp(value: u8) -> u8 {
+pub fn clamp(value: u8) -> u8 {
     value.clamp(MIN_LIMIT, MAX_LIMIT)
 }
 
@@ -119,7 +129,7 @@ fn clamp(value: u8) -> u8 {
 /// * `available_percent` — `MemAvailable` as a percentage of `MemTotal`.
 ///
 /// Returns the new limit, or `None` when nothing should change.
-fn decide(current_limit: u8, ratio: Option<f64>, available_percent: f64) -> Option<u8> {
+pub fn decide(current_limit: u8, ratio: Option<f64>, available_percent: f64) -> Option<u8> {
     // Treat an unusable ratio (absent, NaN, infinite) as "no information": never act.
     let ratio = ratio.filter(|r| r.is_finite())?;
 
@@ -140,19 +150,19 @@ fn decide(current_limit: u8, ratio: Option<f64>, available_percent: f64) -> Opti
 }
 
 /// Requires `needed` consecutive low ratios before forwarding one to `decide`.
-struct Debounce {
+pub struct Debounce {
     needed: u8,
     hits: u8,
 }
 
 impl Debounce {
-    fn new(needed: u8) -> Self {
+    pub fn new(needed: u8) -> Self {
         Debounce { needed, hits: 0 }
     }
 
     /// Feed a raw ratio in, get back either the same ratio (enough evidence) or
     /// `None` (not yet convinced, or nothing to be convinced about).
-    fn push(&mut self, ratio: Option<f64>) -> Option<f64> {
+    pub fn push(&mut self, ratio: Option<f64>) -> Option<f64> {
         let low = match ratio {
             Some(r) => r.is_finite() && r < LOWER_RATIO,
             None => false,
@@ -176,7 +186,7 @@ impl Debounce {
 // ---------------------------------------------------------------------------
 
 /// The subset of `/proc/meminfo` this daemon needs.
-struct MemInfo {
+pub struct MemInfo {
     total_kb: u64,
     available_kb: u64,
     /// `Zswap`: current compressed pool size, absent when zswap is off.
@@ -187,7 +197,7 @@ struct MemInfo {
 
 impl MemInfo {
     /// Parse meminfo text. Absent `Zswap`/`Zswapped` lines simply yield `None`.
-    fn from_text(text: &str) -> MemInfo {
+    pub fn from_text(text: &str) -> MemInfo {
         let mut info = MemInfo {
             total_kb: 0,
             available_kb: 0,
@@ -218,7 +228,7 @@ impl MemInfo {
         info
     }
 
-    fn read() -> Result<MemInfo, String> {
+    pub fn read() -> Result<MemInfo, String> {
         let text = fs::read_to_string(MEMINFO_PATH)
             .map_err(|e| format!("cannot read {}: {}", MEMINFO_PATH, e))?;
         let info = MemInfo::from_text(&text);
@@ -229,7 +239,7 @@ impl MemInfo {
     }
 
     /// `MemAvailable` as a percentage of `MemTotal`.
-    fn available_percent(&self) -> f64 {
+    pub fn available_percent(&self) -> f64 {
         if self.total_kb == 0 {
             return 0.0;
         }
@@ -237,7 +247,7 @@ impl MemInfo {
     }
 
     /// Compression ratio `Zswapped / Zswap`, or `None` when nothing is compressed.
-    fn ratio(&self) -> Option<f64> {
+    pub fn ratio(&self) -> Option<f64> {
         let zswap = self.zswap_kb?;
         let zswapped = self.zswapped_kb?;
         if zswap == 0 || zswapped == 0 {
@@ -256,7 +266,7 @@ impl MemInfo {
 // sysfs
 // ---------------------------------------------------------------------------
 
-fn read_limit() -> Result<u8, String> {
+pub fn read_limit() -> Result<u8, String> {
     let text = fs::read_to_string(SYSFS_LIMIT_PATH)
         .map_err(|e| format!("cannot read {}: {}", SYSFS_LIMIT_PATH, e))?;
     text.trim().parse::<u8>().map_err(|e| {
@@ -270,7 +280,7 @@ fn read_limit() -> Result<u8, String> {
 }
 
 /// Write `value` to sysfs and verify it read back.
-fn write_limit(value: u8) -> Result<u8, String> {
+pub fn write_limit(value: u8) -> Result<u8, String> {
     let path = Path::new(SYSFS_LIMIT_PATH);
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -298,12 +308,12 @@ fn write_limit(value: u8) -> Result<u8, String> {
 
 /// The limit override in force, if any.
 ///
-/// * `Pin(value)` — `/run/zswap-tune.pin` holds `value`, an integer inside
+/// * `Pin(value)` — `/run/tuned-zswap.pin` holds `value`, an integer inside
 ///   `[MIN_LIMIT, MAX_LIMIT]`; the decision path is bypassed and `value` is
 ///   written to sysfs instead.
 /// * `Auto` — no usable pin: the existing decision path applies unchanged.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Override {
+pub enum Override {
     Pin(u8),
     Auto,
 }
@@ -312,7 +322,7 @@ impl Override {
     /// Read the pin file. Absent, unreadable, non-integer or out-of-range
     /// contents all fall back to `Auto`; a valid value is used verbatim, never
     /// clamped, so an operator can see exactly what they asked for.
-    fn read() -> Override {
+    pub fn read() -> Override {
         match fs::read_to_string(PIN_PATH) {
             Ok(text) => parse_pin_text(&text),
             Err(_) => Override::Auto,
@@ -320,14 +330,14 @@ impl Override {
     }
 
     /// The limit this override dictates, or `None` when the decision path runs.
-    fn limit(self) -> Option<u8> {
+    pub fn limit(self) -> Option<u8> {
         match self {
             Override::Pin(value) => Some(value),
             Override::Auto => None,
         }
     }
 
-    fn describe(self) -> String {
+    pub fn describe(self) -> String {
         match self {
             Override::Pin(value) => format!("pinned to {}% ({})", value, PIN_PATH),
             Override::Auto => "auto (decide)".to_string(),
@@ -337,7 +347,7 @@ impl Override {
 
 /// Interpret the contents of the pin file. Pure, so the rules are testable
 /// without touching the real `/run`.
-fn parse_pin_text(text: &str) -> Override {
+pub fn parse_pin_text(text: &str) -> Override {
     match text.trim().parse::<u8>() {
         Ok(value) if (MIN_LIMIT..=MAX_LIMIT).contains(&value) => Override::Pin(value),
         _ => Override::Auto,
@@ -354,7 +364,7 @@ fn parse_pin_text(text: &str) -> Override {
 /// non-numeric one yields `None` too, so a partial debugfs never panics and
 /// never poisons a record with a fake zero.
 #[derive(Default, Clone, Debug)]
-struct ZswapCounters {
+pub struct ZswapCounters {
     stored_pages: Option<u64>,
     written_back_pages: Option<u64>,
     pool_total_size: Option<u64>,
@@ -434,7 +444,7 @@ impl ZswapCounters {
 // ---------------------------------------------------------------------------
 
 /// One recorded sample: everything the report needs, in kernel units.
-struct Sample {
+pub struct Sample {
     /// Unix timestamp, integer seconds.
     ts: u64,
     /// The ceiling in force when the sample was taken.
@@ -452,7 +462,7 @@ struct Sample {
 }
 
 /// A single line of the recorded history, split by device.
-struct DeviceLine {
+pub struct DeviceLine {
     device: String,
     used_bytes: u64,
 }
@@ -460,7 +470,7 @@ struct DeviceLine {
 /// The storage backs a swap device writes to. `/proc/swaps` names devices by
 /// their node (`/dev/md0`), while `/proc/diskstats` names them by kernel name
 /// (`md0`), so the basename is what the two have in common.
-fn swap_backing_devices() -> Vec<String> {
+pub fn swap_backing_devices() -> Vec<String> {
     let text = match fs::read_to_string("/proc/swaps") {
         Ok(text) => text,
         Err(_) => return Vec::new(),
@@ -481,7 +491,7 @@ fn swap_backing_devices() -> Vec<String> {
 /// writes completed (8), writes merged (9), sectors written (10). The kernel
 /// reports sectors in 512-byte units regardless of logical block size, so the
 /// mapping to bytes is a flat multiply.
-fn diskstats_used_bytes(device: &str) -> Option<u64> {
+pub fn diskstats_used_bytes(device: &str) -> Option<u64> {
     let text = fs::read_to_string("/proc/diskstats").ok()?;
     for line in text.lines() {
         let mut fields = line.split_whitespace();
@@ -506,7 +516,7 @@ fn diskstats_used_bytes(device: &str) -> Option<u64> {
 
 /// Append one sample. A missing or unwritable stats file is not fatal: the
 /// daemon keeps tuning and only the recording stops.
-fn append_sample(sample: &Sample, devices: &[DeviceLine]) -> Result<(), String> {
+pub fn append_sample(sample: &Sample, devices: &[DeviceLine]) -> Result<(), String> {
     if let Some(parent) = Path::new(STATS_PATH).parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {}", parent.display(), e))?;
@@ -567,7 +577,7 @@ fn append_sample(sample: &Sample, devices: &[DeviceLine]) -> Result<(), String> 
 
 /// Escape a JSON string body. Only the four escapes that can appear in a
 /// device name are handled, which is all of them.
-fn json_escape(text: &str) -> String {
+pub fn json_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
@@ -585,7 +595,7 @@ fn json_escape(text: &str) -> String {
 /// Take one recording sample. Returns `Ok(Some(sample))` when the kernel
 /// exposed its counters, `Ok(None)` when it did not (which the caller reports
 /// and moves on from) and `Err` only when meminfo itself is unusable.
-fn record_sample(limit: u8) -> Result<Option<(Sample, Vec<DeviceLine>)>, String> {
+pub fn record_sample(limit: u8) -> Result<Option<(Sample, Vec<DeviceLine>)>, String> {
     let info = MemInfo::read()?;
     let counters = match ZswapCounters::read() {
         Ok(Some(counters)) => counters,
@@ -617,7 +627,7 @@ fn record_sample(limit: u8) -> Result<Option<(Sample, Vec<DeviceLine>)>, String>
     Ok(Some((sample, devices)))
 }
 
-fn now_secs() -> u64 {
+pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -628,106 +638,126 @@ fn now_secs() -> u64 {
 // Polling
 // ---------------------------------------------------------------------------
 
-/// One poll. Returns `Some((from, to))` when the limit was changed.
+/// Take one recording sample and append it. Never fails the caller: a missing
+pub fn record_tick(limit: u8) -> Result<(), String> {
+    match record_sample(limit) {
+        Ok(Some((sample, devices))) => {
+            if let Err(e) = append_sample(&sample, &devices) {
+                Err(format!("recording stopped: {}", e))
+            } else {
+                Ok(())
+            }
+        }
+        Ok(None) => Err(format!(
+            "{} is unreadable, skipping this sample",
+            ZSWAP_DEBUGFS_DIR
+        )),
+        Err(e) => Err(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Entries the fused daemon uses
+// ---------------------------------------------------------------------------
+
+/// What one poll found, and what it did about it. Returned instead of printed
+/// so the caller decides where it goes: the journal under systemd, a terminal
+/// when `tuned zswap once` is invoked by hand.
+#[derive(Debug, Clone)]
+pub struct PollOutcome {
+    /// The ceiling as it was read from sysfs before this poll.
+    pub from: u8,
+    /// Where the decision came from.
+    pub source: PollSource,
+    /// `MemAvailable` as a percentage of `MemTotal`.
+    pub available_percent: f64,
+    /// `Zswapped / Zswap`, or `None` when nothing is compressed.
+    pub ratio: Option<f64>,
+    /// What happened.
+    pub action: PollAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollSource {
+    /// `/run/tuned-zswap.pin` holds a value; the decision path was bypassed.
+    Pin,
+    /// The decision path ran.
+    Decide,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PollAction {
+    /// The ceiling was moved.
+    Applied { to: u8 },
+    /// The decision matched what is already set.
+    Hold,
+    /// The deadband or an unusable ratio: nothing to do.
+    NoChange,
+}
+
+impl PollAction {
+    pub fn changed(&self) -> bool {
+        matches!(self, PollAction::Applied { .. })
+    }
+}
+
+/// One decision poll. `dry_run` reports the decision without writing sysfs.
 ///
-/// With a valid pin the decision path is bypassed entirely: the pinned value
-/// is the limit and is written to sysfs when it differs from what is set.
-fn poll(debounce: &mut Debounce) -> Result<Option<(u8, u8)>, String> {
+/// The debounce state lives with the caller because it is per-run, not
+/// per-call: a fresh `Debounce` would defeat the 3-consecutive-readings rule
+/// on every invocation.
+pub fn poll_once(debounce: &mut Debounce, dry_run: bool) -> Result<PollOutcome, String> {
     let info = MemInfo::read()?;
     let available = info.available_percent();
     let ratio = info.ratio();
     let current = read_limit()?;
 
-    let pinned = Override::read().limit();
-    let decision = match pinned {
-        Some(value) => Some(value),
+    let pinned = Override::read();
+    let decision = match pinned.limit() {
+        Some(value) => {
+            return Ok(PollOutcome {
+                from: current,
+                source: PollSource::Pin,
+                available_percent: available,
+                ratio,
+                action: if value == current {
+                    PollAction::Hold
+                } else if dry_run {
+                    PollAction::Applied { to: value }
+                } else {
+                    let applied = write_limit(value)?;
+                    PollAction::Applied { to: applied }
+                },
+            })
+        }
         None => decide(current, debounce.push(ratio), available),
     };
 
-    let source = match pinned {
-        Some(_) => "pinned".to_string(),
-        None => "auto".to_string(),
-    };
-
-    println!(
-        "zswap-tune: max_pool_percent={}% MemAvailable={:.1}% ratio={} [{}] -> {}",
-        current,
-        available,
-        ratio.map_or("n/a".to_string(), |r| format!("{:.2}", r)),
-        source,
-        match decision {
-            Some(new) if new != current => format!("{}%", new),
-            Some(_) => "hold (already there)".to_string(),
-            None => "no change".to_string(),
-        }
-    );
-
-    match decision {
+    let action = match decision {
         Some(new) if new != current => {
-            let applied = write_limit(new)?;
-            println!(
-                "zswap-tune: applied max_pool_percent {} -> {}",
-                current, applied
-            );
-            Ok(Some((current, applied)))
-        }
-        _ => Ok(None),
-    }
-}
-
-/// Take one recording sample and append it. Never fails the caller: a missing
-/// debugfs, an unwritable log, a vanished device — all are warnings.
-fn record_tick(limit: u8) {
-    match record_sample(limit) {
-        Ok(Some((sample, devices))) => {
-            if let Err(e) = append_sample(&sample, &devices) {
-                eprintln!("zswap-tune: recording stopped: {}", e);
+            if dry_run {
+                PollAction::Applied { to: new }
             } else {
-                println!(
-                    "zswap-tune: recorded ts={} limit={}% stored_pages={} written_back={} pool={}B",
-                    sample.ts,
-                    sample.limit,
-                    sample.stored_pages,
-                    sample.written_back_pages,
-                    sample.pool_total_size
-                );
+                PollAction::Applied {
+                    to: write_limit(new)?,
+                }
             }
         }
-        Ok(None) => {
-            eprintln!(
-                "zswap-tune: {} is unreadable, skipping this sample",
-                ZSWAP_DEBUGFS_DIR
-            );
-        }
-        Err(e) => eprintln!("zswap-tune: {}", e),
-    }
-}
+        Some(_) => PollAction::Hold,
+        None => PollAction::NoChange,
+    };
 
-fn run_daemon() -> Result<(), String> {
-    let mut debounce = Debounce::new(DEBOUNCE);
-    let record_every = record_interval();
-    // Sample immediately on start so a short window still yields several rows,
-    // then on the cadence, decoupled from the 15 s decision poll.
-    let mut next_record = std::time::Instant::now();
-    let mut first = true;
-    loop {
-        if let Err(e) = poll(&mut debounce) {
-            eprintln!("zswap-tune: {}", e);
-        }
-        if first || std::time::Instant::now() >= next_record {
-            first = false;
-            let limit = Override::read()
-                .limit()
-                .unwrap_or_else(|| read_limit().unwrap_or(MIN_LIMIT));
-            record_tick(limit);
-            next_record = std::time::Instant::now() + record_every;
-        }
-        thread::sleep(INTERVAL);
-    }
+    Ok(PollOutcome {
+        from: current,
+        source: PollSource::Decide,
+        available_percent: available,
+        ratio,
+        action,
+    })
 }
 
 /// One poll. In dry-run mode the decision is reported but never written.
-fn run_once(dry_run: bool) -> Result<(), String> {
+pub fn run_once(dry_run: bool) -> Result<(), String> {
     let info = MemInfo::read()?;
     let available = info.available_percent();
     let ratio = info.ratio();
@@ -783,7 +813,7 @@ fn run_once(dry_run: bool) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 /// One line of the recorded history, as far as the report cares.
-struct Record {
+pub struct Record {
     ts: u64,
     limit: u8,
     stored_pages: i64,
@@ -793,7 +823,7 @@ struct Record {
 }
 
 /// Read one JSON object per line. Malformed lines are reported, not fatal.
-fn parse_records(text: &str) -> (Vec<Record>, Vec<String>) {
+pub fn parse_records(text: &str) -> (Vec<Record>, Vec<String>) {
     let mut records = Vec::new();
     let mut problems = Vec::new();
 
@@ -881,7 +911,7 @@ fn json_device_bytes(line: &str, device: &str) -> Option<u64> {
 }
 
 /// One interval between two consecutive samples.
-struct Interval {
+pub struct Interval {
     /// The ceiling in force when the interval opened.
     limit: u8,
     stored_delta: i64,
@@ -892,7 +922,7 @@ struct Interval {
 
 /// Per-ceiling aggregation of the intervals.
 #[derive(Clone)]
-struct Group {
+pub struct Group {
     limit: u8,
     samples: usize,
     stored_bytes: u64,
@@ -954,7 +984,7 @@ const VERDICT_LOW: u8 = 25;
 const REQUIRED_ADVANTAGE: f64 = 0.25;
 
 /// Turn consecutive samples into per-ceiling groups.
-fn analyse(records: &[Record]) -> Vec<Group> {
+pub fn analyse(records: &[Record]) -> Vec<Group> {
     let mut intervals: Vec<Interval> = Vec::new();
 
     for pair in records.windows(2) {
@@ -1029,7 +1059,7 @@ fn analyse(records: &[Record]) -> Vec<Group> {
 }
 
 /// The verdict on the 50-vs-25 comparison, as one self-contained sentence.
-fn verdict(groups: &[Group]) -> String {
+pub fn verdict(groups: &[Group]) -> String {
     let high = groups.iter().find(|g| g.limit == VERDICT_HIGH);
     let low = groups.iter().find(|g| g.limit == VERDICT_LOW);
 
@@ -1119,13 +1149,13 @@ fn verdict(groups: &[Group]) -> String {
 }
 
 /// Print the per-ceiling table, the verdict and the write evidence.
-fn print_report(path: &Path) -> Result<(), String> {
+pub fn print_report(path: &Path) -> Result<(), String> {
     let text =
         fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
     let (records, problems) = parse_records(&text);
 
     if records.is_empty() {
-        println!("zswap-tune report: {}", path.display());
+        println!("tuned-zswap report: {}", path.display());
         println!(
             "no usable records found; {} problem line(s)",
             problems.len()
@@ -1141,7 +1171,7 @@ fn print_report(path: &Path) -> Result<(), String> {
     }
 
     let groups = analyse(&records);
-    println!("zswap-tune report: {}", path.display());
+    println!("tuned-zswap report: {}", path.display());
     println!(
         "records: {} over {} ceiling value(s)",
         records.len(),
@@ -1205,14 +1235,14 @@ fn print_report(path: &Path) -> Result<(), String> {
 /// Render an optional kernel counter: a real value, or `n/a` when the kernel
 /// did not expose it. A genuine 0 and an absent counter are not the same fact,
 /// so they must not print the same thing.
-fn opt(value: Option<u64>) -> String {
+pub fn opt(value: Option<u64>) -> String {
     value.map_or("n/a".to_string(), |v| v.to_string())
 }
 
 /// Print the current ceiling, pool size, compression ratio, boot-time eviction
 /// rate and the reject counters. Never fails: an unreadable debugfs degrades to
 /// the meminfo/parameter view plus one explanatory line.
-fn print_stats() {
+pub fn print_stats() {
     let current = read_limit().unwrap_or(0);
     let pinned = Override::read();
     let info = MemInfo::read().ok();
@@ -1291,19 +1321,26 @@ fn print_stats() {
 }
 
 // ---------------------------------------------------------------------------
-// CLI
+// Command-line surface (shared with the `tuned zswap` binary)
 // ---------------------------------------------------------------------------
 
-struct Args {
-    once: bool,
-    dry_run: bool,
-    stats: bool,
+/// The parsed invocation. One job per invocation: mixing modes would only
+/// create ambiguity about what a `systemctl start` was supposed to be doing.
+#[derive(Debug, Clone)]
+pub struct Args {
+    /// Perform a single poll instead of daemon mode.
+    pub once: bool,
+    /// Report the decision without writing sysfs. Only valid with `once`.
+    pub dry_run: bool,
+    /// Print a live snapshot instead of polling.
+    pub stats: bool,
     /// `Some(path)` for `--report`, defaulting to `STATS_PATH`.
-    report: Option<PathBuf>,
+    pub report: Option<PathBuf>,
 }
 
 impl Args {
-    fn new() -> Args {
+    /// Daemon mode: no mode flags at all.
+    pub fn daemon() -> Args {
         Args {
             once: false,
             dry_run: false,
@@ -1311,93 +1348,64 @@ impl Args {
             report: None,
         }
     }
-}
 
-enum Parsed {
-    Run(Args),
-    Help,
-    Error(String),
-}
+    /// Parse argv without the program name. Pure, so the rules are testable
+    /// without spawning the binary.
+    ///
+    /// `USAGE` is returned with errors so a mis-typed flag explains the
+    /// available modes rather than only rejecting them.
+    ///
+    /// `--report` takes an *optional* path: only consumed when it is not
+    /// another flag and not the end of the command line.
+    pub fn parse(args: &[String]) -> Result<Args, String> {
+        let mut parsed = Args::daemon();
+        let mut args = args.iter().peekable();
 
-fn parse_args<I: Iterator<Item = String>>(args: I) -> Parsed {
-    let mut parsed = Args::new();
-    let mut args = args.peekable();
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--once" => parsed.once = true,
-            "--dry-run" => parsed.dry_run = true,
-            "--stats" => parsed.stats = true,
-            "--report" => {
-                // Optional path; only consumed when it is not another flag and
-                // not the end of the command line.
-                match args.peek() {
-                    Some(next) if !next.starts_with('-') => {
-                        let next = args.next().unwrap_or_default();
-                        parsed.report = Some(PathBuf::from(next));
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--once" => parsed.once = true,
+                "--dry-run" => parsed.dry_run = true,
+                "--stats" => parsed.stats = true,
+                "--report" => match args.peek().and_then(|next| {
+                    // An optional path: only consumed when it is not another
+                    // flag and not the end of the command line.
+                    if next.starts_with('-') {
+                        None
+                    } else {
+                        Some(next.to_string())
                     }
-                    _ => parsed.report = Some(PathBuf::from(STATS_PATH)),
-                }
-            }
-            "-h" | "--help" => return Parsed::Help,
-            other => {
-                return Parsed::Error(format!("unknown argument {:?}\n\n{}", other, USAGE));
-            }
-        }
-    }
-
-    if parsed.dry_run && !parsed.once {
-        return Parsed::Error(format!(
-            "--dry-run only makes sense together with --once\n\n{}",
-            USAGE
-        ));
-    }
-
-    // One job per invocation: mixing modes would only create ambiguity about
-    // what a `systemctl start` was supposed to be doing.
-    let modes = [parsed.once, parsed.stats, parsed.report.is_some()]
-        .iter()
-        .filter(|set| **set)
-        .count();
-    if modes > 1 {
-        return Parsed::Error(format!(
-            "choose one of --once, --stats or --report\n\n{}",
-            USAGE
-        ));
-    }
-
-    Parsed::Run(parsed)
-}
-
-fn main() -> ExitCode {
-    match parse_args(env::args().skip(1)) {
-        Parsed::Help => {
-            print!("{}", USAGE);
-            ExitCode::SUCCESS
-        }
-        Parsed::Error(message) => {
-            eprintln!("zswap-tune: {}", message);
-            ExitCode::from(2)
-        }
-        Parsed::Run(args) => {
-            let result = if args.stats {
-                print_stats();
-                Ok(())
-            } else if let Some(path) = args.report {
-                print_report(&path)
-            } else if args.once {
-                run_once(args.dry_run)
-            } else {
-                run_daemon()
-            };
-            match result {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("zswap-tune: {}", e);
-                    ExitCode::FAILURE
+                }) {
+                    Some(path) => {
+                        args.next();
+                        parsed.report = Some(PathBuf::from(path));
+                    }
+                    None => parsed.report = Some(PathBuf::from(STATS_PATH)),
+                },
+                _ => {
+                    return Err(format!("unknown argument {:?}\n\n{}", arg, USAGE));
                 }
             }
         }
+
+        if parsed.dry_run && !parsed.once {
+            return Err(format!(
+                "--dry-run only makes sense together with --once\n\n{}",
+                USAGE
+            ));
+        }
+
+        let modes = [parsed.once, parsed.stats, parsed.report.is_some()]
+            .iter()
+            .filter(|set| **set)
+            .count();
+        if modes > 1 {
+            return Err(format!(
+                "choose one of --once, --stats or --report\n\n{}",
+                USAGE
+            ));
+        }
+
+        Ok(parsed)
     }
 }
 
@@ -1991,7 +1999,7 @@ Zswapped:         723448 kB
 
     #[test]
     fn analysis_keeps_intervals_within_the_gap_threshold() {
-        // A cadence-adjusted run (ZSWAP_TUNE_RECORD_INTERVAL) legitimately
+        // A cadence-adjusted run (TUNED_ZSWAP_RECORD_INTERVAL) legitimately
         // spaces records further apart than 60 s; that is still one run.
         let records = vec![
             interval_record(1_000_000, 30, 100, 0),
@@ -2190,48 +2198,5 @@ Zswapped:         723448 kB
         assert_eq!(json_escape("a\"b"), "a\\\"b");
         assert_eq!(json_escape("a\\b"), "a\\\\b");
         assert_eq!(json_escape("/dev/md0"), "/dev/md0");
-    }
-
-    #[test]
-    fn args_accept_each_mode_and_reject_combinations() {
-        let run = |args: &[&str]| -> Result<Args, String> {
-            match parse_args(args.iter().map(|s| s.to_string())) {
-                Parsed::Run(args) => Ok(args),
-                Parsed::Help => Err("help".to_string()),
-                Parsed::Error(e) => Err(e),
-            }
-        };
-
-        let daemon = run(&[]).expect("daemon mode");
-        assert!(!daemon.once && !daemon.stats && daemon.report.is_none());
-
-        let once = run(&["--once"]).expect("once");
-        assert!(once.once && !once.dry_run);
-
-        let dry = run(&["--once", "--dry-run"]).expect("dry run");
-        assert!(dry.once && dry.dry_run);
-
-        let stats = run(&["--stats"]).expect("stats");
-        assert!(stats.stats);
-
-        let default_report = run(&["--report"]).expect("report");
-        assert_eq!(
-            default_report.report.as_deref(),
-            Some(std::path::Path::new(STATS_PATH))
-        );
-
-        let path_report = run(&["--report", "/somewhere.jsonl"]).expect("report with path");
-        assert_eq!(
-            path_report.report.as_deref(),
-            Some(std::path::Path::new("/somewhere.jsonl"))
-        );
-
-        assert!(run(&["--dry-run"]).is_err(), "needs --once");
-        assert!(run(&["--stats", "--once"]).is_err(), "modes are exclusive");
-        assert!(
-            run(&["--report", "--stats"]).is_err(),
-            "modes are exclusive"
-        );
-        assert!(run(&["--bogus"]).is_err(), "unknown flag");
     }
 }

@@ -1,13 +1,25 @@
-//! animaksm daemon: PSI-aware KSM governor + process scanner.
+//! `tuned` — the fused memory-reclaim daemon.
 //!
-//! Trades CPU cycles for effective RAM by dynamically tuning KSM
-//! scanning aggressiveness based on memory pressure, and proactively
-//! marking duplicate-heavy processes for KSM merging.
+//! One process, four cooperating tasks, all acting on Linux kernel
+//! memory-reclaim subsystems:
+//!
+//! * a **PSI-aware KSM governor** that trades CPU for RAM by tuning scan
+//!   aggressiveness against measured memory pressure,
+//! * a **process scanner** that marks duplicate-heavy processes eligible for
+//!   cross-process merging,
+//! * a **zswap tuner** that keeps `max_pool_percent` in a sane range for the
+//!   machine it runs on,
+//! * a **metrics** reporter for both subsystems.
+//!
+//! The KSM half is async (`crates/tuned`); the zswap half is a std-only,
+//! dependency-free library (`crates/tuned-zswap`) whose decision semantics are
+//! frozen. See the root `AGENTS.md` for why they were not written as one crate.
 
 pub mod governor;
 pub mod madvise;
 pub mod metrics;
 pub mod scanner;
+pub mod zswap;
 
 use std::fs;
 use std::future::Future;
@@ -19,13 +31,17 @@ use tokio::sync::watch;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use animaksm_common::config::AnimaksmConfig;
-use animaksm_common::ksm::{KsmConfig, KsmController, KsmStats};
-use animaksm_common::new_shared_state;
-use animaksm_common::psi::PsiStats;
+use tuned_common::config::TunedConfig;
+use tuned_common::ksm::{KsmConfig, KsmController, KsmStats};
+use tuned_common::new_shared_state;
+use tuned_common::psi::PsiStats;
 
 #[derive(Parser)]
-#[command(name = "animaksm", about = "CPU-for-RAM memory optimization daemon")]
+#[command(
+    name = "tuned",
+    version,
+    about = "KSM governor, process scanner and zswap tuner in one daemon"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -33,32 +49,46 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the animaksm daemon
+    /// Start the daemon: KSM governor, process scanner and zswap tuner
     Run {
         /// Path to configuration file
-        #[arg(short, long, default_value = "/etc/animaksm.toml")]
+        #[arg(short, long, default_value = tuned_common::config::DEFAULT_CONFIG_PATH)]
         config: PathBuf,
 
         /// Dry-run mode: log actions without executing sysfs writes or madvise calls
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
-    /// Show current status
+    /// Show current status of every subsystem
     Status {
         /// Path to configuration file
-        #[arg(short, long, default_value = "/etc/animaksm.toml")]
+        #[arg(short, long, default_value = tuned_common::config::DEFAULT_CONFIG_PATH)]
         config: PathBuf,
     },
     /// Show detailed KSM statistics (like uksmdstats)
     Stats {
         /// Path to configuration file
-        #[arg(short, long, default_value = "/etc/animaksm.toml")]
+        #[arg(short, long, default_value = tuned_common::config::DEFAULT_CONFIG_PATH)]
         config: PathBuf,
+    },
+    /// Show a live zswap snapshot: ceiling, pool size, ratio, eviction
+    ZswapStats,
+    /// Judge the recorded ceilings: does raising max_pool_percent pay for itself?
+    ZswapVerdict {
+        /// Recorded JSONL history to analyse
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+    },
+    /// Perform one zswap decision poll and exit
+    ZswapOnce {
+        /// Report the decision without writing sysfs
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
     /// Restore KSM parameters from snapshot
     RestoreKsm {
         /// Path to configuration file
-        #[arg(short, long, default_value = "/etc/animaksm.toml")]
+        #[arg(short, long, default_value = tuned_common::config::DEFAULT_CONFIG_PATH)]
         config: PathBuf,
     },
 }
@@ -71,8 +101,43 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run { config, dry_run } => run_daemon(config, dry_run).await,
         Commands::Status { config } => show_status(config).await,
         Commands::Stats { config } => show_stats(config).await,
+        Commands::ZswapStats => {
+            init_tracing("info");
+            tuned_zswap::print_stats();
+            Ok(())
+        }
+        Commands::ZswapVerdict { path } => {
+            init_tracing("info");
+            // The library reports failures as `String`; map it onto the
+            // daemon's `anyhow` error so every subcommand has one type.
+            tuned_zswap::print_report(&zswap_verdict_path(path)).map_err(anyhow::Error::msg)
+        }
+        Commands::ZswapOnce { dry_run } => {
+            init_tracing("info");
+            tuned_zswap::run_once(dry_run).map_err(anyhow::Error::msg)
+        }
         Commands::RestoreKsm { config } => restore_ksm(config).await,
     }
+}
+
+/// Resolve which history file to analyse: the explicit `--path`, else the
+/// configured `zswap.stats_path`, else the library default.
+///
+/// A missing or unreadable config is not an error here — falling back to the
+/// library default keeps `tuned zswap verdict` usable when only the binary is
+/// installed and `/etc/tuned.toml` is not.
+fn zswap_verdict_path(path: Option<PathBuf>) -> PathBuf {
+    if let Some(path) = path {
+        return path;
+    }
+    let configured = TunedConfig::load(Path::new(tuned_common::config::DEFAULT_CONFIG_PATH))
+        .ok()
+        .filter(|config| !config.zswap.stats_path.trim().is_empty())
+        .map(|config| config.zswap.stats_path);
+
+    configured
+        .unwrap_or_else(|| tuned_zswap::STATS_PATH.to_string())
+        .into()
 }
 
 async fn run_daemon(config_path: PathBuf, dry_run: bool) -> anyhow::Result<()> {
@@ -98,7 +163,8 @@ where
         dry_run,
         governor_enabled = config.governor.enabled,
         scanner_enabled = config.scanner.enabled,
-        "animaksm starting"
+        zswap_enabled = config.zswap.enabled,
+        "tuned starting"
     );
 
     // Initialize KSM controller
@@ -165,6 +231,21 @@ where
         None
     };
 
+    // Spawn zswap tuning task
+    //
+    // Independent of the KSM tasks: it reads meminfo and writes one sysfs
+    // parameter, so a blocked or failed KSM subsystem must not stop zswap
+    // tuning and vice versa.
+    let zswap_handle = if config.zswap.enabled {
+        let zswap_config = config.zswap.clone();
+        let rx = shutdown_rx.clone();
+        Some(tokio::spawn(async move {
+            zswap::run(zswap_config, rx).await;
+        }))
+    } else {
+        None
+    };
+
     // Spawn metrics task
     let metrics_state = shared_state.clone();
     let metrics_rx = shutdown_rx.clone();
@@ -175,7 +256,12 @@ where
         }
     });
 
-    info!("All tasks spawned, waiting for shutdown signal");
+    info!(
+        governor = config.governor.enabled,
+        scanner = config.scanner.enabled,
+        zswap = config.zswap.enabled,
+        "All tasks spawned, waiting for shutdown signal"
+    );
 
     let signal_name = shutdown_signal.await?;
     match signal_name {
@@ -197,6 +283,9 @@ where
         if let Some(h) = scanner_handle {
             let _ = h.await;
         }
+        if let Some(h) = zswap_handle {
+            let _ = h.await;
+        }
         let _ = metrics_handle.await;
     })
     .await;
@@ -211,7 +300,7 @@ where
         }
     }
 
-    info!("animaksm shutdown complete");
+    info!("tuned shutdown complete");
     Ok(())
 }
 
@@ -233,7 +322,7 @@ async fn show_status(config_path: PathBuf) -> anyhow::Result<()> {
     init_tracing("info");
     print!(
         "{}",
-        build_status_output(&config_path, Path::new("/proc/pressure/memory"))?
+        build_status_output(&config_path, Path::new("/proc/pressure/memory"), true)?
     );
 
     Ok(())
@@ -260,7 +349,7 @@ fn format_stats(stats: &KsmStats, ksm_path: &Path) -> String {
     let mut out = String::new();
 
     out.push_str("======================================================\n");
-    out.push_str("animaksm with KSM statistics support\n");
+    out.push_str("tuned with KSM statistics support\n");
     out.push_str("======================================================\n");
 
     // Read additional KSM stats from sysfs
@@ -349,19 +438,71 @@ fn read_sysfs_u64(ksm_path: &Path, name: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn build_status_output(config_path: &Path, psi_path: &Path) -> anyhow::Result<String> {
+fn build_status_output(
+    config_path: &Path,
+    psi_path: &Path,
+    show_zswap: bool,
+) -> anyhow::Result<String> {
     let config = load_config_or_default(config_path)?;
     let ksm = KsmController::new(&config.governor.ksm_path)?;
     let stats = ksm.read_stats()?;
     let cfg = ksm.read_config()?;
     let psi = PsiStats::read_from(psi_path)?;
 
-    Ok(format_status(&cfg, &stats, &psi))
+    let mut out = format_status(&cfg, &stats, &psi);
+
+    // The zswap line is part of the same picture: both subsystems trade RAM
+    // against compression, so `tuned status` should describe the machine's
+    // whole reclaim posture rather than only the KSM half.
+    if show_zswap {
+        out.push_str(&format_zswap_line());
+    }
+
+    Ok(out)
+}
+
+/// One live line about the zswap subsystem, or nothing when zswap is off.
+///
+/// Deliberately short: `tuned-zswap --stats` owns the detailed table. This is
+/// the "what is it doing right now" summary, and it must degrade quietly
+/// rather than fail `tuned status` when zswap is disabled or the parameter is
+/// unreadable.
+fn format_zswap_line() -> String {
+    let limit = tuned_zswap::read_limit();
+    let info = tuned_zswap::MemInfo::read();
+
+    match (limit, info) {
+        (Ok(limit), Ok(info)) => {
+            let ratio = match info.ratio() {
+                Some(r) => format!("{:.2}", r),
+                None => "n/a (nothing compressed yet)".to_string(),
+            };
+            format!(
+                "zswap:\n\
+                 \x20 enabled:                yes\n\
+                 \x20 max_pool_percent:       {}%\n\
+                 \x20 MemAvailable:           {:.1}%\n\
+                 \x20 compression ratio:      {}\n",
+                limit,
+                info.available_percent(),
+                ratio
+            )
+        }
+        (Ok(limit), Err(_)) => format!(
+            "zswap:\n\
+             \x20 enabled:                yes\n\
+             \x20 max_pool_percent:       {}%\n",
+            limit
+        ),
+        // Either the parameter is missing or zswap is not compiled in; both
+        // mean "not acting on zswap", which is a state to report, not an error.
+        _ => "zswap:\n  enabled:                no (parameter unreadable)\n".to_string(),
+    }
 }
 
 fn format_status(cfg: &KsmConfig, stats: &KsmStats, psi: &PsiStats) -> String {
     format!(
-        "=== animaksm status ===\n\
+        "=== tuned status ===\n\
          \n\
          KSM Configuration:\n\
            run:                    {}\n\
@@ -413,7 +554,7 @@ async fn restore_ksm(config_path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn restore_ksm_from_config(config: &AnimaksmConfig) -> anyhow::Result<()> {
+fn restore_ksm_from_config(config: &TunedConfig) -> anyhow::Result<()> {
     let mut ksm = KsmController::new(&config.governor.ksm_path)?;
     let state_dir = PathBuf::from(&config.general.state_dir);
     ksm.restore(&state_dir)?;
@@ -443,15 +584,15 @@ fn init_tracing(log_level: &str) {
 }
 
 /// Load config from path or return defaults (with info log if file missing).
-fn load_config_or_default(config_path: &Path) -> anyhow::Result<AnimaksmConfig> {
+fn load_config_or_default(config_path: &Path) -> anyhow::Result<TunedConfig> {
     if config_path.exists() {
-        Ok(AnimaksmConfig::load(config_path)?)
+        Ok(TunedConfig::load(config_path)?)
     } else {
         info!(
             path = %config_path.display(),
             "Config file not found, using defaults"
         );
-        Ok(AnimaksmConfig::default())
+        Ok(TunedConfig::default())
     }
 }
 
@@ -527,7 +668,7 @@ mod tests {
 
     #[test]
     fn test_load_config_or_default_nonexistent_returns_default() {
-        let path = PathBuf::from("/nonexistent/path/animaksm.toml");
+        let path = PathBuf::from("/nonexistent/path/tuned.toml");
         let config = load_config_or_default(&path).unwrap();
         assert_eq!(config.governor.stabilization_secs, 30);
         assert_eq!(config.general.log_level, "info");
@@ -536,7 +677,7 @@ mod tests {
     #[test]
     fn test_load_config_or_default_reads_existing_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("animaksm.toml");
+        let path = dir.path().join("tuned.toml");
         std::fs::write(
             &path,
             "[general]\nlog_level = \"debug\"\n\n[scanner]\nenabled = false\n",
@@ -568,12 +709,12 @@ mod tests {
             ..Default::default()
         };
         let psi = PsiStats {
-            some: animaksm_common::psi::PsiLine {
+            some: tuned_common::psi::PsiLine {
                 avg10: 1.25,
                 avg60: 2.5,
                 ..Default::default()
             },
-            full: animaksm_common::psi::PsiLine {
+            full: tuned_common::psi::PsiLine {
                 avg10: 0.5,
                 avg60: 0.75,
                 ..Default::default()
@@ -604,14 +745,33 @@ mod tests {
         )
         .unwrap();
 
-        let config_path = dir.path().join("animaksm.toml");
+        let config_path = dir.path().join("tuned.toml");
         write_config(&config_path, &ksm_dir, &state_dir);
 
-        let output = build_status_output(&config_path, &psi_path).unwrap();
+        // `false` so the assertion is about the KSM section only: the zswap
+        // line reads live sysfs and would make this test machine-dependent.
+        let output = build_status_output(&config_path, &psi_path, false).unwrap();
         assert!(output.contains("pages_to_scan:          500"));
         assert!(output.contains("pages_sharing:          512"));
         assert!(output.contains("some avg60:             2.50%"));
         assert!(output.contains("full avg10:             0.50%"));
+    }
+
+    /// `tuned status` must describe both subsystems, so the KSM-only output is
+    /// not sufficient evidence — the zswap section has to be present too.
+    #[test]
+    fn test_status_includes_the_zswap_subsystem() {
+        let output = format_zswap_line();
+        assert!(
+            output.contains("max_pool_percent:"),
+            "expected the zswap ceiling, got: {}",
+            output
+        );
+        // A machine without zswap must not crash or claim a ceiling.
+        assert!(
+            output.contains("no (parameter unreadable)") || output.contains('%'),
+            "zswap line must state either the ceiling or its absence"
+        );
     }
 
     #[tokio::test]
@@ -626,7 +786,7 @@ mod tests {
         std::fs::create_dir(&ksm_dir).unwrap();
         seed_ksm_dir(&ksm_dir);
 
-        let config_path = dir.path().join("animaksm.toml");
+        let config_path = dir.path().join("tuned.toml");
         write_config(&config_path, &ksm_dir, &state_dir);
 
         show_status(config_path).await.unwrap();
@@ -645,7 +805,7 @@ mod tests {
         std::fs::write(ksm_dir.join("run"), "0").unwrap();
         std::fs::write(ksm_dir.join("pages_to_scan"), "100").unwrap();
 
-        let config_path = dir.path().join("animaksm.toml");
+        let config_path = dir.path().join("tuned.toml");
         write_config(&config_path, &ksm_dir, &state_dir);
 
         restore_ksm(config_path).await.unwrap();
@@ -659,7 +819,7 @@ mod tests {
 
     #[test]
     fn test_restore_ksm_from_config_errors_for_missing_ksm_path() {
-        let mut config = AnimaksmConfig::default();
+        let mut config = TunedConfig::default();
         config.governor.ksm_path = "/nonexistent/ksm/path".into();
         let err = restore_ksm_from_config(&config).unwrap_err();
         assert!(err.to_string().contains("KSM path not found"));
@@ -673,7 +833,7 @@ mod tests {
         std::fs::create_dir(&ksm_dir).unwrap();
         seed_ksm_dir(&ksm_dir);
 
-        let config_path = dir.path().join("animaksm.toml");
+        let config_path = dir.path().join("tuned.toml");
         write_daemon_config(&config_path, &ksm_dir, &state_dir);
 
         run_daemon_with_shutdown(config_path, true, async { Ok("test") })
@@ -691,7 +851,7 @@ mod tests {
         std::fs::create_dir(&ksm_dir).unwrap();
         seed_ksm_dir(&ksm_dir);
 
-        let config_path = dir.path().join("animaksm.toml");
+        let config_path = dir.path().join("tuned.toml");
         write_daemon_config(&config_path, &ksm_dir, &state_dir);
 
         run_daemon_with_shutdown(config_path, false, async { Ok("SIGTERM") })
@@ -710,7 +870,7 @@ mod tests {
         std::fs::create_dir(&ksm_dir).unwrap();
         seed_ksm_dir(&ksm_dir);
 
-        let config_path = dir.path().join("animaksm.toml");
+        let config_path = dir.path().join("tuned.toml");
         write_daemon_config_all_enabled(&config_path, &ksm_dir, &state_dir);
 
         run_daemon_with_shutdown(config_path.clone(), true, async { Ok("SIGINT") })
@@ -729,7 +889,7 @@ mod tests {
         std::fs::create_dir(&ksm_dir).unwrap();
         seed_ksm_dir(&ksm_dir);
 
-        let config_path = dir.path().join("animaksm.toml");
+        let config_path = dir.path().join("tuned.toml");
         write_daemon_config_all_enabled(&config_path, &ksm_dir, &state_dir);
 
         run_daemon_with_shutdown(config_path, false, async { Ok("SIGTERM") })
@@ -752,86 +912,79 @@ mod tests {
 
     #[test]
     fn test_cli_parses_run_status_and_restore_commands() {
-        let run = Cli::try_parse_from([
-            "animaksm",
-            "run",
-            "--config",
-            "/tmp/animaksm.toml",
-            "--dry-run",
-        ])
-        .unwrap();
+        let run = Cli::try_parse_from(["tuned", "run", "--config", "/tmp/tuned.toml", "--dry-run"])
+            .unwrap();
         match run.command {
             Commands::Run { config, dry_run } => {
-                assert_eq!(config, PathBuf::from("/tmp/animaksm.toml"));
+                assert_eq!(config, PathBuf::from("/tmp/tuned.toml"));
                 assert!(dry_run);
             }
             _ => panic!("expected run command"),
         }
 
         let status =
-            Cli::try_parse_from(["animaksm", "status", "--config", "/tmp/animaksm.toml"]).unwrap();
+            Cli::try_parse_from(["tuned", "status", "--config", "/tmp/tuned.toml"]).unwrap();
         assert!(matches!(status.command, Commands::Status { .. }));
 
         let restore =
-            Cli::try_parse_from(["animaksm", "restore-ksm", "--config", "/tmp/animaksm.toml"])
-                .unwrap();
+            Cli::try_parse_from(["tuned", "restore-ksm", "--config", "/tmp/tuned.toml"]).unwrap();
         assert!(matches!(restore.command, Commands::RestoreKsm { .. }));
     }
 
     #[test]
     fn test_cli_parses_stats_subcommand_with_short_config_flag() {
-        let stats = Cli::try_parse_from(["animaksm", "stats", "-c", "/tmp/animaksm.toml"]).unwrap();
+        let stats = Cli::try_parse_from(["tuned", "stats", "-c", "/tmp/tuned.toml"]).unwrap();
         match stats.command {
-            Commands::Stats { config } => assert_eq!(config, PathBuf::from("/tmp/animaksm.toml")),
+            Commands::Stats { config } => assert_eq!(config, PathBuf::from("/tmp/tuned.toml")),
             _ => panic!("expected stats command"),
         }
     }
 
     #[test]
-    fn test_cli_config_flag_defaults_to_etc_animaksm_toml() {
+    fn test_cli_config_flag_defaults_to_etc_tuned_toml() {
         // The default config path is a user-visible contract: the systemd unit
         // invokes the daemon without `--config`.
-        let run = Cli::try_parse_from(["animaksm", "run"]).unwrap();
+        let run = Cli::try_parse_from(["tuned", "run"]).unwrap();
         match run.command {
             Commands::Run { config, dry_run } => {
-                assert_eq!(config, PathBuf::from("/etc/animaksm.toml"));
+                assert_eq!(config, PathBuf::from("/etc/tuned.toml"));
                 assert!(!dry_run, "dry-run must default to off");
             }
             _ => panic!("expected run command"),
         }
 
-        let status = Cli::try_parse_from(["animaksm", "status"]).unwrap();
+        let status = Cli::try_parse_from(["tuned", "status"]).unwrap();
         assert_eq!(
             match status.command {
                 Commands::Status { config } => config,
                 _ => panic!("expected status command"),
             },
-            PathBuf::from("/etc/animaksm.toml")
+            PathBuf::from("/etc/tuned.toml")
         );
 
-        let stats = Cli::try_parse_from(["animaksm", "stats"]).unwrap();
+        let stats = Cli::try_parse_from(["tuned", "stats"]).unwrap();
         assert_eq!(
             match stats.command {
                 Commands::Stats { config } => config,
                 _ => panic!("expected stats command"),
             },
-            PathBuf::from("/etc/animaksm.toml")
+            PathBuf::from("/etc/tuned.toml")
         );
 
-        let restore = Cli::try_parse_from(["animaksm", "restore-ksm"]).unwrap();
+        let restore = Cli::try_parse_from(["tuned", "restore-ksm"]).unwrap();
         assert_eq!(
             match restore.command {
                 Commands::RestoreKsm { config } => config,
                 _ => panic!("expected restore-ksm command"),
             },
-            PathBuf::from("/etc/animaksm.toml")
+            PathBuf::from("/etc/tuned.toml")
         );
     }
 
     #[test]
     fn test_cli_accepts_equals_form_for_flags() {
         // `--config=<path>` is the form used by the systemd unit's ExecStart.
-        let run = Cli::try_parse_from(["animaksm", "run", "--config=/tmp/a.toml"]).unwrap();
+        let run = Cli::try_parse_from(["tuned", "run", "--config=/tmp/a.toml"]).unwrap();
         match run.command {
             Commands::Run { config, dry_run } => {
                 assert_eq!(config, PathBuf::from("/tmp/a.toml"));
@@ -843,7 +996,7 @@ mod tests {
 
     #[test]
     fn test_cli_rejects_missing_subcommand() {
-        let Err(err) = Cli::try_parse_from(["animaksm"]) else {
+        let Err(err) = Cli::try_parse_from(["tuned"]) else {
             panic!("expected missing-subcommand error")
         };
         assert_eq!(
@@ -854,7 +1007,7 @@ mod tests {
 
     #[test]
     fn test_cli_rejects_unknown_flag() {
-        let Err(err) = Cli::try_parse_from(["animaksm", "run", "--turbo"]) else {
+        let Err(err) = Cli::try_parse_from(["tuned", "run", "--turbo"]) else {
             panic!("expected unknown-flag error")
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
@@ -862,7 +1015,7 @@ mod tests {
 
     #[test]
     fn test_cli_rejects_unknown_subcommand() {
-        let Err(err) = Cli::try_parse_from(["animaksm", "frobnicate"]) else {
+        let Err(err) = Cli::try_parse_from(["tuned", "frobnicate"]) else {
             panic!("expected invalid-subcommand error")
         };
         assert_eq!(
@@ -874,7 +1027,7 @@ mod tests {
 
     #[test]
     fn test_cli_rejects_non_boolean_dry_run_value() {
-        let Err(err) = Cli::try_parse_from(["animaksm", "run", "--dry-run=maybe"]) else {
+        let Err(err) = Cli::try_parse_from(["tuned", "run", "--dry-run=maybe"]) else {
             panic!("expected invalid dry-run value error")
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::TooManyValues);
@@ -883,7 +1036,7 @@ mod tests {
 
     #[test]
     fn test_cli_rejects_stray_positional_argument() {
-        let Err(err) = Cli::try_parse_from(["animaksm", "run", "extra"]) else {
+        let Err(err) = Cli::try_parse_from(["tuned", "run", "extra"]) else {
             panic!("expected stray-positional error")
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
@@ -891,7 +1044,7 @@ mod tests {
 
     #[test]
     fn test_cli_help_describes_subcommands() {
-        let Err(err) = Cli::try_parse_from(["animaksm", "--help"]) else {
+        let Err(err) = Cli::try_parse_from(["tuned", "--help"]) else {
             panic!("expected help output")
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
@@ -902,12 +1055,12 @@ mod tests {
 
     #[test]
     fn test_cli_run_help_documents_flags_and_default() {
-        let Err(err) = Cli::try_parse_from(["animaksm", "run", "--help"]) else {
+        let Err(err) = Cli::try_parse_from(["tuned", "run", "--help"]) else {
             panic!("expected run help output")
         };
         assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
         let help = err.to_string();
-        for needle in ["--config", "--dry-run", "/etc/animaksm.toml"] {
+        for needle in ["--config", "--dry-run", "/etc/tuned.toml"] {
             assert!(help.contains(needle), "run help missing {needle}");
         }
     }
@@ -915,7 +1068,7 @@ mod tests {
     #[test]
     fn test_load_config_or_default_surfaces_malformed_toml() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("animaksm.toml");
+        let path = dir.path().join("tuned.toml");
         std::fs::write(&path, "[general\nlog_level = ").unwrap();
 
         let err = load_config_or_default(&path).unwrap_err();
@@ -929,7 +1082,7 @@ mod tests {
     #[test]
     fn test_load_config_or_default_surfaces_validation_error() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("animaksm.toml");
+        let path = dir.path().join("tuned.toml");
         std::fs::write(
             &path,
             "[governor]\npsi_some_threshold = 250.0\nksm_path = \"/nonexistent/ksm\"\n",
@@ -952,7 +1105,7 @@ mod tests {
     #[test]
     fn test_load_config_or_default_ignores_unknown_keys() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("animaksm.toml");
+        let path = dir.path().join("tuned.toml");
         std::fs::write(
             &path,
             "[general]\nlog_level = \"warn\"\nfuture_option = 42\n",
@@ -966,14 +1119,14 @@ mod tests {
     #[test]
     fn test_load_config_or_default_merges_partial_file_with_defaults() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("animaksm.toml");
+        let path = dir.path().join("tuned.toml");
         std::fs::write(&path, "[scanner]\nenabled = false\n").unwrap();
 
         let config = load_config_or_default(&path).unwrap();
         assert!(!config.scanner.enabled);
         // Unspecified sections must keep their defaults rather than erroring.
         assert!(config.validate().is_ok());
-        assert_eq!(config.general.state_dir, "/var/lib/animaksm");
+        assert_eq!(config.general.state_dir, "/var/lib/tuned");
     }
 
     #[tokio::test]
@@ -984,7 +1137,7 @@ mod tests {
         std::fs::create_dir(&ksm_dir).unwrap();
         seed_ksm_dir(&ksm_dir);
 
-        let config_path = dir.path().join("animaksm.toml");
+        let config_path = dir.path().join("tuned.toml");
         write_daemon_config(&config_path, &ksm_dir, &state_dir);
 
         let err = run_daemon_with_shutdown(config_path, true, async {
@@ -1006,7 +1159,7 @@ mod tests {
         // so the absent-knob path is exercised without touching real sysfs.
         std::fs::write(ksm_dir.join("stable_node_chains"), "not-a-number").unwrap();
 
-        let config_path = dir.path().join("animaksm.toml");
+        let config_path = dir.path().join("tuned.toml");
         write_config(&config_path, &ksm_dir, &dir.path().join("state"));
 
         let output = build_stats_output(&config_path).unwrap();
@@ -1057,7 +1210,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_stats_output_errors_for_missing_ksm_path() {
         let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("animaksm.toml");
+        let config_path = dir.path().join("tuned.toml");
         write_config(&config_path, &dir.path().join("missing"), dir.path());
 
         let err = build_stats_output(&config_path).unwrap_err();
@@ -1067,7 +1220,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_daemon_errors_when_config_is_invalid() {
         let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("animaksm.toml");
+        let config_path = dir.path().join("tuned.toml");
         std::fs::write(&config_path, "not = [valid toml").unwrap();
 
         let err = run_daemon_with_shutdown(config_path, true, async { Ok("SIGTERM") })
@@ -1080,7 +1233,7 @@ mod tests {
     async fn test_run_daemon_errors_when_ksm_path_missing() {
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path().join("state");
-        let config_path = dir.path().join("animaksm.toml");
+        let config_path = dir.path().join("tuned.toml");
         std::fs::write(
             &config_path,
             format!(

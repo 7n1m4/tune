@@ -1,10 +1,10 @@
-//! Unified error types for animaksm.
+//! Unified error types for tuned.
 
 use std::path::PathBuf;
 
-/// All errors that can occur in the animaksm system.
+/// All errors that can occur in the tuned system.
 #[derive(Debug, thiserror::Error)]
-pub enum AnimaksmError {
+pub enum TunedError {
     #[error("sysfs I/O error on {path}: {source}")]
     Sysfs {
         path: PathBuf,
@@ -41,4 +41,4 @@ pub enum AnimaksmError {
     Nix(#[from] nix::Error),
 }
 
-pub type Result<T> = std::result::Result<T, AnimaksmError>;
+pub type Result<T> = std::result::Result<T, TunedError>;

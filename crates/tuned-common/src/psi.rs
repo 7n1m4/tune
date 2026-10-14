@@ -3,7 +3,7 @@
 //! Supports both polling and event-driven (kernel trigger) modes
 //! for monitoring memory pressure via /proc/pressure/memory.
 
-use crate::error::{AnimaksmError, Result};
+use crate::error::{Result, TunedError};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -55,7 +55,7 @@ impl PsiStats {
 
     /// Read PSI stats from an arbitrary path (useful for cgroup PSI).
     pub fn read_from(path: &Path) -> Result<Self> {
-        let content = fs::read_to_string(path).map_err(|e| AnimaksmError::Sysfs {
+        let content = fs::read_to_string(path).map_err(|e| TunedError::Sysfs {
             path: path.to_path_buf(),
             source: e,
         })?;
@@ -185,7 +185,7 @@ impl PsiTrigger {
             .write(true)
             .custom_flags(libc::O_RDWR)
             .open(path)
-            .map_err(|e| AnimaksmError::Sysfs {
+            .map_err(|e| TunedError::Sysfs {
                 path: path.to_path_buf(),
                 source: e,
             })?;
@@ -244,7 +244,7 @@ impl PsiTrigger {
         let mut file = unsafe { fs::File::from_raw_fd(fd) };
         let result = file
             .write_all(trigger_str.as_bytes())
-            .map_err(|e| AnimaksmError::Sysfs {
+            .map_err(|e| TunedError::Sysfs {
                 path: path.to_path_buf(),
                 source: e,
             });

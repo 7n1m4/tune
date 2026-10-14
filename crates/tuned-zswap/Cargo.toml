@@ -1,5 +1,5 @@
 [package]
-name = "zswap-tune"
+name = "tuned-zswap"
 version = "0.1.0"
 edition = "2021"
 description = "Live auto-tuner for the kernel zswap max_pool_percent parameter"
@@ -8,6 +8,17 @@ license = "MIT"
 # Non-negotiable (see AGENTS.md): zero third-party crates. Do not add any.
 # This crate also inherits nothing from [workspace.dependencies].
 [dependencies]
+
+[lib]
+name = "tuned_zswap"
+path = "src/lib.rs"
+
+# Thin CLI over the library: argument parsing and formatting only. The fused
+# `tuned` binary in crates/tuned depends on this same lib, so both paths run
+# identical code.
+[[bin]]
+name = "tuned-zswap"
+path = "src/bin/main.rs"
 
 # Release profile (opt-level=2, lto=true) is declared once at the workspace
 # root; a per-crate profile would be ignored with a warning.

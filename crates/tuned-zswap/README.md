@@ -1,4 +1,8 @@
-# zswap-tune
+# tuned-zswap
+
+The zswap tuner as a dependency-free library (`tuned_zswap`), plus the
+standalone `tuned-zswap` binary. See the
+[top-level README](../../README.md) for how it fits into `tuned`.
 
 > **Save every megabyte.** Consumer hardware runs AI agents, browsers and
 > container fleets that were sized for a datacenter, and RAM is the one resource
@@ -23,7 +27,7 @@ Every 15 seconds the daemon:
    range.
 
 Every 60 seconds it additionally appends one JSON record to
-`/var/log/zswap-tune/stats.jsonl`, capturing the ceiling in force together with
+`/var/log/tuned-zswap/stats.jsonl`, capturing the ceiling in force together with
 the kernel's own zswap counters (`/sys/kernel/debug/zswap/*`), memory
 availability, the compression ratio and the write volume of the swap-backed
 devices. Those records are what `--report` analyses.
@@ -67,15 +71,15 @@ It writes **exactly one** thing: `max_pool_percent`. It does not:
 * modify the kernel command line, `/efi`, the initramfs, dracut, or modprobe
   configuration. No reboot or module reload is ever required.
 
-## Manual override: `/run/zswap-tune.pin`
+## Manual override: `/run/tuned-zswap.pin`
 
-While `/run/zswap-tune.pin` exists and holds an integer in `[25, 50]`, the
+While `/run/tuned-zswap.pin` exists and holds an integer in `[25, 50]`, the
 daemon uses that value as the limit and writes it to sysfs instead of consulting
 the decision path. Remove the file to hand control back:
 
 ```console
-$ sudo sh -c 'echo 50 > /run/zswap-tune.pin'   # force ceiling 50
-$ sudo rm /run/zswap-tune.pin                  # back to automatic tuning
+$ sudo sh -c 'echo 50 > /run/tuned-zswap.pin'   # force ceiling 50
+$ sudo rm /run/tuned-zswap.pin                  # back to automatic tuning
 ```
 
 The pin is honoured exactly as written — a value outside `[25, 50]` or one that
@@ -83,13 +87,25 @@ is not an integer is ignored, not clamped.
 
 ## Usage
 
+The crate ships two entry points. `tuned-zswap` is the original standalone
+binary; the fused daemon exposes the same operations as subcommands.
+
 ```console
-$ zswap-tune --once            # one poll, apply, print report, exit
-$ zswap-tune --once --dry-run  # same, but never write sysfs
-$ zswap-tune                   # daemon mode, poll every 15s forever
-$ zswap-tune --stats           # live snapshot of ceiling, pool size, eviction
-$ zswap-tune --report          # judge the ceilings from the recorded history
-$ zswap-tune --help
+$ tuned-zswap --once            # one poll, apply, print report, exit
+$ tuned-zswap --once --dry-run  # same, but never write sysfs
+$ tuned-zswap                   # daemon mode, poll every 15s forever
+$ tuned-zswap --stats           # live snapshot of ceiling, pool size, eviction
+$ tuned-zswap --report          # judge the ceilings from the recorded history
+$ tuned-zswap --help
+```
+
+From the fused `tuned` binary:
+
+```console
+$ tuned zswap-once [--dry-run]
+$ tuned zswap-stats
+$ tuned zswap-verdict [PATH]
+$ tuned run                     # both subsystems in one process
 ```
 
 Flags:
@@ -104,7 +120,7 @@ Flags:
   an unprivileged user the table degrades to the meminfo and parameter view
   plus an explicit note that the counters are unavailable, and still exits 0.
 * `--report [PATH]` — read a recorded stats file (default
-  `/var/log/zswap-tune/stats.jsonl`), compute per-interval deltas, group them
+  `/var/log/tuned-zswap/stats.jsonl`), compute per-interval deltas, group them
   by the ceiling that was in force and print one table plus a verdict. An
   interval is evidence only if it was spent contiguously under one ceiling:
   samples spaced more than `RECORD_GAP_MAX` apart (300 s) belong to different
@@ -122,7 +138,7 @@ Flags:
 Logging goes to stdout/stderr, which systemd's journal captures. A bad read
 (transient `/proc` or permission failure) is logged and skipped; the daemon
 never panics. The recorded history is rotated daily by
-`/etc/logrotate.d/zswap-tune`, keeping 14 compressed generations.
+`systemd/tuned-logrotate.conf` (installed as `/etc/logrotate.d/tuned-zswap`), keeping 14 compressed generations.
 
 ## Judging the ceilings
 
@@ -147,13 +163,13 @@ and a progress script to check mid-run whether either ceiling has reached the
 ## Building
 
 ```console
-$ cd /opt/zswap-tune && cargo build --release
+$ cargo build --release -p tuned-zswap
 ```
 
 No third-party crates — std only. Install with:
 
 ```console
-$ sudo install -m 755 target/release/zswap-tune /usr/local/bin/zswap-tune
+$ sudo install -m 755 target/release/tuned-zswap /usr/local/bin/tuned-zswap
 ```
 
 Run as root (as a systemd unit, for example), since writing to

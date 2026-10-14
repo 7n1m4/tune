@@ -34,13 +34,13 @@
 
 use std::time::{Duration, Instant};
 
-use animaksm_common::config::GovernorConfig;
-use animaksm_common::ksm::{KsmController, KsmStats};
-use animaksm_common::psi::{PressureLevel, PsiStats};
-use animaksm_common::SharedGovernorState;
 use tokio::sync::watch;
 use tokio::time;
 use tracing::{debug, info, warn};
+use tuned_common::config::GovernorConfig;
+use tuned_common::ksm::{KsmController, KsmStats};
+use tuned_common::psi::{PressureLevel, PsiStats};
+use tuned_common::SharedGovernorState;
 
 /// KSM profile for each aggressiveness level.
 ///
@@ -471,7 +471,7 @@ impl Governor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use animaksm_common::new_shared_state;
+    use tuned_common::new_shared_state;
 
     /// Create a Governor with default config and a dry-run KSM controller.
     fn make_gov() -> Governor {
@@ -504,11 +504,11 @@ mod tests {
 
     fn psi(some_avg10: f32, full_avg10: f32) -> PsiStats {
         PsiStats {
-            some: animaksm_common::psi::PsiLine {
+            some: tuned_common::psi::PsiLine {
                 avg10: some_avg10,
                 ..Default::default()
             },
-            full: animaksm_common::psi::PsiLine {
+            full: tuned_common::psi::PsiLine {
                 avg10: full_avg10,
                 ..Default::default()
             },

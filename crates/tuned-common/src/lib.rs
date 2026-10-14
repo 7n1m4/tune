@@ -1,7 +1,7 @@
-//! animaksm-common: Shared library for animaksm components.
+//! tuned-common: Shared library for tuned components.
 //!
 //! Provides PSI monitoring, KSM control, process analysis, and
-//! configuration management for the animaksm memory optimization system.
+//! configuration management for the tuned memory optimization system.
 
 pub mod config;
 pub mod error;

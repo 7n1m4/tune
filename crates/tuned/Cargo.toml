@@ -1,16 +1,17 @@
 [package]
-name = "animaksm-daemon"
+name = "tuned-daemon"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "KSM governor and process-wide merge-eligibility scanner for Linux"
+description = "KSM governor and process-wide merge-eligibility scanner for Linux, fused with zswap tuning"
 
 [[bin]]
-name = "animaksm"
+name = "tuned"
 path = "src/main.rs"
 
 [dependencies]
-animaksm-common = { path = "../common" }
+tuned-common = { path = "../tuned-common" }
+tuned-zswap = { path = "../tuned-zswap" }
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -21,6 +22,7 @@ nix.workspace = true
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+parking_lot.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

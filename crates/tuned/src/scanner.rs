@@ -30,12 +30,12 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use animaksm_common::config::ScannerConfig;
-use animaksm_common::procfs::{self, KsmProcStat, ProcessStatus};
-use animaksm_common::SharedGovernorState;
 use tokio::sync::watch;
 use tokio::time;
 use tracing::{debug, info, warn};
+use tuned_common::config::ScannerConfig;
+use tuned_common::procfs::{self, KsmProcStat, ProcessStatus};
+use tuned_common::SharedGovernorState;
 
 use crate::madvise;
 
@@ -403,7 +403,7 @@ impl Scanner {
         // (high pages_volatile), try to re-promote large regions to THPs
         // for TLB efficiency. process_madvise supports COLLAPSE cross-process,
         // so it needs the region list this path used to be able to rely on.
-        if let Ok(ksm_stats) = animaksm_common::ksm::KsmController::new("/sys/kernel/mm/ksm") {
+        if let Ok(ksm_stats) = tuned_common::ksm::KsmController::new("/sys/kernel/mm/ksm") {
             if let Ok(stats) = ksm_stats.read_stats() {
                 if stats.pages_volatile > 1000 {
                     for pid in &injected {
@@ -551,10 +551,10 @@ impl Scanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use animaksm_common::config::ScannerConfig;
-    use animaksm_common::GovernorState;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+    use tuned_common::config::ScannerConfig;
+    use tuned_common::GovernorState;
 
     // ── Integration: scanner not blocked by governor actions ──────────
 
@@ -685,7 +685,7 @@ mod tests {
     fn test_l1_candidate_filters_kernel_small_and_blocklisted_processes() {
         let config = ScannerConfig {
             min_anon_rss_mb: 100,
-            blocklist: vec!["animaksm".into()],
+            blocklist: vec!["tuned".into()],
             ..ScannerConfig::default()
         };
 
@@ -714,7 +714,7 @@ mod tests {
         assert!(l1_candidate_from_status(
             ProcessStatus {
                 pid: 101,
-                name: "animaksm-daemon".into(),
+                name: "tuned-daemon".into(),
                 anon_rss_kb: 500 * 1024,
                 ..Default::default()
             },
@@ -1293,7 +1293,7 @@ mod tests {
 
         let daemon_pid = scanner.daemon_pid;
         let targets = vec![
-            reprotect_candidate(daemon_pid, "animaksm-daemon", 512),
+            reprotect_candidate(daemon_pid, "tuned-daemon", 512),
             reprotect_candidate(4242, "app", 256),
         ];
 

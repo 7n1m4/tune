@@ -1,0 +1,64 @@
+[Unit]
+Description=tuned — KSM governor, process scanner and zswap tuner
+Documentation=file:///home/vi/tune/README.md
+After=local-fs.target swap.target
+ConditionPathExists=/sys/kernel/mm/ksm
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tuned run --config /etc/tuned.toml
+ExecStopPost=-/usr/local/bin/tuned restore-ksm --config /etc/tuned.toml
+Restart=on-failure
+RestartSec=5
+
+# Runs as root: `User=` is intentionally unset. It writes
+# /sys/kernel/mm/ksm/* and /sys/module/zswap/parameters/max_pool_percent
+# (both root-writable), and needs CAP_SYS_PTRACE/CAP_DAC_READ_SEARCH to inject
+# prctl(PR_SET_MEMORY_MERGE) into other processes.
+
+# Output goes to the journal: every poll, ceiling change and scan cycle is logged.
+StandardOutput=journal
+StandardError=journal
+
+# StateDirectory= creates /var/lib/tuned (the KSM snapshot dir) and
+# LogsDirectory= creates /var/log/tuned-zswap (the JSONL history). Both must
+# exist before the unit starts, because ProtectSystem=strict makes
+# ReadWritePaths a hard requirement: a missing directory fails the whole
+# invocation with 226/NAMESPACE rather than starting degraded.
+StateDirectory=tuned
+LogsDirectory=tuned-zswap
+
+# Security: limit what the process can do outside memory-reclaim tuning.
+NoNewPrivileges=yes
+AmbientCapabilities=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# Every path the fused daemon legitimately writes: the KSM sysfs directory, the
+# single zswap parameter, and the two directories systemd created above.
+ReadWritePaths=/sys/kernel/mm/ksm
+ReadWritePaths=/sys/module/zswap/parameters
+ReadWritePaths=/var/lib/tuned
+ReadWritePaths=/var/log/tuned-zswap
+ReadOnlyPaths=/proc/pressure /proc /etc/tuned.toml
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+RemoveIPC=yes
+
+# Deliberately NOT set, because each can interfere with this daemon. The first
+# two are the known traps: they remount /sys and /proc/sys read-only for the
+# unit, which silently makes the zswap write fail.
+#   ProtectKernelModules   - can block writes to /sys/module/zswap/...
+#   ProtectKernelTunables  - can block writes to /sys/module/zswap/...
+#   RestrictAddressFamilies - keep defaults so journald logging cannot break
+#   MemoryDenyWriteExecute is set to =no above: it is unnecessary here and can
+#   break the Rust stack guard.
+
+# Resource limits
+MemoryMax=32M
+Nice=19
+
+[Install]
+WantedBy=multi-user.target
