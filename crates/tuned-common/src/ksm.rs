@@ -997,4 +997,796 @@ mod tests {
         assert!(!result.is_empty());
         assert!(result.chars().all(|c| c.is_ascii_digit()));
     }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Fault injection: what happens when the sysfs / snapshot boundaries FAIL
+    //
+    // Every test below drives a real failure at a kernel or filesystem
+    // boundary inside a tempdir and asserts on the *observable decision* the
+    // controller makes: an Err (never a silently Default-filled struct), an
+    // Err that names the offending path, or an abort before any write lands.
+    // Each assertion is written so that breaking the production error
+    // handling (`?` → `unwrap_or_default`, `map_err` → `.ok()`, dropping the
+    // clamp, etc.) turns the test red.
+    // ════════════════════════════════════════════════════════════════════
+
+    /// Set a POSIX mode on `path`. Test-only, so failures are ignored by the
+    /// caller (probe paths always restore permissions before returning).
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    }
+
+    /// Probe whether this uid actually has its permission bits enforced.
+    ///
+    /// Root bypasses file permission checks, so a chmod-based fault injection
+    /// is simply unreachable under root. The probe writes a file, removes its
+    /// write bit and tries to write again; it restores the mode afterwards so
+    /// the tempdir can still be unlinked. Callers branch on this answer rather
+    /// than assuming an unprivileged uid.
+    fn permission_bits_are_enforced() -> bool {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("probe");
+        std::fs::write(&file, "x").expect("probe write");
+        set_mode(&file, 0o444);
+        let write_refused = std::fs::write(&file, "y").is_err();
+        set_mode(&file, 0o644);
+        let read_refused = {
+            let nested = dir.path().join("nested");
+            std::fs::create_dir(&nested).expect("nested dir");
+            std::fs::write(nested.join("run"), "1").expect("nested write");
+            set_mode(&nested, 0o000);
+            let refused = std::fs::read_to_string(nested.join("run")).is_err();
+            set_mode(&nested, 0o755);
+            refused
+        };
+        write_refused || read_refused
+    }
+
+    /// The eight stats files `read_stats` treats as required.
+    const REQUIRED_STATS: [&str; 8] = [
+        "pages_shared",
+        "pages_sharing",
+        "pages_unshared",
+        "pages_volatile",
+        "pages_scanned",
+        "pages_skipped",
+        "full_scans",
+        "general_profit",
+    ];
+
+    /// Full path of a seeded file, used to assert the error names the file.
+    fn path_in(dir: &Path, name: &str) -> String {
+        dir.join(name).display().to_string()
+    }
+
+    /// A controller over `base_path` with the rate limiter already primed, so
+    /// writes land on the first attempt instead of being skipped.
+    fn controller_at(base_path: &Path) -> KsmController {
+        KsmController {
+            base_path: base_path.to_path_buf(),
+            last_update: Instant::now() - std::time::Duration::from_secs(60),
+            dry_run: false,
+        }
+    }
+
+    /// Seed a snapshot file with *raw* content (corrupt or otherwise).
+    fn write_raw_snapshot(state_dir: &Path, content: &str) {
+        std::fs::create_dir_all(state_dir).unwrap();
+        std::fs::write(state_dir.join(SNAPSHOT_FILENAME), content).unwrap();
+    }
+
+    /// A snapshot JSON whose every field is in range and differs from the
+    /// seeded sysfs values, so each assertion distinguishes a real write.
+    const VALID_SNAPSHOT_JSON: &str = r#"{
+      "config": {
+        "run": 1,
+        "pages_to_scan": 700,
+        "sleep_millisecs": 11,
+        "max_page_sharing": 2048,
+        "smart_scan": 1,
+        "advisor_mode": "none",
+        "advisor_target_scan_time": 250,
+        "advisor_max_cpu": 90,
+        "advisor_min_pages_to_scan": 400,
+        "advisor_max_pages_to_scan": 9000
+      },
+      "timestamp": "2026-10-15T00:00:00Z"
+    }"#;
+
+    // ── (a) unreadable sysfs directory ─────────────────────────────────
+
+    #[test]
+    fn fault_read_stats_unreadable_directory_errors_and_is_not_zeroed() {
+        if !permission_bits_are_enforced() {
+            eprintln!(
+                "skipped: running with permission bits unenforced (root), \
+                 the chmod-000 sysfs directory fault is unreachable"
+            );
+            return;
+        }
+
+        // Every required field is present and non-zero, so an Ok would be the
+        // only way this test could pass by fabrication: the failure has to come
+        // from the unreadable file, not from a missing seed.
+        let t = seeded![
+            ("pages_shared", "100"),
+            ("pages_sharing", "200"),
+            ("pages_unshared", "50"),
+            ("pages_volatile", "10"),
+            ("pages_scanned", "9999"),
+            ("pages_skipped", "5"),
+            ("full_scans", "42"),
+            ("general_profit", "123456"),
+        ];
+        set_mode(t.dir.path(), 0o000);
+        let result = t.ctrl.read_stats();
+        set_mode(t.dir.path(), 0o755);
+
+        let err = result.expect_err(
+            "read_stats over a chmod-000 sysfs directory must fail, \
+             never hand back a KsmStats struct full of zeros",
+        );
+        // The error names the exact file that could not be read.
+        let expected = path_in(t.dir.path(), "pages_shared");
+        assert!(
+            matches!(err, TunedError::Sysfs { .. }),
+            "expected a Sysfs error, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(&expected),
+            "error must name the unreadable file: {err} does not contain {expected}"
+        );
+
+        // And the whole struct is unreachable — the first required read alone
+        // is enough to abort, so nothing downstream is fabricated.
+        assert!(
+            err.to_string().contains("pages_shared"),
+            "error must name the failing parameter: {err}"
+        );
+    }
+
+    #[test]
+    fn fault_read_stats_deleted_base_directory_errors_naming_the_missing_file() {
+        // EPERM-independent: ENOENT happens under root too. This is the
+        // root-proof equivalent of the unreadable-directory fault above.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gone = dir.path().to_path_buf();
+        dir.close().unwrap();
+        assert!(!gone.exists(), "precondition: base path must be gone");
+
+        let ctrl = controller_at(&gone);
+        let err = ctrl
+            .read_stats()
+            .expect_err("read_stats over a deleted sysfs directory must fail");
+
+        assert!(
+            matches!(err, TunedError::Sysfs { .. }),
+            "expected a Sysfs error, got {err:?}"
+        );
+        let missing = gone.join("pages_shared").display().to_string();
+        assert!(
+            err.to_string().contains(&missing),
+            "error must name the missing file {missing}: {err}"
+        );
+        // The failing read is the FIRST required field, so a Default-filled
+        // struct is impossible: every one of the 11 reads would have to have
+        // been mutated away for this to be Ok.
+        assert!(
+            err.to_string().contains("os error 2") || err.to_string().contains("No such file"),
+            "deleted directory must surface as NotFound, got: {err}"
+        );
+    }
+
+    // ── (b) individual required file missing ───────────────────────────
+
+    #[test]
+    fn fault_read_stats_missing_required_file_errors_naming_that_file() {
+        // Seven of the eight required stats files exist (and the optional
+        // three too); `full_scans` is the hole.
+        let mut seeds: Vec<(&str, &str)> = vec![
+            ("pages_shared", "100"),
+            ("pages_sharing", "200"),
+            ("pages_unshared", "50"),
+            ("pages_volatile", "10"),
+            ("pages_scanned", "9999"),
+            ("pages_skipped", "5"),
+            ("general_profit", "123456"),
+            ("ksm_zero_pages", "7"),
+            ("stable_node_chains", "3"),
+            ("stable_node_dups", "1"),
+        ];
+        seeds.retain(|(name, _)| *name != "full_scans");
+        let t = TempKsm::with_seeded(seeds);
+
+        let err = t
+            .ctrl
+            .read_stats()
+            .expect_err("a missing required stats file must fail the whole read");
+
+        assert!(
+            matches!(err, TunedError::Sysfs { .. }),
+            "expected a Sysfs error, got {err:?}"
+        );
+        let expected = path_in(t.dir.path(), "full_scans");
+        assert!(
+            err.to_string().contains(&expected),
+            "error must name the missing file {expected}: {err}"
+        );
+    }
+
+    #[test]
+    fn fault_read_stats_missing_required_file_leaves_nothing_for_other_fields() {
+        // Same hole, different angle: the Err must not be a per-field
+        // defaulting decision that could be "fixed later" — every other
+        // required file must still be a read that can fail, so the same
+        // mutation on any single field is caught.
+        let names = REQUIRED_STATS;
+        for missing in names {
+            let mut seeds: Vec<(&str, &str)> = vec![
+                ("pages_shared", "100"),
+                ("pages_sharing", "200"),
+                ("pages_unshared", "50"),
+                ("pages_volatile", "10"),
+                ("pages_scanned", "9999"),
+                ("pages_skipped", "5"),
+                ("full_scans", "42"),
+                ("general_profit", "123456"),
+            ];
+            seeds.retain(|(name, _)| *name != missing);
+            let t = TempKsm::with_seeded(seeds);
+            let err = t.ctrl.read_stats().expect_err("missing required file");
+            let expected = t.dir.path().join(missing).display().to_string();
+            assert!(
+                err.to_string().contains(&expected),
+                "removing {missing} must produce an error naming it: {err}"
+            );
+        }
+    }
+
+    // ── (c) garbage in a required file ─────────────────────────────────
+
+    #[test]
+    fn fault_read_u64_garbage_values_error_and_name_the_file() {
+        for garbage in ["abc", "", "-1", "12x", "[none] scan-time"] {
+            let t = seeded![("pages_shared", garbage)];
+            let err = t
+                .ctrl
+                .read_u64("pages_shared")
+                .expect_err(&format!("read_u64({garbage:?}) must fail"));
+            let expected = path_in(t.dir.path(), "pages_shared");
+            assert!(
+                err.to_string().contains(&expected),
+                "error for {garbage:?} must name the file {expected}: {err}"
+            );
+            assert!(
+                err.to_string()
+                    .contains(&format!("cannot parse '{garbage}' as u64")),
+                "error for {garbage:?} must report the unparsable content: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn fault_read_stats_garbage_required_field_errors_naming_that_field() {
+        // All ten other files hold good values; only `general_profit` is
+        // garbage, so the only way to Ok is to default it to zero.
+        let t = seeded![
+            ("pages_shared", "100"),
+            ("pages_sharing", "200"),
+            ("pages_unshared", "50"),
+            ("pages_volatile", "10"),
+            ("pages_scanned", "9999"),
+            ("pages_skipped", "5"),
+            ("full_scans", "42"),
+            ("general_profit", "abc"),
+            ("ksm_zero_pages", "7"),
+            ("stable_node_chains", "3"),
+            ("stable_node_dups", "1"),
+        ];
+        let err = t
+            .ctrl
+            .read_stats()
+            .expect_err("garbage in a required stats file must fail the whole read");
+        let expected = path_in(t.dir.path(), "general_profit");
+        assert!(
+            err.to_string().contains(&expected),
+            "error must name the garbage file {expected}: {err}"
+        );
+        assert!(
+            err.to_string().contains("cannot parse 'abc' as i64"),
+            "error must report the unparsable content: {err}"
+        );
+    }
+
+    #[test]
+    fn fault_read_i64_garbage_values_error_and_name_the_file() {
+        for garbage in ["abc", "", "1.5", "0x10"] {
+            let t = seeded![("general_profit", garbage)];
+            let err = t.ctrl.read_i64("general_profit").expect_err(&format!(
+                "read_i64({garbage:?}) must fail, never fall back to 0"
+            ));
+            let expected = path_in(t.dir.path(), "general_profit");
+            assert!(
+                err.to_string().contains(&expected),
+                "error for {garbage:?} must name the file {expected}: {err}"
+            );
+            assert!(
+                err.to_string()
+                    .contains(&format!("cannot parse '{garbage}' as i64")),
+                "error for {garbage:?} must report the unparsable content: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn fault_garbage_knob_file_blocks_only_the_read_path() {
+        // A knob file holding garbage is a READ failure, but it must not stop
+        // the WRITE path: `set_run` overwrites the file, so the operator's
+        // recovery write still lands with valid content.
+        let t = seeded![("run", "abc")];
+
+        let err = t
+            .ctrl
+            .read_u64("run")
+            .expect_err("garbage 'run' must not parse");
+        assert!(
+            err.to_string().contains("cannot parse 'abc' as u64"),
+            "read error must name the garbage: {err}"
+        );
+
+        t.ctrl.set_run(1).unwrap();
+        assert_eq!(
+            t.read("run"),
+            "1",
+            "the write path must replace garbage with the clamped value"
+        );
+        // And the replacement is genuinely readable now.
+        assert_eq!(t.ctrl.read_u64("run").unwrap(), 1);
+    }
+
+    // ── (d) write failure ──────────────────────────────────────────────
+
+    #[test]
+    fn fault_write_param_to_read_only_file_errors_naming_the_path() {
+        if !permission_bits_are_enforced() {
+            eprintln!(
+                "skipped: running with permission bits unenforced (root), \
+                 a chmod-444 knob file is still writable"
+            );
+            return;
+        }
+        let t = seeded![("run", "0")];
+        let knob = t.dir.path().join("run");
+        set_mode(&knob, 0o444);
+
+        let err = t
+            .ctrl
+            .write_param("run", "1")
+            .expect_err("writing to a read-only knob file must fail");
+        let expected = knob.display().to_string();
+        assert!(
+            matches!(err, TunedError::Sysfs { .. }),
+            "expected a Sysfs error, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(&expected),
+            "error must name the unwritable path {expected}: {err}"
+        );
+        // The refused write must not be reported as success: the file still
+        // holds its old value, which is what makes the write failure visible.
+        set_mode(&knob, 0o644);
+        assert_eq!(t.read("run"), "0", "no value may be written on failure");
+    }
+
+    #[test]
+    fn fault_set_run_to_read_only_file_errors_naming_the_path() {
+        if !permission_bits_are_enforced() {
+            eprintln!("skipped: permission bits unenforced (root)");
+            return;
+        }
+        let t = seeded![("pages_to_scan", "100"), ("run", "0")];
+        let knob = t.dir.path().join("run");
+        set_mode(&knob, 0o444);
+
+        let err = t
+            .ctrl
+            .set_run(1)
+            .expect_err("set_run on a read-only knob file must fail");
+        let expected = knob.display().to_string();
+        assert!(
+            err.to_string().contains(&expected),
+            "error must name the unwritable path {expected}: {err}"
+        );
+        set_mode(&knob, 0o644);
+        assert_eq!(t.read("run"), "0");
+    }
+
+    #[test]
+    fn fault_write_new_param_to_read_only_directory_errors_naming_the_path() {
+        if !permission_bits_are_enforced() {
+            eprintln!("skipped: permission bits unenforced (root)");
+            return;
+        }
+        // A parameter that does not exist yet: creating it needs write
+        // permission on the directory itself.
+        let t = seeded![];
+        set_mode(t.dir.path(), 0o555);
+
+        let err = t
+            .ctrl
+            .write_param("future_knob", "1")
+            .expect_err("creating a new entry in a read-only directory must fail");
+        let expected = path_in(t.dir.path(), "future_knob");
+        assert!(
+            matches!(err, TunedError::Sysfs { .. }),
+            "expected a Sysfs error, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(&expected),
+            "error must name the path {expected}: {err}"
+        );
+        set_mode(t.dir.path(), 0o755);
+        assert!(
+            !t.dir.path().join("future_knob").exists(),
+            "a failed write must not leave a file behind"
+        );
+    }
+
+    #[test]
+    fn fault_write_param_to_deleted_directory_errors_naming_the_path() {
+        // EPERM-independent, so it exercises the write-failure arm under root.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gone = dir.path().to_path_buf();
+        dir.close().unwrap();
+
+        let ctrl = controller_at(&gone);
+        let err = ctrl
+            .write_param("pages_to_scan", "100")
+            .expect_err("writing into a deleted directory must fail");
+        let expected = gone.join("pages_to_scan").display().to_string();
+        assert!(
+            matches!(err, TunedError::Sysfs { .. }),
+            "expected a Sysfs error, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(&expected),
+            "error must name the path {expected}: {err}"
+        );
+    }
+
+    #[test]
+    fn fault_set_pages_to_scan_to_deleted_directory_errors_naming_the_path() {
+        // Same universal failure through the validated setter, so the clamp
+        // arithmetic cannot swallow the write error either.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let gone = dir.path().to_path_buf();
+        dir.close().unwrap();
+
+        let ctrl = controller_at(&gone);
+        let err = ctrl
+            .set_pages_to_scan(500)
+            .expect_err("set_pages_to_scan into a deleted directory must fail");
+        let expected = gone.join("pages_to_scan").display().to_string();
+        assert!(
+            err.to_string().contains(&expected),
+            "error must name the path {expected}: {err}"
+        );
+        assert_eq!(ctrl.clamp_value("pages_to_scan", 500), 500);
+    }
+
+    // ── (e) corrupt snapshot at restore time ───────────────────────────
+
+    #[test]
+    fn fault_restore_truncated_snapshot_errors_and_writes_nothing() {
+        let t = seeded![
+            ("run", "1"),
+            ("pages_to_scan", "100"),
+            ("sleep_millisecs", "5000"),
+            ("max_page_sharing", "4096"),
+            ("advisor_mode", "scan-time"),
+            ("advisor_target_scan_time", "10"),
+            ("advisor_max_cpu", "10"),
+        ];
+        let state_dir = t.dir.path().join("state");
+        write_raw_snapshot(&state_dir, "{\"config\":{");
+
+        let mut ctrl = controller_at(t.dir.path());
+        let err = ctrl
+            .restore(&state_dir)
+            .expect_err("truncated snapshot JSON must abort restore");
+
+        assert!(
+            err.to_string().contains("snapshot"),
+            "the error must identify the snapshot: {err}"
+        );
+        // No partial write: every sysfs file keeps its pre-restore value.
+        assert_eq!(t.read("run"), "1");
+        assert_eq!(t.read("pages_to_scan"), "100");
+        assert_eq!(t.read("sleep_millisecs"), "5000");
+        assert_eq!(t.read("max_page_sharing"), "4096");
+        assert_eq!(t.read("advisor_mode"), "scan-time");
+        assert_eq!(t.read("advisor_target_scan_time"), "10");
+        assert_eq!(t.read("advisor_max_cpu"), "10");
+    }
+
+    #[test]
+    fn fault_restore_empty_snapshot_file_errors_and_writes_nothing() {
+        let t = seeded![
+            ("run", "1"),
+            ("pages_to_scan", "100"),
+            ("sleep_millisecs", "5000"),
+            ("max_page_sharing", "4096"),
+            ("advisor_mode", "scan-time"),
+            ("advisor_target_scan_time", "10"),
+            ("advisor_max_cpu", "10"),
+        ];
+        let state_dir = t.dir.path().join("state");
+        write_raw_snapshot(&state_dir, "");
+
+        let mut ctrl = controller_at(t.dir.path());
+        let err = ctrl
+            .restore(&state_dir)
+            .expect_err("an empty snapshot file must abort restore");
+
+        assert!(
+            err.to_string().contains("snapshot"),
+            "the error must identify the snapshot: {err}"
+        );
+        assert_eq!(t.read("run"), "1");
+        assert_eq!(t.read("pages_to_scan"), "100");
+        assert_eq!(t.read("advisor_mode"), "scan-time");
+    }
+
+    #[test]
+    fn fault_restore_unterminated_snapshot_errors_and_writes_nothing() {
+        // Valid prefix, no closing brace: this is the shape a crash mid-write
+        // leaves behind if the atomic rename is ever bypassed.
+        let t = seeded![
+            ("run", "1"),
+            ("pages_to_scan", "100"),
+            ("sleep_millisecs", "5000"),
+            ("max_page_sharing", "4096"),
+            ("advisor_mode", "scan-time"),
+            ("advisor_target_scan_time", "10"),
+            ("advisor_max_cu", "10"),
+            ("advisor_max_cpu", "10"),
+        ];
+        let state_dir = t.dir.path().join("state");
+        write_raw_snapshot(&state_dir, "{\"config\":{\"run\":1");
+
+        let mut ctrl = controller_at(t.dir.path());
+        let err = ctrl
+            .restore(&state_dir)
+            .expect_err("an unterminated snapshot must abort restore");
+
+        assert!(
+            err.to_string().contains("snapshot"),
+            "the error must identify the snapshot: {err}"
+        );
+        assert_eq!(t.read("run"), "1");
+        assert_eq!(t.read("pages_to_scan"), "100");
+        assert_eq!(t.read("advisor_mode"), "scan-time");
+    }
+
+    #[test]
+    fn fault_restore_unreadable_snapshot_file_errors_and_writes_nothing() {
+        if !permission_bits_are_enforced() {
+            eprintln!("skipped: permission bits unenforced (root)");
+            return;
+        }
+        let t = seeded![
+            ("run", "1"),
+            ("pages_to_scan", "100"),
+            ("advisor_mode", "scan-time"),
+        ];
+        let state_dir = t.dir.path().join("state");
+        write_raw_snapshot(&state_dir, VALID_SNAPSHOT_JSON);
+        set_mode(&state_dir.join(SNAPSHOT_FILENAME), 0o000);
+
+        let mut ctrl = controller_at(t.dir.path());
+        let result = ctrl.restore(&state_dir);
+        set_mode(&state_dir.join(SNAPSHOT_FILENAME), 0o644);
+
+        // An unreadable snapshot surfaces as an I/O error, NOT as a Snapshot
+        // error, and it must still be an Err: nothing is written on a restore
+        // that cannot even read its own state.
+        let err = result.expect_err("an unreadable snapshot must abort restore");
+        assert!(
+            matches!(err, TunedError::Io(_)),
+            "expected an I/O error, got {err:?}"
+        );
+        assert_eq!(t.read("run"), "1");
+        assert_eq!(t.read("pages_to_scan"), "100");
+        assert_eq!(t.read("advisor_mode"), "scan-time");
+    }
+
+    // ── (f) snapshot from a different kernel version ───────────────────
+
+    #[test]
+    fn fault_restore_ignores_unknown_snapshot_parameter() {
+        // A snapshot taken on a kernel with an extra tunable: `future_knob` is
+        // unknown to this build. `KsmConfig` is `#[serde(default)]` over a
+        // FIXED field set, so the unknown key must be dropped by serde rather
+        // than written into sysfs.
+        let t = seeded![
+            ("run", "0"),
+            ("pages_to_scan", "100"),
+            ("sleep_millisecs", "5000"),
+            ("max_page_sharing", "4096"),
+            ("advisor_mode", "scan-time"),
+            ("advisor_target_scan_time", "10"),
+            ("advisor_max_cpu", "10"),
+            ("advisor_min_pages_to_scan", "5000"),
+            ("advisor_max_pages_to_scan", "1000"),
+        ];
+        let state_dir = t.dir.path().join("state");
+
+        let snapshot = serde_json::json!({
+            "config": {
+                "run": 1,
+                "pages_to_scan": 700,
+                "sleep_millisecs": 11,
+                "max_page_sharing": 2048,
+                "smart_scan": 1,
+                "advisor_mode": "none",
+                "advisor_target_scan_time": 250,
+                "advisor_max_cpu": 90,
+                "advisor_min_pages_to_scan": 400,
+                "advisor_max_pages_to_scan": 9000,
+                "future_knob": 42
+            },
+            "timestamp": "2026-10-15T00:00:00Z"
+        });
+        write_raw_snapshot(&state_dir, &snapshot.to_string());
+
+        let mut ctrl = controller_at(t.dir.path());
+        ctrl.restore(&state_dir)
+            .expect("an unknown snapshot key must not fail the restore");
+
+        // The unknown key never reaches sysfs.
+        assert!(
+            !t.dir.path().join("future_knob").exists(),
+            "unknown parameter must never be written to sysfs"
+        );
+        let entries: Vec<String> = std::fs::read_dir(t.dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            !entries.iter().any(|n| n.contains("future_knob")),
+            "no sysfs entry may be created for an unknown parameter: {entries:?}"
+        );
+
+        // Every KNOWN parameter restore is documented to write, restored.
+        assert_eq!(t.ctrl.read_u64("run").unwrap(), 1);
+        assert_eq!(t.ctrl.read_u64("pages_to_scan").unwrap(), 700);
+        assert_eq!(t.ctrl.read_u64("sleep_millisecs").unwrap(), 11);
+        assert_eq!(t.ctrl.read_u64("max_page_sharing").unwrap(), 2048);
+        assert_eq!(t.ctrl.read_string("advisor_mode").unwrap(), "none");
+        assert_eq!(t.ctrl.read_u64("advisor_target_scan_time").unwrap(), 250);
+        assert_eq!(t.ctrl.read_u64("advisor_max_cpu").unwrap(), 90);
+        // The two advisor page bounds are not written by restore, so they keep
+        // the seeded kernel values — which proves the unknown key did not
+        // silently widen the restore's parameter set.
+        assert_eq!(t.read("advisor_min_pages_to_scan"), "5000");
+        assert_eq!(t.read("advisor_max_pages_to_scan"), "1000");
+    }
+
+    #[test]
+    fn fault_restore_aborts_on_first_failing_write_and_leaves_partial_state_visible() {
+        // A snapshot whose `run` cannot be written (the sysfs entry is
+        // missing, so the create fails with ENOENT) must ABORT restore with
+        // an Err that names the path — not silently continue and leave the
+        // operator believing the kernel still holds the old configuration.
+        // This is the write-path twin of the corrupt-JSON tests: the abort
+        // has to come from the write decision, not from a parse.
+        let t = seeded![
+            ("pages_to_scan", "100"),
+            ("sleep_millisecs", "5000"),
+            ("max_page_sharing", "4096"),
+            ("advisor_mode", "none"),
+            ("advisor_target_scan_time", "10"),
+            ("advisor_max_cpu", "10"),
+        ];
+        let state_dir = t.dir.path().join("state");
+
+        let snapshot = serde_json::json!({
+            "config": {
+                "run": 1,
+                "pages_to_scan": 700,
+                "sleep_millisecs": 11,
+                "max_page_sharing": 2048,
+                "smart_scan": 1,
+                "advisor_mode": "none",
+                "advisor_target_scan_time": 250,
+                "advisor_max_cpu": 90,
+                "advisor_min_pages_to_scan": 400,
+                "advisor_max_pages_to_scan": 9000
+            },
+            "timestamp": "2026-10-15T00:00:00Z"
+        });
+        write_raw_snapshot(&state_dir, &snapshot.to_string());
+
+        // Without write access to the directory, the very first restore write
+        // (`run`) cannot be created; every later parameter would fail too, so
+        // the abort point is what is under test.
+        if !permission_bits_are_enforced() {
+            eprintln!(
+                "skipped: permission bits unenforced (root), \
+                 the read-only-directory fault is unreachable"
+            );
+            return;
+        }
+        set_mode(t.dir.path(), 0o555);
+
+        let mut ctrl = controller_at(t.dir.path());
+        let result = ctrl.restore(&state_dir);
+        set_mode(t.dir.path(), 0o755);
+
+        let err = result.expect_err("a restore whose first write fails must abort");
+        let expected = path_in(t.dir.path(), "run");
+        assert!(
+            err.to_string().contains(&expected),
+            "the abort must name the parameter it could not write: {err}"
+        );
+
+        // The abort is real, not a partial success dressed up as an error:
+        // the parameters that would have been written are still at their
+        // pre-restore values.
+        assert_eq!(
+            t.read("pages_to_scan"),
+            "100",
+            "no later parameter may be written after the abort"
+        );
+        assert_eq!(t.read("sleep_millisecs"), "5000");
+        assert_eq!(t.read("max_page_sharing"), "4096");
+    }
+
+    // ── (g) PARAM_RANGES clamping on restore ───────────────────────────
+    #[test]
+    fn fault_restore_clamps_out_of_range_snapshot_values() {
+        let t = seeded![
+            ("run", "0"),
+            ("pages_to_scan", "100"),
+            ("sleep_millisecs", "20"),
+            ("max_page_sharing", "256"),
+            ("advisor_mode", "none"),
+            ("advisor_target_scan_time", "200"),
+            ("advisor_max_cpu", "70"),
+        ];
+        let state_dir = t.dir.path().join("state");
+
+        let snapshot = serde_json::json!({
+            "config": {
+                "run": 9,
+                "pages_to_scan": 10_000_000,
+                "sleep_millisecs": 999_999,
+                "max_page_sharing": 999_999,
+                "smart_scan": 1,
+                "advisor_mode": "none",
+                "advisor_target_scan_time": 999_999,
+                "advisor_max_cpu": 250,
+                "advisor_min_pages_to_scan": 1,
+                "advisor_max_pages_to_scan": 10_000_000
+            },
+            "timestamp": "2026-10-15T00:00:00Z"
+        });
+        write_raw_snapshot(&state_dir, &snapshot.to_string());
+
+        let mut ctrl = controller_at(t.dir.path());
+        ctrl.restore(&state_dir).unwrap();
+
+        // The requested values must NOT land; the PARAM_RANGES ceilings do.
+        assert_eq!(t.read("pages_to_scan"), "30000");
+        assert_eq!(t.read("sleep_millisecs"), "10000");
+        assert_eq!(t.read("max_page_sharing"), "4096");
+        assert_eq!(t.read("run"), "2");
+        assert_eq!(t.read("advisor_target_scan_time"), "3600");
+        assert_eq!(t.read("advisor_max_cpu"), "100");
+        // And the clamped values are read back as numbers, not raw clobber.
+        assert_eq!(t.ctrl.read_u64("pages_to_scan").unwrap(), 30000);
+        assert_ne!(t.ctrl.read_u64("pages_to_scan").unwrap(), 10_000_000);
+    }
 }

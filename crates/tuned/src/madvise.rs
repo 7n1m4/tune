@@ -240,7 +240,7 @@ pub fn unmerge_executable_vmas(pid: u32, dry_run: bool) -> (usize, usize) {
         }
     };
 
-    let exec_vmas: Vec<&MapsEntry> = maps.iter().filter(|e| e.has_exec()).collect();
+    let exec_vmas: Vec<&MapsEntry> = maps.iter().filter(|m| m.has_exec()).collect();
     if exec_vmas.is_empty() {
         return (0, 0);
     }
@@ -1219,6 +1219,522 @@ mod tests {
         assert_eq!(result.processes_marked, 0);
         assert_eq!(result.exec_vmas_protected, 0);
         assert_eq!(result.exec_vmas_failed, 0);
+    }
+
+    // ── fault injection: where the kernel/proc boundary FAILS ────────────
+    //
+    // Everything above drives the guard through targets that exist, are
+    // readable, and behave. That is the half of the contract that was never
+    // the problem. The SIGILL incident went undiagnosed because the *other*
+    // half — the target whose maps cannot be read, the target that vanishes
+    // between the attach and the inject, the entry whose range is nonsense —
+    // was never executed at all, so the guard's behaviour there was code, not
+    // verified behaviour.
+    //
+    // Every target below is a `/usr/bin/sleep` child of this test process,
+    // reaped on every exit path. Nothing outside this process's own children
+    // is attached to, and no knob outside this process is written.
+
+    /// A `sleep` child that is safe to inject into and to kill.
+    ///
+    /// Its mappings are frozen once the loader finishes, so an injected
+    /// `prctl` cannot race a remap the way it would on a process still
+    /// building its address space.
+    fn spawn_sleep_target() -> std::process::Child {
+        std::process::Command::new("/usr/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawning a sleep target must work")
+    }
+
+    /// Block until `/proc/<pid>/stat`'s state field is `Z` (zombie).
+    ///
+    /// The state is the third whitespace-separated field *after* the closing
+    /// parenthesis of `(comm)`. Splitting on the **last** `)` keeps that
+    /// correct even for a comm that itself contains a parenthesis.
+    ///
+    /// Returns whether the state was observed; a `false` return means the
+    /// budget ran out, which callers must treat as "zombie not confirmed"
+    /// rather than "zombie".
+    fn wait_for_zombie_state(pid: u32) -> bool {
+        for _ in 0..250 {
+            let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(')')
+                        .and_then(|(_, rest)| rest.trim_start().chars().next())
+                });
+            if state == Some('Z') {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// The prctl option number for `PR_SET_DUMPABLE`.
+    ///
+    /// Spelled as a literal rather than `libc::PR_SET_DUMPABLE` because that
+    /// constant is not exported by the `libc` crate on every supported
+    /// target; the value is fixed in `linux/prctl.h`. Typed as `c_ulong` to
+    /// match `inject_syscall`'s first argument, which is passed straight into
+    /// the target's `rdi`.
+    #[allow(clippy::cast_possible_truncation)]
+    const PR_SET_DUMPABLE: libc::c_ulong = 4;
+
+    /// Fault (a): the ptrace attach is refused, and the refusal must reach
+    /// the caller as a refusal instead of being swallowed into a success.
+    ///
+    /// The refusal is *injected*, not hoped for. A child of this test process
+    /// is a legal ptrace target under Yama `ptrace_scope = 1`, so the first
+    /// injection — `prctl(PR_SET_DUMPABLE, 0)` — succeeds, and its whole
+    /// effect is to make the child non-dumpable. From that moment the same
+    /// child refuses a second attach and denies `/proc/<pid>/maps`, which is
+    /// exactly the fault this test exists to pin: the daemon marks a process
+    /// whose code it then cannot protect.
+    ///
+    /// Two determinism notes. The refusal is built by an attach that is known
+    /// to be permitted, so the fault is not dependent on any privilege the
+    /// test process happens to hold. And the outcome is checked against what
+    /// the kernel actually allowed rather than assumed: under an unprivileged
+    /// tracer a non-dumpable descendant's maps is denied, so the contract
+    /// under test applies. Under `CAP_SYS_PTRACE` the denial does not occur —
+    /// the capability outranks the flag — so this fault cannot be produced on
+    /// such a host, and the test says so instead of asserting a weaker truth
+    /// it can actually observe. That is the same discipline as the
+    /// `cat_ptrace_scope() > 1` gate used by the real-injection test above.
+    #[test]
+    fn test_nondumpable_child_refused_ptrace_is_reported_not_swallowed() {
+        if cat_ptrace_scope() > 1 {
+            return;
+        }
+
+        let mut child = spawn_sleep_target();
+        let pid = child.id();
+
+        let Some(exec_vmas) = stable_exec_vmas_of(pid) else {
+            reap(&mut child);
+            return;
+        };
+        assert!(exec_vmas > 0, "a running process has executable mappings");
+
+        // Inject the fault. This attach is legal (own child), and its only
+        // effect is to clear the child's dumpable flag.
+        if inject_syscall(pid, SYS_PRCTL, PR_SET_DUMPABLE, 0, 0, 0, 0, 0).is_err() {
+            // A host whose injector cannot reach the child cannot build this
+            // fault at all; the absent-PID test already covers the Err arm.
+            reap(&mut child);
+            return;
+        }
+
+        // Grounding: the fault really landed. The maps that was readable
+        // moments ago (exec_vmas > 0 came from it) is now denied. Without
+        // this check the assertions below would be asserting against a
+        // perfectly healthy target and would pass either way.
+        let maps_after = tuned_common::procfs::read_process_maps(pid);
+        if maps_after.is_ok() {
+            // CAP_SYS_PTRACE tracer: a non-dumpable descendant is still
+            // readable and still attachable, so this refusal does not exist
+            // on this host. Refuse to assert a weaker truth.
+            reap(&mut child);
+            return;
+        }
+        let denial = maps_after.unwrap_err().to_string();
+        assert!(
+            denial.contains("Permission denied"),
+            "the injected non-dumpable flag must deny maps, got: {denial}"
+        );
+
+        // The guard: an unreadable target is not a target with a broken
+        // guard, so it reports nothing to do — not a withdrawal, and not a
+        // failure count that would read as "protected and failed".
+        let (withdrawn, failed) = unmerge_executable_vmas(pid, false);
+        assert_eq!(
+            (withdrawn, failed),
+            (0, 0),
+            "unreadable maps must report nothing to do, not a mismatch"
+        );
+
+        // The marking path: the prctl attach is refused by the same flag, so
+        // nothing was marked and the refusal is reported. A swallowed refusal
+        // here is the incident: a marked, unprotected process.
+        let result = enable_merge_any(pid, false);
+        assert_eq!(result.processes_marked, 0, "a refused attach marks nothing");
+        assert!(result.error.is_some(), "the refusal must be reported");
+        assert_eq!(result.exec_vmas_protected, 0);
+        assert_eq!(result.exec_vmas_failed, 0);
+
+        reap(&mut child);
+    }
+
+    /// Fault (a), continued: the invariant that must hold on *every* host,
+    /// including one where the injected refusal does not bite.
+    ///
+    /// The outcome of the attach is not the guard's to choose — a privileged
+    /// tracer legitimately succeeds where an unprivileged one is refused. What
+    /// is the guard's choice is what it *reports*: a mark and an error must
+    /// never be claimed at the same time. That conjunction is the shape that
+    /// hides the incident, because "marked 1, error ESRCH" reads as success to
+    /// any consumer that only checks the count.
+    #[test]
+    fn test_nondumpable_child_never_reports_a_mark_it_did_not_earn() {
+        if cat_ptrace_scope() > 1 {
+            return;
+        }
+
+        let mut child = spawn_sleep_target();
+        let pid = child.id();
+
+        let Some(exec_vmas) = stable_exec_vmas_of(pid) else {
+            reap(&mut child);
+            return;
+        };
+
+        if inject_syscall(pid, SYS_PRCTL, PR_SET_DUMPABLE, 0, 0, 0, 0, 0).is_err() {
+            reap(&mut child);
+            return;
+        }
+
+        // Whichever branch the host takes, the report must be self-consistent.
+        // Unprivileged: attach refused → marked 0, error reported.
+        // Privileged: attach allowed → marked 1, no error, and the guard then
+        // had to account for every executable mapping it could see.
+        let maps_readable = tuned_common::procfs::read_process_maps(pid).is_ok();
+        let result = enable_merge_any(pid, false);
+        assert_eq!(
+            result.processes_marked > 0,
+            result.error.is_none(),
+            "a refusal must be reported, never swallowed into a mark: {result:?}"
+        );
+        assert_eq!(
+            result.exec_vmas_protected + result.exec_vmas_failed,
+            if maps_readable { exec_vmas } else { 0 },
+            "every executable VMA the guard could see must be accounted for"
+        );
+
+        reap(&mut child);
+    }
+
+    /// Fault (c-i): the target is alive and answerable, and its maps alone is
+    /// denied.
+    ///
+    /// The non-vacuity point is the comm/status check. An unreadable maps is
+    /// indistinguishable from a dead process at the `read_process_maps` level
+    /// — both are an `Err` — so a test that only saw the denial could be
+    /// passing because the child had already exited. Proving
+    /// `/proc/<pid>/comm` still answers proves the denial is specific to the
+    /// maps boundary and the process is alive throughout. What the daemon must
+    /// do with that is report nothing to do, which is the documented contract
+    /// — the same contract the SIGILL incident depends on, because an
+    /// unreadable target is one whose code cannot be protected either.
+    #[test]
+    fn test_nondumpable_target_maps_denial_is_maps_specific_and_reports_nothing_to_do() {
+        if cat_ptrace_scope() > 1 {
+            return;
+        }
+
+        let mut child = spawn_sleep_target();
+        let pid = child.id();
+
+        let Some(exec_vmas) = stable_exec_vmas_of(pid) else {
+            reap(&mut child);
+            return;
+        };
+        assert!(exec_vmas > 0, "a running process has executable mappings");
+
+        if inject_syscall(pid, SYS_PRCTL, PR_SET_DUMPABLE, 0, 0, 0, 0, 0).is_err() {
+            reap(&mut child);
+            return;
+        }
+
+        let maps = tuned_common::procfs::read_process_maps(pid);
+        if maps.is_ok() {
+            // Privileged tracer: the denial this test needs does not exist
+            // here, so there is nothing to assert without inventing it.
+            reap(&mut child);
+            return;
+        }
+
+        // The denial names the file it failed on, so an operator reading a log
+        // sees which target was skipped and why rather than a bare "cannot
+        // read maps".
+        let denial = maps.unwrap_err().to_string();
+        assert!(
+            denial.contains(&format!("/proc/{pid}/maps")),
+            "the error must name the maps file it failed on, got: {denial}"
+        );
+        assert!(
+            denial.contains("Permission denied"),
+            "the denial must be a permission error, got: {denial}"
+        );
+
+        // Non-vacuity: the process is alive and its identity is still
+        // readable. The denial is about the maps boundary, not a corpse.
+        assert_eq!(
+            tuned_common::procfs::read_process_comm(pid)
+                .expect("comm stays readable for a live target")
+                .as_str(),
+            "sleep",
+            "the target must still be identifiable while its maps is denied"
+        );
+
+        let (withdrawn, failed) = unmerge_executable_vmas(pid, false);
+        assert_eq!((withdrawn, failed), (0, 0));
+
+        reap(&mut child);
+    }
+
+    /// Fault (b): the target disappears between the decision to act on it and
+    /// the act.
+    ///
+    /// The daemon's scanner enumerates processes, then injects. Any process in
+    /// that window may exit, and a PID is not a handle — it is a name that the
+    /// kernel is free to hand to something else. So the guard is called here
+    /// with a child that has already been killed *and waited for*: the PID is
+    /// valid-looking and gone. What must not happen is a panic, and what must
+    /// happen is a reported absence.
+    #[test]
+    fn test_reaped_child_reports_absence_not_success() {
+        let mut child = spawn_sleep_target();
+        let pid = child.id();
+
+        // Let the child reach a settled state first, so the disappearance is
+        // the only thing being tested rather than a mid-loader race.
+        assert!(stable_exec_vmas_of(pid).unwrap_or(0) > 0);
+
+        // Kill and reap before calling anything: the PID is now free.
+        child.kill().expect("killing the child must work");
+        child.wait().expect("reaping the child must work");
+
+        let result = enable_merge_any(pid, false);
+        assert_eq!(result.pid, pid);
+        assert!(
+            result.error.is_some(),
+            "a vanished target must report an error, not success"
+        );
+        assert_eq!(
+            result.processes_marked, 0,
+            "a vanished target is not marked"
+        );
+        assert_eq!(result.exec_vmas_protected, 0);
+        assert_eq!(result.exec_vmas_failed, 0);
+
+        let (withdrawn, failed) = unmerge_executable_vmas(pid, false);
+        assert_eq!(
+            (withdrawn, failed),
+            (0, 0),
+            "a vanished target's maps is unreadable, so nothing to do"
+        );
+    }
+
+    /// Fault (b), the PIDs that were never processes at all.
+    ///
+    /// This is the cheapest form of the same boundary: nothing can be attached
+    /// to. `u32::MAX` is included for the reason the assignment called out —
+    /// the pid_t cast makes it `Pid::from_raw(-1)`, so it exercises the
+    /// negative-PID shape rather than merely a large one. `0x7FFF_FFFF` is a
+    /// realistic absent PID: it is above any host's `pid_max`, so it can never
+    /// be a live process, yet it is small enough to be one on a careless host.
+    #[test]
+    fn test_absent_pids_report_the_refusal_not_a_success() {
+        for absent in [0x7FFF_FFFF_u32, 0xFFFF_FFFE, u32::MAX] {
+            let result = enable_merge_any(absent, false);
+            assert_eq!(result.pid, absent);
+            assert!(
+                result.error.is_some(),
+                "pid {absent} must report an error, got {result:?}"
+            );
+            assert_eq!(
+                result.processes_marked, 0,
+                "pid {absent} must not be reported as marked"
+            );
+            assert_eq!(result.exec_vmas_protected, 0);
+            assert_eq!(result.exec_vmas_failed, 0);
+
+            let (withdrawn, failed) = unmerge_executable_vmas(absent, false);
+            assert_eq!(
+                (withdrawn, failed),
+                (0, 0),
+                "pid {absent} has no maps, so nothing to do"
+            );
+        }
+    }
+
+    /// Faults (c-ii) and (e): the zombie.
+    ///
+    /// A killed-but-unreaped child is still in `/proc`, so every read the guard
+    /// performs *succeeds* — and then returns nothing. `/proc/<pid>/maps` for
+    /// a zombie opens and reads as zero bytes, which `read_process_maps` turns
+    /// into an `Ok` with an empty vector. That is the shape this test pins, and
+    /// it is the same shape as the SIGILL incident from the daemon's side: the
+    /// guard concludes "this process has no executable mappings", which is
+    /// indistinguishable from "there was nothing to protect here".
+    ///
+    /// The distinguishing signal is one level up, in `enable_merge_any`: the
+    /// attach is refused for a zombie, so the mark must be reported as failed.
+    /// A test that only looked at `unmerge_executable_vmas` would see `(0, 0)`
+    /// and pass, which is why the mark path is asserted here too.
+    #[test]
+    fn test_zombie_child_yields_empty_maps_and_is_reported_as_failed() {
+        let mut child = spawn_sleep_target();
+        let zpid = child.id();
+        assert!(stable_exec_vmas_of(zpid).unwrap_or(0) > 0);
+
+        // Exit without reaping, then wait for the kernel to report `Z`.
+        child.kill().expect("killing the child must work");
+        assert!(
+            wait_for_zombie_state(zpid),
+            "the child must reach zombie state before the assertions"
+        );
+
+        // Grounding: maps is Ok — not an error — and empty. If this ever turns
+        // into an Err the test below would still pass vacuously.
+        let maps = tuned_common::procfs::read_process_maps(zpid);
+        match &maps {
+            Ok(entries) => assert!(
+                entries.is_empty(),
+                "a zombie's maps must be empty, got {} entries",
+                entries.len()
+            ),
+            Err(e) => panic!("a zombie's maps is expected to read as empty, not to fail: {e}"),
+        }
+
+        // Nothing to do, and specifically not a mismatched report.
+        let (withdrawn, failed) = unmerge_executable_vmas(zpid, false);
+        assert_eq!((withdrawn, failed), (0, 0));
+
+        // The failure signal lives here, one level up.
+        let result = enable_merge_any(zpid, false);
+        assert!(
+            result.error.is_some(),
+            "a zombie cannot be attached to, so the refusal must be reported"
+        );
+        assert_eq!(result.processes_marked, 0, "a zombie is not marked");
+        assert_eq!(result.exec_vmas_protected, 0);
+        assert_eq!(result.exec_vmas_failed, 0);
+
+        reap(&mut child);
+    }
+
+    /// Fault (d): a malformed mapping whose end precedes its start.
+    ///
+    /// `unmerge_executable_vmas` computes each region's length with
+    /// `vma.end.saturating_sub(vma.start)`, and a reversed range therefore
+    /// yields `0` and is skipped by the `if len == 0 { continue; }` guard.
+    /// Neither branch can be reached from outside a process: a live kernel
+    /// never writes an `end <= start` line into `/proc/<pid>/maps`, and this
+    /// module has no seam to hand the guard a synthetic entry — unlike
+    /// `collapse_regions`, which takes its regions as an argument.
+    ///
+    /// So this pins the *arithmetic contract* the loop relies on, using the
+    /// exact expressions the production line uses, and states the consequence
+    /// explicitly: a reversed entry passes the `has_exec()` filter, reaches
+    /// the loop, computes `len == 0`, and is skipped. The mutation that would
+    /// replace `continue` with a withdrawal increment is therefore not
+    /// detectable by any test on this host — there is no live VMA for it to
+    /// fire on — and is recorded as such rather than papered over.
+    #[test]
+    fn test_reversed_range_exec_vma_is_not_counted_as_withdrawable() {
+        // The malformed entry: executable, so it survives the filter the guard
+        // applies, and malformed, so its length is not a length.
+        let reversed = MapsEntry {
+            start: 0x9000,
+            end: 0x1000,
+            perms: "r-xp".into(),
+            offset: 0,
+            dev: "00:00".into(),
+            inode: 0,
+            pathname: String::new(),
+        };
+        assert!(
+            reversed.has_exec(),
+            "the malformed entry must reach the loop, or the test proves nothing"
+        );
+
+        // The exact expression `unmerge_executable_vmas` computes per VMA.
+        assert_eq!(
+            reversed.end.saturating_sub(reversed.start),
+            0,
+            "a reversed range saturates to zero length"
+        );
+        // `saturating_sub` is load-bearing here: `MapsEntry::size()` is
+        // `end - start`, which on this entry would panic. That is why the
+        // guard does not use `size()` and must not start.
+        assert_eq!(0x9000u64.wrapping_sub(0x1000u64), 0x8000);
+
+        // Consequence in the loop's terms: `len == 0`, so the skip fires and
+        // the entry contributes neither a withdrawal nor a failure.
+        let len = reversed.end.saturating_sub(reversed.start);
+        assert_eq!(len, 0, "the entry enters the loop with a zero length");
+        let mut withdrawn = 0;
+        let mut failed = 0;
+        if len == 0 {
+            // The production `continue`: no accounting either way.
+        } else {
+            withdrawn += 1;
+            failed += 1;
+        }
+        assert_eq!(
+            (withdrawn, failed),
+            (0, 0),
+            "a zero-length VMA must be skipped, not counted"
+        );
+
+        // And the real function must survive being driven while an entry of
+        // this shape exists in the world: no panic, no arithmetic underflow.
+        // The accounting contract is the additive one the production code
+        // maintains: every candidate is either withdrawn or failed, never
+        // counted twice and never lost.
+        let (withdrawn, failed) = unmerge_executable_vmas(std::process::id(), false);
+        let real_exec_vmas = std::fs::read_to_string("/proc/self/maps")
+            .map(|maps| maps.lines().filter(|l| l.contains("x")).count())
+            .unwrap_or(0);
+        assert!(
+            withdrawn + failed <= real_exec_vmas,
+            "accounting must not exceed the {real_exec_vmas} executable VMAs \
+             in the caller's own maps, got withdrawn={withdrawn} failed={failed}"
+        );
+    }
+
+    /// Fault (d), the live half: the accounting must stay total.
+    ///
+    /// `unmerge_executable_vmas` reaches the loop only after the exec filter,
+    /// and the filter is the one mutation that a live target *can* catch: a
+    /// filter that admits nothing produces `(0, 0)` for a process that has
+    /// executable mappings. This drives the real function against this test
+    /// binary's own maps and asserts every executable mapping it saw is
+    /// accounted for — as a withdrawal, or as a reported failure, never as
+    /// silence.
+    #[test]
+    fn test_exec_vma_accounting_stays_total_against_a_live_target() {
+        let pid = std::process::id();
+        let maps = tuned_common::procfs::read_process_maps(pid)
+            .expect("the test process's own maps must be readable");
+        let exec_in_maps = maps.iter().filter(|m| m.has_exec()).count();
+        assert!(
+            exec_in_maps > 0,
+            "premise: this process runs code, so it has executable mappings"
+        );
+
+        // Every executable VMA of a live process has a positive length, which
+        // is exactly why the `len == 0` skip is unreachable here.
+        let zero_length_exec = maps
+            .iter()
+            .filter(|m| m.has_exec())
+            .filter(|m| m.end.saturating_sub(m.start) == 0)
+            .count();
+        assert_eq!(
+            zero_length_exec, 0,
+            "premise for the (d) unobservability note: a live kernel never \
+             reports a zero-length executable VMA"
+        );
+
+        let (withdrawn, failed) = unmerge_executable_vmas(pid, false);
+        assert_eq!(
+            withdrawn + failed,
+            exec_in_maps,
+            "every executable VMA must be accounted for as withdrawn or failed"
+        );
     }
 
     fn reap(child: &mut std::process::Child) {

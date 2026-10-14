@@ -949,4 +949,406 @@ mod tests {
         let err = read_process_comm_from(dir.path(), 123).unwrap_err();
         assert!(err.to_string().contains("cannot read"));
     }
+
+    // ------------------------------------------------------------------
+    // Fault injection: /proc boundaries failing
+    //
+    // Every fixture below is a fake `/proc` under a tempdir, so the fault is
+    // produced for real rather than stubbed: a `/proc` that cannot be listed,
+    // a PID that disappeared between listing and reading, a status file that
+    // is truncated or whose fields are not numbers, and a maps file whose
+    // ranges are malformed.
+    // ------------------------------------------------------------------
+
+    /// A `/proc` that cannot be listed must be an error naming it, not an
+    /// empty PID set. An empty set would tell the scanner "there is nothing to
+    /// tune", which on a host with processes is a lie that stops the daemon.
+    #[test]
+    fn test_list_pids_from_on_a_non_directory_errors() {
+        // A file is not a readable directory: `ENOTDIR` for every uid, root
+        // included, so this fault is injectable without a privilege branch.
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_proc = dir.path().join("proc");
+        std::fs::write(&not_a_proc, "1\n2\n").unwrap();
+
+        let err = list_pids_from(&not_a_proc).expect_err("a file is not a /proc directory to list");
+        assert!(
+            err.to_string().contains("cannot read"),
+            "the error must carry the listing reason, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("proc"),
+            "the error must name the path, got: {err}"
+        );
+    }
+
+    /// Non-numeric entries are skipped, so a `/proc` carrying only foreign
+    /// directories yields exactly the numeric ones without erroring — the
+    /// survival case that keeps the loop moving.
+    #[test]
+    fn test_list_pids_from_skips_non_numeric_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["cpuinfo", "self", "thread-self", "irq", "1x"] {
+            std::fs::create_dir(dir.path().join(name)).unwrap();
+        }
+        for pid in ["1", "42"] {
+            proc_pid(dir.path(), pid.parse().unwrap());
+        }
+
+        let mut pids = list_pids_from(dir.path()).expect("a mixed /proc listing must succeed");
+        pids.sort_unstable();
+        assert_eq!(
+            pids,
+            vec![1, 42],
+            "only the numeric entries are PIDs, sorted"
+        );
+    }
+
+    /// A PID that disappears between listing and reading must be an error
+    /// naming the PID's path, which is what lets the scanner drop it.
+    #[test]
+    fn test_read_process_status_from_a_vanished_pid_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        proc_pid(dir.path(), 7);
+
+        let err = read_process_status_from(dir.path(), 7)
+            .expect_err("the process exited before its status was read");
+        assert!(
+            err.to_string().contains("7/status"),
+            "the error must point at the vanished PID's status file, got: {err}"
+        );
+    }
+
+    /// A status file that is empty or truncated must yield a status whose
+    /// numeric fields are zero, never a panic and never stale values from a
+    /// previous call — the parse is per-file, not cumulative.
+    #[test]
+    fn test_read_process_status_from_empty_and_truncated_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = proc_pid(dir.path(), 9);
+        let status = pid_dir.join("status");
+
+        std::fs::write(&status, "").unwrap();
+        let empty = read_process_status_from(dir.path(), 9).unwrap();
+        assert_eq!(empty.anon_rss_kb, 0, "an empty file has no RssAnon line");
+        assert_eq!(empty.vm_rss_kb, 0);
+        assert_eq!(empty.name, "");
+
+        // Truncated mid-line: the field never closes, so it stays zero.
+        std::fs::write(&status, "Name:\tfirefox\nRssAnon:\nVmRSS: 2048\n").unwrap();
+        let truncated = read_process_status_from(dir.path(), 9).unwrap();
+        assert_eq!(
+            truncated.name, "firefox",
+            "the Name line must still parse, got {:?}",
+            truncated.name
+        );
+        assert_eq!(
+            truncated.anon_rss_kb, 0,
+            "a truncated RssAnon value must stay zero, not a stale value"
+        );
+        assert_eq!(truncated.vm_rss_kb, 2048, "VmRSS must parse");
+    }
+
+    /// A status file whose numbers are not numbers defaults to zero rather
+    /// than aborting the read. The field that IS parseable must survive, so
+    /// the assertion is not satisfied by a whole-record reset.
+    #[test]
+    fn test_read_process_status_with_unparseable_field_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = proc_pid(dir.path(), 11);
+        std::fs::write(
+            pid_dir.join("status"),
+            "Name:\tchrome\nRssAnon:\tnot_a_number kB\nVmRSS:\t  4096 kB\n",
+        )
+        .unwrap();
+
+        let status = read_process_status_from(dir.path(), 11).unwrap();
+        assert_eq!(status.name, "chrome");
+        assert_eq!(status.anon_rss_kb, 0, "an unparseable kB value is 0");
+        assert_eq!(
+            status.vm_rss_kb, 4096,
+            "the parseable field on the same file must survive"
+        );
+    }
+
+    /// A maps file that does not exist — the target exited, or was never
+    /// injectable — is an error naming the path, which is the documented
+    /// "unreadable target no longer exists" contract.
+    #[test]
+    fn test_read_process_maps_from_a_missing_process_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        proc_pid(dir.path(), 3);
+
+        let err =
+            read_process_maps_from(dir.path(), 3).expect_err("a missing maps file is a failure");
+        assert!(
+            err.to_string().contains("3/maps"),
+            "the error must name the maps path, got: {err}"
+        );
+    }
+
+    /// A maps file whose lines are malformed is skipped line by line, so a
+    /// single bad range cannot drop the whole mapping set. A maps file that is
+    /// entirely unparseable still returns Ok with an empty set, which is what
+    /// keeps the caller from treating a partial read as a missing file.
+    #[test]
+    fn test_read_process_maps_from_skips_malformed_lines_and_keeps_good_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = proc_pid(dir.path(), 5);
+        std::fs::write(
+            pid_dir.join("maps"),
+            "this line is not a maps line\n\
+             7f0000000000-7f0000001000 r-xp 00000000 00:00 0 /bin/tool\n\
+             \n\
+             zzzzz-zzzzz rw-p 00000000 00:00 0\n\
+             7f0000002000-7f0000003000 rw-p 00000000 00:00 0\n",
+        )
+        .unwrap();
+
+        let entries =
+            read_process_maps_from(dir.path(), 5).expect("bad lines are skipped, not fatal");
+        assert_eq!(
+            entries.len(),
+            2,
+            "exactly the two well-formed lines survive, got {}",
+            entries.len()
+        );
+        assert!(
+            entries[0].has_exec() && !entries[1].has_exec(),
+            "the surviving entries keep their own permissions"
+        );
+
+        // A file with no parseable line at all is still Ok with an empty set:
+        // an unparseable-looking file is not the same as an unreadable file.
+        std::fs::write(pid_dir.join("maps"), "junk\nmore junk\n").unwrap();
+        let entries = read_process_maps_from(dir.path(), 5).unwrap();
+        assert!(
+            entries.is_empty(),
+            "a wholly unparseable maps file is an empty set, not an error"
+        );
+    }
+
+    /// A reversed range (`start > end`) parses without panicking but yields the
+    /// documented nothing-to-do size. This is the shape the executable-VMA
+    /// guard has to survive: `madvise.rs` uses `end.saturating_sub(start)` and
+    /// skips a zero length, so the arithmetic cannot wrap around into a huge
+    /// length and flag the wrong byte range.
+    #[test]
+    fn test_a_reversed_maps_range_has_a_zero_size_not_a_wrapped_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = proc_pid(dir.path(), 6);
+        std::fs::write(
+            pid_dir.join("maps"),
+            "7f0000009000-7f0000001000 r-xp 00000000 00:00 0\n",
+        )
+        .unwrap();
+
+        let entries = read_process_maps_from(dir.path(), 6).unwrap();
+        assert_eq!(entries.len(), 1, "the reversed line still parses");
+        let entry = &entries[0];
+        assert!(entry.start > entry.end, "the fixture really is reversed");
+        assert!(entry.has_exec(), "the fixture really is executable");
+
+        assert_eq!(
+            entry.end.saturating_sub(entry.start),
+            0,
+            "saturating_sub on a reversed range is 0"
+        );
+        assert!(
+            (entry.end as i128 - entry.start as i128) < 0,
+            "the plain subtraction really is negative, so 0 is not a coincidence"
+        );
+    }
+
+    /// A `ksm_stat` that is unreadable either because the process is gone or
+    /// because the file is a directory must be an error naming the PID — not
+    /// zero counters, which would read as "no KSM interest here".
+    #[test]
+    fn test_read_ksm_stat_from_unreadable_entries_errors_naming_the_pid() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Gone before the read.
+        proc_pid(dir.path(), 13);
+        let err =
+            read_ksm_stat_from(dir.path(), 13).expect_err("a missing ksm_stat is a read failure");
+        assert!(
+            err.to_string().contains("13/ksm_stat"),
+            "the error must name the missing ksm_stat path, got: {err}"
+        );
+
+        // Present but not a regular file: `EISDIR` for root as well.
+        std::fs::create_dir_all(dir.path().join("17/ksm_stat")).unwrap();
+        let err = read_ksm_stat_from(dir.path(), 17).expect_err("a directory is not a ksm_stat");
+        assert!(
+            err.to_string().contains("17/ksm_stat"),
+            "the error must name the offending path, got: {err}"
+        );
+    }
+
+    /// A `ksm_stat` whose counters are not numbers, and whose booleans are
+    /// neither `1` nor `0`, must not abort the read: the whole file is still
+    /// returned with the parseable counters intact, so a partially-written
+    /// file cannot stall the scanner.
+    #[test]
+    fn test_read_ksm_stat_from_with_unparseable_counters_and_booleans() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = proc_pid(dir.path(), 19);
+        std::fs::write(
+            pid_dir.join("ksm_stat"),
+            "ksm_rmap_items 12345\n\
+             ksm_merging_pages not_a_number\n\
+             ksm_process_profit -42\n\
+             ksm_merge_any maybe\n\
+             ksm_mergeable 1\n\
+             ksm_unknown_future_field 7\n",
+        )
+        .unwrap();
+
+        let stat = read_ksm_stat_from(dir.path(), 19)
+            .expect("an unparseable counter is not a read failure");
+        assert_eq!(stat.rmap_items, 12345, "numeric counters still parse");
+        assert_eq!(stat.merging_pages, 0, "a garbage counter is 0");
+        assert_eq!(stat.process_profit, -42, "profit is a signed value");
+        assert!(
+            !stat.merge_any,
+            "a non-1/yes/true boolean must not claim merge is on"
+        );
+        assert!(stat.mergeable, "the parseable boolean must survive");
+    }
+
+    /// A `comm` file that is only whitespace must not be read as a real name:
+    /// the trimmed empty string is what a half-written file leaves behind, and
+    /// it must never match a blocklist pattern.
+    #[test]
+    fn test_read_process_comm_from_a_blank_file_trims_to_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = proc_pid(dir.path(), 29);
+        std::fs::write(pid_dir.join("comm"), "  \n\t\n").unwrap();
+
+        let comm = read_process_comm_from(dir.path(), 29).unwrap();
+        assert_eq!(comm, "", "a blank comm must trim to empty");
+        assert!(
+            !is_blocklisted(&comm, &crate::config::ScannerConfig::default().blocklist),
+            "an empty name must not match a blocklist pattern"
+        );
+    }
+
+    /// Cross-CALL leakage in the status parse. A `ProcessStatus` is rebuilt from
+    /// `Default` on every call, so the reading for one process must never
+    /// carry another's RSS. Two calls with different inputs is the only way to
+    /// observe a mutation that persists a field across calls — a single-call
+    /// test cannot see it, because the carry starts empty.
+    #[test]
+    fn test_read_process_status_does_not_carry_between_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let heavy = proc_pid(dir.path(), 31);
+        std::fs::write(
+            heavy.join("status"),
+            "Name:\theavy\nVmRSS:\t8192 kB\nRssAnon:\t4096 kB\n",
+        )
+        .unwrap();
+
+        let first = read_process_status_from(dir.path(), 31).unwrap();
+        assert_eq!(
+            first.anon_rss_kb, 4096,
+            "the heavy process must parse, got {}",
+            first.anon_rss_kb
+        );
+
+        // A second process with *no* RssAnon line at all must read as zero, not
+        // as the previous process's 4096.
+        let light = proc_pid(dir.path(), 33);
+        std::fs::write(light.join("status"), "Name:\tlight\n").unwrap();
+        let second = read_process_status_from(dir.path(), 33).unwrap();
+        assert_eq!(
+            second.anon_rss_kb, 0,
+            "a process with no RssAnon line must read 0, not the previous {}",
+            first.anon_rss_kb
+        );
+        assert_eq!(second.vm_rss_kb, 0);
+        assert_eq!(second.name, "light");
+
+        // And back to the heavy one: a carry would show up as a stale value
+        // for a PID whose file says something else.
+        std::fs::write(
+            heavy.join("status"),
+            "Name:\theavy\nVmRSS:\t16 kB\nRssAnon:\t8 kB\n",
+        )
+        .unwrap();
+        let third = read_process_status_from(dir.path(), 31).unwrap();
+        assert_eq!(
+            third.anon_rss_kb, 8,
+            "a re-read must reflect the file, not the earlier 4096"
+        );
+    }
+
+    /// Cross-CALL leakage in the ksm_stat parse. `KsmProcStat::default()` is the
+    /// starting point every call, so a process whose counters are absent must
+    /// read zero rather than the previous process's numbers.
+    #[test]
+    fn test_read_ksm_stat_does_not_carry_between_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = proc_pid(dir.path(), 41);
+        std::fs::write(
+            first.join("ksm_stat"),
+            "ksm_rmap_items 5000\nksm_merging_pages 300\nksm_process_profit 900\nksm_merge_any 1\n",
+        )
+        .unwrap();
+
+        let busy = read_ksm_stat_from(dir.path(), 41).unwrap();
+        assert_eq!(busy.rmap_items, 5000, "the busy process must parse");
+
+        // A process with none of the counters must read zero, not 5000.
+        let idle = proc_pid(dir.path(), 43);
+        std::fs::write(idle.join("ksm_stat"), "ksm_merge_any 0\n").unwrap();
+        let quiet = read_ksm_stat_from(dir.path(), 43).unwrap();
+        assert_eq!(
+            quiet.rmap_items, 0,
+            "an absent counter must read 0, not the previous {}",
+            busy.rmap_items
+        );
+        assert_eq!(quiet.merging_pages, 0);
+        assert_eq!(quiet.process_profit, 0);
+        assert!(!quiet.merge_any);
+
+        // And an empty file must reset everything, not carry the busy values.
+        std::fs::write(idle.join("ksm_stat"), "").unwrap();
+        let cleared = read_ksm_stat_from(dir.path(), 43).unwrap();
+        assert_eq!(cleared.rmap_items, 0, "an empty ksm_stat must be all zero");
+        assert!(!cleared.merge_any);
+    }
+
+    /// The blocklist is a substring heuristic, and the kernel truncates `comm`
+    /// to 15 chars — so a name a process picked to dodge the list is caught,
+    /// while a name that happens to be a prefix is caught too. This pins the
+    /// semantics that make the heuristic work, not a security claim about it.
+    #[test]
+    fn test_is_blocklisted_is_a_substring_test_over_truncated_comm_names() {
+        let blocklist = crate::config::ScannerConfig::default().blocklist;
+
+        // comm is 15 chars: `firefox-nightly` is truncated to `firefox-night`
+        // on the way in, and the blocklist entry is the truncated form, so the
+        // substring test still fires.
+        assert_eq!("firefox-nightly".len(), 15);
+        assert!(
+            is_blocklisted("firefox-nightly", &blocklist),
+            "the blocklist carries the 15-char comm form"
+        );
+        // A prefix or suffix of a blocked name still matches, which is the
+        // point of a substring list: the operator cannot predict every build.
+        assert!(
+            is_blocklisted("chrome-gpu-helper", &blocklist),
+            "a substring hit anywhere in the name blocks the process"
+        );
+        assert!(
+            is_blocklisted("my-chrome-wrapper", &blocklist),
+            "a name wrapped around a blocked token is blocked too"
+        );
+        // And a name with no blocked token is not matched, so the list is not a
+        // blanket "block everything" rule.
+        assert!(
+            !is_blocklisted("kded6", &blocklist),
+            "a process name with no blocked token must be a candidate"
+        );
+    }
 }

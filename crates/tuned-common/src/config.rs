@@ -343,4 +343,143 @@ stats_path = "/tmp/other.jsonl"
             .to_string()
             .contains("duplicate_ratio_threshold"));
     }
+
+    // ------------------------------------------------------------------
+    // Fault injection: the config file boundary failing
+    //
+    // `TunedConfig::load` is the daemon's only configuration entry point, and
+    // every failure shape below is one an operator can produce: the file is
+    // missing, the mode denies the read, the file is a directory, the TOML is
+    // syntactically broken, or the types are wrong. The contract under test is
+    // that each failure is *reported* — with the offending file or key — and
+    // never silently replaced by defaults.
+    // ------------------------------------------------------------------
+
+    /// A config file that does not exist must fail rather than fall back to
+    /// defaults: `load` is the strict entry point, and the caller decides
+    /// whether a missing file is fatal. The fallback itself lives one layer up
+    /// in the daemon's `load_config_or_default`.
+    #[test]
+    fn test_load_missing_file_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-config.toml");
+        assert!(!missing.exists(), "the fixture really is absent");
+
+        let err = TunedConfig::load(&missing).expect_err("a missing config file is not a load");
+        assert!(
+            err.to_string().contains("No such file or directory"),
+            "the error must be the read failure, got: {err}"
+        );
+    }
+
+    /// A config file the daemon cannot read must fail with the reason. Under
+    /// uid 0 the mode bits do not apply, so the test branches on what the host
+    /// actually does rather than asserting a fault that does not happen.
+    #[test]
+    fn test_load_unreadable_file_reports_or_parses_as_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tuned.toml");
+        std::fs::write(&path, "[general]\nlog_level = \"debug\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        match TunedConfig::load(&path) {
+            Err(e) => {
+                let message = e.to_string();
+                assert!(
+                    message.contains("Permission denied") || message.contains("os error"),
+                    "the refusal must carry the kernel reason, got: {message}"
+                );
+            }
+            // Root ignores the mode bits, so the load proceeds and must land on
+            // the parsed value rather than a default.
+            Ok(cfg) => assert_eq!(
+                cfg.general.log_level, "debug",
+                "a successful load must honour the file's contents"
+            ),
+        }
+    }
+
+    /// A directory is not a config file. `EISDIR` applies to root as well, so
+    /// this fault is injectable without a privilege branch and must not be
+    /// treated as an empty config.
+    #[test]
+    fn test_load_a_directory_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let as_dir = dir.path().join("tuned.toml");
+        std::fs::create_dir(&as_dir).unwrap();
+
+        let err = TunedConfig::load(&as_dir).expect_err("a directory is not a TOML document");
+        assert!(
+            err.to_string().contains("Is a directory"),
+            "the error must be the EISDIR read failure, got: {err}"
+        );
+    }
+
+    /// Syntactically broken TOML must fail with the offending line. The point
+    /// is that the caller sees the syntax error, not a partially-defaulted
+    /// config that silently changes tuning behaviour.
+    #[test]
+    fn test_load_broken_toml_reports_the_syntax_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.toml");
+        std::fs::write(&path, "[general\nlog_level = \"debug\"\n").unwrap();
+
+        let err = TunedConfig::load(&path).expect_err("unclosed brackets are not valid TOML");
+        let message = err.to_string();
+        assert!(
+            message.contains("TOML parse error") || message.contains("expected"),
+            "the error must be a parse error, got: {message}"
+        );
+    }
+
+    /// Well-formed TOML with a wrong type is the fault that a hand-edited
+    /// config file produces. It must fail, and it must fail naming the key so
+    /// the operator can find it.
+    #[test]
+    fn test_load_wrong_typed_value_reports_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("typed.toml");
+        std::fs::write(&path, "[general]\npoll_interval_ms = \"not a number\"\n").unwrap();
+
+        let err = TunedConfig::load(&path).expect_err("a string is not a u64");
+        let message = err.to_string();
+        assert!(
+            message.contains("poll_interval_ms"),
+            "the error must name the offending key, got: {message}"
+        );
+    }
+
+    /// A config that parses but violates a safety invariant must be rejected by
+    /// `validate` before the daemon runs with it. This is the one fault TOML
+    /// alone cannot catch, so the error must name the field.
+    #[test]
+    fn test_load_rejects_a_config_that_parses_but_is_unsafe() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unsafe.toml");
+        std::fs::write(
+            &path,
+            "[scanner]\nmin_anon_rss_mb = 0\n[governor]\npsi_some_threshold = -1.0\n",
+        )
+        .unwrap();
+
+        let err = TunedConfig::load(&path).expect_err("an out-of-range threshold is unusable");
+        assert!(
+            err.to_string().contains("psi_some_threshold"),
+            "the validation error must name the offending field, got: {err}"
+        );
+    }
+
+    /// The default config path is shared between the daemon and the zswap
+    /// binary, so the two must agree. A divergence would mean the daemon reads
+    /// one file while the standalone tool reads another.
+    #[test]
+    fn test_default_config_path_is_the_documented_location() {
+        assert_eq!(DEFAULT_CONFIG_PATH, "/etc/tuned.toml");
+        assert!(
+            Path::new(DEFAULT_CONFIG_PATH).is_absolute(),
+            "a relative default would depend on the daemon's working directory"
+        );
+    }
 }

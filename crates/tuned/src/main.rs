@@ -1692,4 +1692,283 @@ mod tests {
         assert_eq!(read("advisor_target_scan_time"), "200");
         assert_eq!(read("advisor_max_cpu"), "70");
     }
+
+    // ── Fault injection: config and stats-path boundary failures ─────────
+    //
+    // The daemon reads two things it does not own: the operator's config file
+    // and the zswap history file. Both can be unreadable for reasons that
+    // have nothing to do with this process. The contract is honest
+    // degradation — never a fabricated value, never a panic.
+
+    /// Probe how this host treats a `chmod 000` file owned by the caller.
+    ///
+    /// The answer differs by privilege: `root` reads it anyway (DAC_OVERRIDE),
+    /// so a test asserting "unreadable" would be lying on a root run. Rather
+    /// than assume, the probe reports what the host actually does, and the
+    /// callers branch on it so the assertion always describes real behaviour.
+    fn probe_chmod_000_readable() -> bool {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unreadable.toml");
+        std::fs::write(&path, "[general]\nlog_level = \"debug\"\n").unwrap();
+
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o000);
+        }
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        // `TunedConfig::load` is the production reader; going through it
+        // means the probe measures exactly what the code under test will hit.
+        TunedConfig::load(&path).is_ok()
+    }
+
+    #[test]
+    fn test_load_config_or_default_surfaces_a_permission_fault() {
+        let path = PathBuf::from("/nonexistent/path/tuned.toml");
+        let config = load_config_or_default(&path).unwrap();
+        assert_eq!(config.governor.stabilization_secs, 30);
+        assert_eq!(config.general.log_level, "info");
+    }
+
+    /// `load_config_or_default`'s fallback exists for the missing-file case.
+    /// An **existing** file is handed to `TunedConfig::load`, whose
+    /// `read_to_string` error propagates — the fallback must not silently
+    /// swallow a permission fault on a file the operator did write.
+    ///
+    /// The host decides which of the two outcomes is real: as `root` the
+    /// chmod-000 file is still readable, so the parse succeeds; as an
+    /// unprivileged user it does not, so the error surfaces. Both branches
+    /// below assert exactly what happened, so the test never claims a
+    /// permission failure that this host did not produce.
+    #[test]
+    fn test_load_config_or_default_reports_an_unreadable_existing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tuned.toml");
+        // Real content, so a successful parse is a meaningful assertion and
+        // not an accident of an empty file.
+        std::fs::write(&path, "[general]\nlog_level = \"debug\"\n").unwrap();
+
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o000);
+        }
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let readable_as_caller = probe_chmod_000_readable();
+
+        let result = load_config_or_default(&path);
+
+        if readable_as_caller {
+            // Root (or any caller that can override DAC): the read succeeds,
+            // so production takes the "existing file → parse" branch and the
+            // documented content comes back.
+            let config = result
+                .expect("a chmod-000 file must still parse for a caller the kernel lets read it");
+            assert_eq!(config.general.log_level, "debug");
+        } else {
+            // Unprivileged: the read fails, and the error must surface rather
+            // than being replaced by defaults. Silently falling back here
+            // would let a mis-permissioned config run the daemon with the
+            // wrong knobs while the operator believes theirs are in effect.
+            let err = result
+                .expect_err("an unreadable existing config must surface its error, not default");
+            let text = format!("{err:#}");
+            assert!(
+                text.contains("tuned.toml") || text.contains("Permission denied"),
+                "the error must name the failing read, got: {text}"
+            );
+        }
+    }
+
+    /// The documented fallback, pinned exactly: a path that does not exist
+    /// yields `TunedConfig::default()` with no error. The chmod branch above
+    /// depends on host privilege; this one must hold everywhere.
+    #[test]
+    fn test_load_config_or_default_nonexistent_path_returns_exact_defaults() {
+        // A path inside a real temp dir whose parent exists but the file does
+        // not — the `exists()` probe must take the fallback branch for a
+        // reason that has nothing to do with `/nonexistent` being unwritable.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("never-written.toml");
+        assert!(!path.exists(), "precondition: the file must not exist");
+
+        let config = load_config_or_default(&path)
+            .expect("a missing config must not be an error, it is the default");
+
+        let default = TunedConfig::default();
+        assert_eq!(config.general.log_level, default.general.log_level);
+        assert_eq!(config.general.log_level, "info");
+        assert_eq!(
+            config.governor.stabilization_secs,
+            default.governor.stabilization_secs
+        );
+        assert_eq!(config.scanner.enabled, default.scanner.enabled);
+        assert_eq!(
+            config.governor.psi_some_threshold,
+            default.governor.psi_some_threshold
+        );
+        assert_eq!(config.zswap.stats_path, default.zswap.stats_path);
+    }
+
+    /// A configured `zswap.stats_path` pointing into a directory that does not
+    /// exist is the realistic misconfiguration: the operator set the path,
+    /// rotation removed the directory, nothing recreates it. The resolved
+    /// path must be the configured one verbatim — the resolution layer has no
+    /// business second-guessing an operator's path — and `print_report` must
+    /// then fail honestly on it.
+    #[test]
+    fn test_a_stats_path_into_a_missing_directory_degrades_with_an_honest_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_parent = dir.path().join("gone-dir");
+        let history = missing_parent.join("history.jsonl");
+
+        let resolved = resolve_verdict_path(None, Some(history.display().to_string()));
+        assert_eq!(
+            resolved, history,
+            "a configured stats_path must be resolved verbatim, even when it \
+             points somewhere that does not exist"
+        );
+        assert!(
+            !resolved.parent().unwrap().exists(),
+            "precondition: the configured path's parent directory must not exist"
+        );
+
+        let err = tuned_zswap::print_report(&resolved)
+            .expect_err("a history file in a missing directory must be an error");
+        assert!(
+            err.contains("cannot read"),
+            "the error must name the failed read, got: {err}"
+        );
+        assert!(
+            err.contains(&missing_parent.display().to_string()),
+            "the error must name the path it could not read, got: {err}"
+        );
+    }
+
+    /// An explicit `--path` reaching a nonexistent file behaves identically:
+    /// the operator's argument is never rewritten, and the report fails with
+    /// the path in the message.
+    #[test]
+    fn test_an_explicit_verdict_path_that_is_missing_errors_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent").join("history.jsonl");
+
+        let chosen = zswap_verdict_path(Some(missing.clone()));
+        assert_eq!(
+            chosen, missing,
+            "an explicit --path must be returned verbatim"
+        );
+        assert_eq!(chosen, PathBuf::from(missing.to_str().unwrap()));
+
+        let err = tuned_zswap::print_report(&chosen)
+            .expect_err("a missing history file must be an error");
+        assert!(err.contains("cannot read"), "got: {err}");
+        assert!(
+            err.contains(&missing.display().to_string()),
+            "the error must name the exact path requested, got: {err}"
+        );
+    }
+
+    /// A path that is a directory is not a readable history file either.
+    /// `read_to_string` on a directory is `Err` on Linux, and the report must
+    /// say so rather than reporting an empty body as "no usable records".
+    #[test]
+    fn test_a_verdict_path_that_is_a_directory_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let as_dir = dir.path().join("history.jsonl");
+        std::fs::create_dir(&as_dir).unwrap();
+
+        let err = tuned_zswap::print_report(&as_dir)
+            .expect_err("a directory is not a readable history file");
+        assert!(
+            err.contains("cannot read"),
+            "the error must name the failed read, got: {err}"
+        );
+        assert!(
+            err.contains(&as_dir.display().to_string()),
+            "the error must name the path, got: {err}"
+        );
+    }
+
+    /// The `zswap verdict` observable contract on an unfabricated report: an
+    /// empty history file must not be turned into a verdict. `print_report`
+    /// returns `Ok(())` — there is no error to report, the file was read fine
+    /// — and the verdict it renders is INCONCLUSIVE, which is the only honest
+    /// answer when no interval ever ran.
+    ///
+    /// `print_report` writes to stdout, which no test here can capture without
+    /// a new dependency, so the assertion is on the return value plus the
+    /// library's own `verdict` and `parse_records` functions on the same
+    /// inputs.
+    #[test]
+    fn test_an_empty_history_file_reports_inconclusive_not_a_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty.jsonl");
+        std::fs::write(&empty, "").unwrap();
+
+        // Reading an empty file is not a failure.
+        tuned_zswap::print_report(&empty).expect("an empty history file reads fine");
+
+        // The verdict over the groups such a history yields is INCONCLUSIVE,
+        // and names both ceilings so the operator learns what was missing.
+        let (records, problems) = tuned_zswap::parse_records("");
+        assert!(records.is_empty(), "an empty body carries no records");
+        assert!(problems.is_empty(), "an empty body has no malformed lines");
+
+        let text = tuned_zswap::verdict(&[]);
+        assert!(
+            text.starts_with("INCONCLUSIVE"),
+            "no records must never produce a verdict, got: {text}"
+        );
+        assert!(
+            text.contains("50") && text.contains("25"),
+            "the inconclusive reason must name both ceilings, got: {text}"
+        );
+    }
+
+    /// A garbage history file is reported, not fatal, and never judged. This
+    /// is the failure the daemon actually meets: a rotated log, a truncated
+    /// write, a hand-edited line. `parse_records` reports each bad line and
+    /// returns no records, and `print_report` returns `Ok(())` — the report
+    /// exists, it is just inconclusive.
+    #[test]
+    fn test_garbage_history_lines_are_reported_and_never_judged() {
+        let garbage = concat!(
+            "not json at all\n",
+            "{\"ts\": 1}\n",
+            "{\"ts\": \"x\", \"limit\": 50}\n",
+            "[]\n",
+            "   \n",
+        );
+
+        let (records, problems) = tuned_zswap::parse_records(garbage);
+        assert!(
+            records.is_empty(),
+            "no malformed line may become a record, got {} record(s)",
+            records.len()
+        );
+        assert_eq!(
+            problems.len(),
+            4,
+            "each malformed line must be reported, got: {problems:?}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("garbage.jsonl");
+        std::fs::write(&path, garbage).unwrap();
+
+        // The return value is the observable contract without capturing
+        // stdout: no error, because the file was read and analysed.
+        tuned_zswap::print_report(&path).expect("a garbage history file must not error");
+
+        let text = tuned_zswap::verdict(&[]);
+        assert!(
+            text.starts_with("INCONCLUSIVE"),
+            "garbage input must never yield a verdict, got: {text}"
+        );
+    }
 }

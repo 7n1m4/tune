@@ -1725,4 +1725,214 @@ mod tests {
         );
         assert!(s.last_adjustment.elapsed() < Duration::from_secs(5));
     }
+
+    // ── Fault injection: the kernel / proc boundary FAILS ──────────────
+    //
+    // Everything above drives the governor with readings handed to it. The
+    // production loop reads those readings from two sources that can fail
+    // independently: `/proc/pressure/memory` and the KSM sysfs directory.
+    // The tests below pin what the governor does when one of them does.
+
+    /// A missing PSI file must surface as `Err` — the governor's only cue to
+    /// bail out. This is the exact shape `tick()` receives when
+    /// `/proc/pressure/memory` cannot be opened, established through
+    /// `PsiStats::read_from` (the same helper `read_memory` delegates to, with
+    /// the live path swapped for a temp one).
+    #[test]
+    fn test_psi_read_from_missing_file_is_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("memory");
+
+        let result = PsiStats::read_from(&missing);
+
+        assert!(
+            result.is_err(),
+            "a missing PSI file must be an Err, otherwise tick() would act on zeros"
+        );
+        // Not a panic, and not a silently-defaulted struct either.
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("memory"),
+            "the error must name the file it failed on, got: {err}"
+        );
+    }
+
+    /// An *empty* PSI file is not an unreadable one, and the distinction
+    /// matters: `tick()` only returns early on `Err`, so an empty file reaches
+    /// the governor as all-zero readings. Documented here so the
+    /// "empty != missing" contract cannot drift unnoticed — an empty file
+    /// parses Ok with every field at zero.
+    #[test]
+    fn test_psi_read_from_empty_file_is_ok_with_zeros() {
+        let dir = tempfile::tempdir().unwrap();
+        let psi_file = dir.path().join("memory");
+        std::fs::write(&psi_file, "").unwrap();
+
+        let stats = PsiStats::read_from(&psi_file).expect("an empty PSI file parses fine");
+        assert_eq!(stats.some.avg10, 0.0);
+        assert_eq!(stats.full.avg10, 0.0);
+        assert_eq!(stats.some.total, 0);
+        assert_eq!(stats.full.total, 0);
+    }
+
+    /// A PSI file whose lines cannot be parsed must not crash the governor.
+    /// The parser is total over any text, so the governor sees zeros — which
+    /// is the same shape as a stalled sensor, and is classified Idle rather
+    /// than as pressure. (The parse contract is `tuned_common::psi`'s, but the
+    /// governor is the consumer that must expect it.)
+    #[test]
+    fn test_psi_parse_garbage_yields_zeros_not_error() {
+        let parsed = PsiStats::parse("some garbage\nfull nonsense\n").expect("garbage parses");
+
+        assert_eq!(
+            parsed.some.avg10, 0.0,
+            "unparsed lines must not become pressure"
+        );
+        assert_eq!(parsed.full.avg10, 0.0);
+
+        // And the governor's own view of that shape: zero-score readings are
+        // Idle, so they classify to target level 0, never upward.
+        let gov = make_temp_gov_with(|_| {});
+        assert_eq!(parsed.classify(5.0, 2.0), PressureLevel::Idle);
+        assert_eq!(
+            gov.pressure_to_level(PressureLevel::Idle),
+            0,
+            "a stalled PSI sensor must map to Idle, not to aggressiveness"
+        );
+    }
+
+    /// `PsiStats::default()` is the shape of a subsystem that reports nothing:
+    /// every counter zero. The governor must treat it as Idle — score 0.0 is
+    /// below the 0.5 floor — and therefore as target level 0, the profile that
+    /// stops the scanner in manual mode. Driven through the real tick path, not
+    /// just through `classify`, because the tick is what publishes it to shared
+    /// state.
+    #[tokio::test]
+    async fn test_zero_psi_classifies_idle_and_maps_to_level_zero() {
+        let mut gov = make_temp_gov_with(|c| {
+            c.stabilization_secs = 0;
+            c.min_level_duration_secs = 0;
+        });
+        gov.current_level = 1;
+        let state = new_shared_state();
+
+        gov.tick_with_readings(&state, PsiStats::default(), ksm_stats(10, 20, 1))
+            .await;
+
+        assert_eq!(
+            PsiStats::default()
+                .classify(gov.config.psi_some_threshold, gov.config.psi_full_threshold),
+            PressureLevel::Idle,
+            "all-zero PSI must classify Idle with the production thresholds"
+        );
+        assert_eq!(
+            gov.pressure_to_level(PressureLevel::Idle),
+            0,
+            "Idle must map to level 0 (the run=0 profile)"
+        );
+        // Held at 1 by the idle dwell, but the *target* is 0, so the shared
+        // pressure record says Idle and the dwell is accumulating.
+        assert_eq!(gov.current_level, 1);
+        assert_eq!(
+            gov.idle_dwell_count, 1,
+            "one zero reading accumulates dwell"
+        );
+        let s = state.read().await;
+        assert_eq!(
+            s.current_pressure,
+            PressureLevel::Idle,
+            "the tick must publish the classified pressure, not the raw score"
+        );
+    }
+
+    /// Zero PSI held long enough must actually reach level 0 — the level-0
+    /// profile stops the scanner, so a null sensor must not leave the daemon
+    /// frozen at level 1 forever.
+    #[tokio::test]
+    async fn test_sustained_zero_psi_reaches_level_zero_via_tick() {
+        let mut gov = make_temp_gov_with(|c| {
+            c.stabilization_secs = 0;
+            c.min_level_duration_secs = 0;
+            c.hysteresis_readings = 2;
+        });
+        gov.current_level = 1;
+        let state = new_shared_state();
+
+        // 2 * IDLE_DWELL_FACTOR = 6 consecutive zero readings are required for
+        // the 1 → 0 step; feed a comfortable margin.
+        for _ in 0..12 {
+            gov.tick_with_readings(&state, PsiStats::default(), ksm_stats(10, 20, 1))
+                .await;
+        }
+
+        assert_eq!(
+            gov.current_level, 0,
+            "a persistently idle (zero) PSI sensor must reach level 0"
+        );
+        let s = state.read().await;
+        assert_eq!(s.current_pressure, PressureLevel::Idle);
+        assert_eq!(s.ksm_level, 0);
+    }
+
+    /// PSI flapping across the Idle/Low boundary must not move the level. This
+    /// pins the debounce as a *mechanism*, not as an outcome: the assertions
+    /// are on the state-machine counters after every flap, so removing the
+    /// hysteresis/dwell logic fails the test even if the level happened to
+    /// stay where it is.
+    #[tokio::test]
+    async fn test_psi_flapping_does_not_move_the_level() {
+        let mut gov = make_temp_gov_with(|c| {
+            c.stabilization_secs = 0;
+            c.min_level_duration_secs = 0;
+            c.hysteresis_readings = 2;
+        });
+        gov.current_level = 1;
+        let state = new_shared_state();
+        let action_before = state.read().await.last_governor_action;
+
+        for tick in 0..12 {
+            // Idle reading (score 0.07) then Low reading (score 0.65) — the
+            // pair straddles the 0.5 classification floor.
+            gov.tick_with_readings(&state, psi(0.0, 0.1), ksm_stats(10, 20, 1))
+                .await;
+
+            // The idle tick must not start stepping toward level 0 on its own.
+            assert_eq!(gov.current_level, 1, "idle tick {tick} must not stop KSM");
+            assert_eq!(
+                gov.idle_dwell_count, 1,
+                "a single idle reading is one dwell tick, not a decision"
+            );
+            assert_eq!(
+                gov.ramp_up_count, 0,
+                "flapping up and down must never accumulate ramp-up credit"
+            );
+            assert_eq!(
+                gov.stable_psi_ticks, 0,
+                "a flap larger than 0.5 in either PSI line must reset stability"
+            );
+
+            // The trailing Low tick resets the dwell, so the next idle tick
+            // starts from one again rather than from two.
+            gov.tick_with_readings(&state, psi(1.0, 0.5), ksm_stats(10, 20, 1))
+                .await;
+            assert_eq!(gov.current_level, 1, "low tick {tick} must not move either");
+            assert_eq!(
+                gov.idle_dwell_count, 0,
+                "the Low reading must reset the idle dwell — this is the debounce"
+            );
+            assert_eq!(gov.ramp_up_count, 0);
+            assert_eq!(gov.hysteresis_count, 0);
+            assert_eq!(gov.stable_psi_ticks, 0);
+        }
+
+        // Non-vacuity: 12 flaps means 12 full idle readings accumulated, which
+        // with hysteresis_readings = 2 would need only 6. The level never moved,
+        // so what held it must have been the reset, not the count.
+        assert_eq!(gov.current_level, 1);
+        assert_eq!(
+            state.read().await.last_governor_action,
+            action_before,
+            "no level change, so no profile write and no timestamp update"
+        );
+    }
 }

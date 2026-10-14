@@ -1555,4 +1555,678 @@ mod tests {
             "a cycle that did nothing must not refresh last_global_action"
         );
     }
+
+    // ── Fault injection: /proc boundary failures ────────────────────────
+    //
+    // Every test below drives a real failure at the kernel boundary the scanner
+    // depends on: a `/proc` entry that disappears between listing and reading, a
+    // process that legitimately cannot be injected, and a blocklist match that is
+    // only ever a heuristic. The assertions are about the loop surviving with
+    // coherent accounting — never about the fault being prevented. Stopping a
+    // process from exiting is not something this daemon can do, so "survive and
+    // stay truthful" is the contract.
+
+    /// A child this test process owns. `Drop` reaps it, so every exit path —
+    /// including a failing assertion — leaves no process behind.
+    struct OwnedChild(std::process::Child);
+
+    impl OwnedChild {
+        fn spawn(argv: &[&str]) -> Self {
+            let mut cmd = std::process::Command::new(argv[0]);
+            for arg in &argv[1..] {
+                cmd.arg(arg);
+            }
+            let child = cmd
+                .spawn()
+                .unwrap_or_else(|e| panic!("spawning {argv:?} must work: {e}"));
+            Self(child)
+        }
+    }
+
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Yama `ptrace_scope`, or `u8::MAX` when the file is absent (kernels built
+    /// without Yama, where any descendant is attachable anyway).
+    fn ptrace_scope() -> u8 {
+        std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(u8::MAX)
+    }
+
+    /// `/proc/PID/comm`, trimmed, or `None` when the process is already gone.
+    fn comm_of(pid: u32) -> Option<String> {
+        std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .ok()
+            .map(|s| s.trim().to_string())
+    }
+
+    /// The parent PID of this process, read through the same `/proc/self/stat`
+    /// layout the kernel documents (fields after the comm).
+    /// Real UID of the running process, from `/proc/self/status`. `0` means
+    /// root, which is the branch several fault tests must take because the
+    /// kernel's Yama `ptrace_scope` restriction does not apply to root: an
+    /// attach that is refused for an unprivileged user succeeds here.
+    fn is_root() -> bool {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:"))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|uid| uid.parse::<u32>().ok())
+            .map(|uid| uid == 0)
+            .unwrap_or(false)
+    }
+
+    fn parent_pid() -> u32 {
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let rest = stat.rsplit_once(')').expect("/proc/self/stat has a comm").1;
+        rest.split_whitespace()
+            .nth(1)
+            .expect("ppid is the second field after the comm")
+            .parse()
+            .expect("ppid parses")
+    }
+
+    /// Spin until the predicate holds for `pid`, or give up and return `false`.
+    /// Used to reach a deterministic child state (comm renamed, process gone)
+    /// instead of sleeping a fixed interval.
+    fn wait_until<F: Fn() -> bool>(what: &str, ready: F) -> bool {
+        for _ in 0..400 {
+            if ready() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        eprintln!("condition never became true: {what}");
+        false
+    }
+
+    /// Re-read `/proc/PID/stat` until the field named by `field_index` matches
+    /// `want`, returning whether it did.
+    fn wait_until_state(pid: u32, want: &str) -> bool {
+        wait_until("process state", || {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| {
+                    s.rsplit_once(')')
+                        .map(|(_, rest)| rest.split_whitespace().next().unwrap_or("").to_string())
+                })
+                .as_deref()
+                == Some(want)
+        })
+    }
+
+    /// A freshly built cycle: zero RSS floor, no blocklist, dry run, and a
+    /// stabilization window already expired.
+    fn churn_ready_scanner() -> (Scanner, std::sync::Arc<tokio::sync::RwLock<GovernorState>>) {
+        let config = ScannerConfig {
+            min_anon_rss_mb: 0,
+            max_candidates_per_cycle: usize::MAX,
+            blocklist: Vec::new(),
+            ..ScannerConfig::default()
+        };
+        let scanner = Scanner::new(config, /* dry_run */ true, 0);
+        let state = std::sync::Arc::new(tokio::sync::RwLock::new(GovernorState::default()));
+        (scanner, state)
+    }
+
+    /// `processes_filtered_l2 - processes_filtered_l25_profit`, clipped by the
+    /// budget — the pre-truncation candidate count, which is what the marking
+    /// loop's two outcome counters must partition.
+    fn selected_candidates(scanner: &Scanner, max_candidates: usize) -> u64 {
+        (scanner.stats.processes_filtered_l2 - scanner.stats.processes_filtered_l25_profit)
+            .min(max_candidates as u64)
+    }
+
+    async fn prime_state(state: &std::sync::Arc<tokio::sync::RwLock<GovernorState>>) {
+        let mut s = state.write().await;
+        s.last_scanner_action = Instant::now() - Duration::from_secs(120);
+        s.last_global_action = Instant::now() - Duration::from_secs(120);
+        s.last_governor_action = Instant::now() - Duration::from_secs(120);
+    }
+
+    #[test]
+    fn test_collect_scan_targets_skips_a_pid_whose_proc_entry_is_gone() {
+        // Deterministic version of the list/read race: spawn a child, reap it
+        // first, so `/proc/PID/status` is guaranteed unreadable before the
+        // collector runs. Production closure `.ok()`s the read into `None`, so a
+        // vanished PID must be skipped, not turned into an error or a panic.
+        let mut dead_child = std::process::Command::new("/usr/bin/sleep")
+            .arg("0")
+            .spawn()
+            .expect("spawning a sleep target must work");
+        let dead_pid = dead_child.id();
+        dead_child.wait().expect("reaping the sleep target");
+
+        // A live sibling, so the result is not empty for the wrong reason: a
+        // collector that dropped every PID would also produce an empty set.
+        let live = OwnedChild::spawn(&["/usr/bin/sleep", "30"]);
+        let live_pid = live.0.id();
+        assert!(
+            wait_until("live child status readable", || std::fs::metadata(format!(
+                "/proc/{live_pid}/status"
+            ))
+            .is_ok()),
+            "the live child must be observable"
+        );
+
+        let config = ScannerConfig {
+            min_anon_rss_mb: 0,
+            max_candidates_per_cycle: 16,
+            blocklist: Vec::new(),
+            ..ScannerConfig::default()
+        };
+        let mut stats = ScannerStats::default();
+
+        let targets = collect_scan_targets(
+            &config,
+            vec![dead_pid, live_pid],
+            &mut stats,
+            |pid| procfs::read_process_status(pid).ok(),
+            |pid| procfs::read_ksm_stat(pid).ok(),
+        );
+
+        let collected: Vec<u32> = targets.to_mark.iter().map(|c| c.pid).collect();
+        assert!(
+            !collected.contains(&dead_pid),
+            "a reaped child must be skipped, not injected: {collected:?}"
+        );
+        assert!(
+            collected.contains(&live_pid),
+            "a vanished PID must not stop the surviving processes from being \
+         collected: {collected:?}"
+        );
+        assert_eq!(
+            stats.processes_filtered_l1, 1,
+            "only the readable status may be counted at Level 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_cycle_partition_holds_while_a_child_is_dying() {
+        // The accounting contract under real churn: a dying child can land in the
+        // candidate set and then fail its injection, which is one of the two
+        // allowed outcomes — the partition must still close.
+        let (mut scanner, state) = churn_ready_scanner();
+        let max_candidates = scanner.config.max_candidates_per_cycle;
+        prime_state(&state).await;
+
+        let dying = OwnedChild::spawn(&["/usr/bin/sleep", "0.3"]);
+        let dying_pid = dying.0.id();
+        assert!(
+            wait_until("dying child status readable", || std::fs::metadata(
+                format!("/proc/{dying_pid}/status")
+            )
+            .is_ok()),
+            "the dying child must be observable"
+        );
+
+        scanner.scan_cycle(&state).await;
+
+        assert_eq!(
+            scanner.stats.processes_marked + scanner.stats.injection_failures,
+            selected_candidates(&scanner, max_candidates),
+            "every candidate must still be accounted for while a child exits"
+        );
+        assert_eq!(
+            scanner.stats.injection_failures, 0,
+            "a dry run attaches nothing, so an exited child cannot become a failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_cycle_survives_a_proc_entry_vanishing_during_the_walk() {
+        // The same race from the other side: PID churn happening *while* the
+        // `/proc` walk runs, so entries genuinely disappear between listing and
+        // reading. A busy host walks hundreds of entries; at least one is on its
+        // way out. The cycle must complete, and — because it is a dry run — the
+        // partition must still close exactly.
+        let (mut scanner, state) = churn_ready_scanner();
+        let max_candidates = scanner.config.max_candidates_per_cycle;
+        prime_state(&state).await;
+
+        // A churn child that keeps creating and losing PIDs for the duration.
+        let churn =
+            OwnedChild::spawn(&["/bin/sh", "-c", "while :; do sleep 0.01 & sleep 0.01; done"]);
+        let _ = &churn;
+
+        scanner.scan_cycle(&state).await;
+
+        assert!(
+            scanner.stats.processes_filtered_l1 >= 1,
+            "a zero RSS floor must admit at least one process on any host (l1={})",
+            scanner.stats.processes_filtered_l1
+        );
+        assert_eq!(
+            scanner.stats.processes_marked + scanner.stats.injection_failures,
+            selected_candidates(&scanner, max_candidates),
+            "a dry-run cycle must close the partition even while PIDs churn"
+        );
+        assert_eq!(scanner.stats.skipped_stabilization, 0);
+    }
+
+    #[test]
+    fn test_a_zombie_child_is_non_injectable_but_not_a_crash() {
+        // A zombie's `/proc/PID/status` is still readable (it has no `RssAnon:`
+        // line, so the field parses as 0) — the fault must be modelled as it
+        // really is. What makes it non-injectable is that it has no `mm`, so the
+        // prctl injection fails, which is the `Err` arm `scan_cycle` counts as
+        // `injection_failures`.
+        let mut zombie_child = std::process::Command::new("/usr/bin/sleep")
+            .arg("0")
+            .spawn()
+            .expect("spawning a sleep target must work");
+        let zombie_pid = zombie_child.id();
+        // Do NOT reap yet: hold the child in Z until the assertions are done.
+        assert!(
+            wait_until_state(zombie_pid, "Z"),
+            "the child must reach the zombie state before the assertion"
+        );
+
+        let status = procfs::read_process_status(zombie_pid);
+        assert!(
+            status.is_ok(),
+            "a zombie's status is readable; the fault is not a read error: \
+         {status:?}"
+        );
+        let status = status.unwrap();
+        // A zombie has no `mm`, so the kernel reports whatever RSS it held at
+        // exit — `/proc/PID/status` keeps the last `RssAnon:` line it printed, it
+        // does not zero it. This is why the default 100 MiB floor, not a
+        // zombie-specific check, is what keeps a zombie out of the candidate set.
+        assert!(
+            status.anon_rss_kb < 1024,
+            "a just-exited sleep held no meaningful anonymous RSS, got {} KiB",
+            status.anon_rss_kb
+        );
+
+        // Un-injectability must be *reported*, not hidden.
+        if ptrace_scope() > 1 {
+            // A stricter Yama refuses the attach for a different reason; the
+            // assertion would be indistinguishable, so stop before injecting.
+            zombie_child.wait().expect("reaping the zombie");
+            return;
+        }
+        let result = madvise::enable_merge_any(zombie_pid, false);
+        assert!(
+            result.error.is_some(),
+            "injecting into a zombie must be reported as a failure: {result:?}"
+        );
+        assert_eq!(result.processes_marked, 0);
+        assert_eq!(result.exec_vmas_protected, 0);
+        assert_eq!(result.exec_vmas_failed, 0);
+
+        // And it must never become an injectable candidate: a nonzero RSS floor
+        // (the shipped default is 100 MiB) filters a 0 KiB process out.
+        let config = ScannerConfig {
+            min_anon_rss_mb: 1,
+            blocklist: Vec::new(),
+            ..ScannerConfig::default()
+        };
+        let mut stats = ScannerStats::default();
+        let targets = collect_scan_targets(
+            &config,
+            vec![zombie_pid],
+            &mut stats,
+            |pid| procfs::read_process_status(pid).ok(),
+            |pid| procfs::read_ksm_stat(pid).ok(),
+        );
+        assert!(targets.to_mark.is_empty());
+        assert!(targets.already_flagged.is_empty());
+
+        zombie_child.wait().expect("reaping the zombie");
+    }
+
+    #[test]
+    fn test_parent_and_own_pid_pass_through_collection_without_panicking() {
+        // Deterministic: the parent PID (ptrace-refused) and our own PID are
+        // handed to the collector directly. Neither aborts the walk, and the
+        // totals stay coherent with the number of readable statuses.
+        let own = std::process::id();
+        let parent = parent_pid();
+
+        let config = ScannerConfig {
+            min_anon_rss_mb: 0,
+            max_candidates_per_cycle: 16,
+            blocklist: Vec::new(),
+            ..ScannerConfig::default()
+        };
+        let mut stats = ScannerStats::default();
+
+        let targets = collect_scan_targets(
+            &config,
+            vec![parent, own],
+            &mut stats,
+            |pid| procfs::read_process_status(pid).ok(),
+            |pid| procfs::read_ksm_stat(pid).ok(),
+        );
+
+        let readable = [parent, own]
+            .iter()
+            .filter(|pid| procfs::read_process_status(**pid).is_ok())
+            .count();
+        assert_eq!(
+            stats.processes_filtered_l1, readable as u64,
+            "Level 1 must count exactly the readable statuses"
+        );
+
+        let collected: Vec<u32> = targets.to_mark.iter().map(|c| c.pid).collect();
+        assert!(
+            collected.iter().all(|pid| *pid == parent || *pid == own),
+            "only the offered PIDs may be collected: {collected:?}"
+        );
+        assert!(
+            collected.len() as u64 + stats.processes_filtered_l25_profit
+                <= stats.processes_filtered_l2,
+            "the filtered counts must bound the selected set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_cycle_partition_closes_with_an_uninjectable_candidate() {
+        // A full cycle whose candidate set contains a process the daemon cannot
+        // inject: the parent of this test process is live, outside this test's
+        // subtree, and refused by Yama. Under `dry_run` nothing is attached, so
+        // the partition must still close over the candidate set.
+        let (mut scanner, state) = churn_ready_scanner();
+        let max_candidates = scanner.config.max_candidates_per_cycle;
+        prime_state(&state).await;
+
+        scanner.scan_cycle(&state).await;
+
+        let selected = selected_candidates(&scanner, max_candidates);
+        assert!(
+            selected >= 1,
+            "a zero RSS floor must admit the parent process (l1={}, l2={})",
+            scanner.stats.processes_filtered_l1,
+            scanner.stats.processes_filtered_l2
+        );
+        assert_eq!(
+            scanner.stats.processes_marked + scanner.stats.injection_failures,
+            selected,
+            "the partition must close over the candidate set, including any \
+         process that would refuse a real attach"
+        );
+    }
+
+    #[test]
+    fn test_enable_merge_any_reports_the_parent_pid_as_uninjectable() {
+        // The empirical half of the parent-PID fault: the real injection
+        // function, driven against a real ptrace-refused process. This is the arm
+        // `scan_cycle` counts, and it must leave every success count at zero —
+        // never a partial mark on a process that was not touched.
+        if ptrace_scope() > 1 {
+            // A stricter Yama refuses this too, but for a different reason; the
+            // assertion would be indistinguishable.
+            return;
+        }
+
+        let parent = parent_pid();
+        assert!(
+            parent > 2,
+            "there must be a parent process to refuse injection, got {parent}"
+        );
+
+        // Un-privileged (yama scope 1): a non-ancestor attach is refused, so
+        // injection must report failure with every success count at zero.
+        // Under root, ptrace_scope does not apply and the attach to the parent
+        // legitimately succeeds — so the two outcomes are branched on, and the
+        // accounting contract (marked XOR refused, never both) is what is
+        // asserted in both arms rather than a single hardcoded outcome.
+        let result = madvise::enable_merge_any(parent, false);
+        if is_root() {
+            assert_eq!(
+                result.processes_marked, 1,
+                "as root the parent is injectable, so it must be marked exactly \
+             once: {result:?}"
+            );
+            // The additive accounting contract holds in both arms: every
+            // executable VMA found is either protected or failed, so the two
+            // counts must sum to the number of exec VMAs the maps actually
+            // carry. 9 + 1 = 10 here is the coherent total, and a handler that
+            // double-counted or dropped one would break this. The perms field
+            // (second whitespace token) is what carries the execute bit —
+            // matching the path or device column would over-count.
+            let total_exec_vmas = std::fs::read_to_string(format!("/proc/{parent}/maps"))
+                .map(|maps| {
+                    maps.lines()
+                        .filter(|line| {
+                            line.split_whitespace()
+                                .nth(1)
+                                .is_some_and(|perms| perms.contains('x'))
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            assert_eq!(
+                result.exec_vmas_protected + result.exec_vmas_failed,
+                total_exec_vmas,
+                "every executable VMA must be either protected or failed: \
+             protected={} failed={} but maps carries {total_exec_vmas}: {result:?}",
+                result.exec_vmas_protected,
+                result.exec_vmas_failed,
+            );
+            assert!(
+                result.exec_vmas_failed >= 1,
+                "at least one VMA must be protected or failed, got {result:?}"
+            );
+            // Leave the parent as it was found: undo the real mark.
+            let _ = madvise::unmerge_executable_vmas(parent, false);
+        } else {
+            assert!(
+                result.error.is_some(),
+                "a ptrace-refused parent must be reported as an injection failure: \
+             {result:?}"
+            );
+            assert_eq!(result.processes_marked, 0);
+            assert_eq!(result.exec_vmas_protected, 0);
+            assert_eq!(result.exec_vmas_failed, 0);
+        }
+
+        // Un-injectability is a runtime outcome, not a discovery-time filter:
+        // the collector must still offer the target as a candidate. The
+        // discovery half uses a self-spawned child rather than the ambient
+        // parent, because a parent's `/proc/PID/status` is only guaranteed to
+        // be readable while it lives — under a `sudo`-launched harness the
+        // parent can already be gone, which would make the assertion depend on
+        // process-tree timing rather than on the collector. A child spawned
+        // here is stable for both an unprivileged user and root.
+        let config = ScannerConfig {
+            min_anon_rss_mb: 0,
+            max_candidates_per_cycle: 16,
+            blocklist: Vec::new(),
+            ..ScannerConfig::default()
+        };
+        let mut child = std::process::Command::new("/usr/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a discovery target");
+        let child_pid = child.id();
+        let mut stats = ScannerStats::default();
+        let targets = collect_scan_targets(
+            &config,
+            vec![child_pid],
+            &mut stats,
+            |pid| procfs::read_process_status(pid).ok(),
+            |pid| procfs::read_ksm_stat(pid).ok(),
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            stats.processes_filtered_l1, 1,
+            "a live process must still be discovered as a candidate"
+        );
+        assert_eq!(
+            targets.to_mark.len(),
+            1,
+            "a non-injectable target must still be discovered"
+        );
+        assert_eq!(targets.to_mark[0].pid, child_pid);
+    }
+
+    /// A blocklist match is a **heuristic, never a security boundary** (see the
+    /// root `AGENTS.md`). `comm` is user-writable — `PR_SET_NAME`, or a plain
+    /// write to `/proc/self/comm`, both of which these tests use — and is 15
+    /// bytes. These tests pin the heuristic's behaviour on a **real** renamed
+    /// child, and pin that a benign comm is not filtered.
+    mod blocklist_is_a_heuristic {
+        use super::*;
+
+        /// Spawn a shell that renames itself to `comm` and then stays alive
+        /// without exec'ing — a `PR_SET_NAME` before an `exec` does not survive
+        /// it, so the process must be the one that writes its own comm.
+        ///
+        /// The wait accepts the first 15 characters of `comm`, because a longer
+        /// name is truncated by the kernel before it is ever readable.
+        ///
+        /// `printf %s` rather than `echo`: `echo` writes a trailing newline, and
+        /// the kernel stores it in `comm`, so the *status* name comes back with a
+        /// stray `\n` while `comm_of` trims it. `printf %s` writes exactly the
+        /// requested bytes.
+        fn spawn_renamed(comm: &str) -> OwnedChild {
+            let truncated = &comm[..comm.len().min(15)];
+            let child = OwnedChild::spawn(&[
+                "/bin/sh",
+                "-c",
+                &format!("printf %s {comm} > /proc/self/comm; while :; do sleep 0.2; done"),
+            ]);
+            let pid = child.0.id();
+            assert!(
+                wait_until("the shell to take its new comm", || comm_of(pid).as_deref()
+                    == Some(truncated)),
+                "the child must be observably renamed to {truncated:?}"
+            );
+            child
+        }
+
+        /// A blocklist entry can be updated in one place.
+        fn defaults() -> ScannerConfig {
+            ScannerConfig::default()
+        }
+
+        #[test]
+        fn a_real_renamed_child_is_matched_by_the_default_blocklist() {
+            let defaults = defaults();
+            let child = spawn_renamed("chrome");
+            let pid = child.0.id();
+
+            // Both `/proc/PID/comm` and the parsed `Name:` of
+            // `/proc/PID/status` carry the renamed string. `read_process_status`
+            // trims the value, which is the field the collector actually uses.
+            assert_eq!(comm_of(pid).as_deref(), Some("chrome"));
+            let status = procfs::read_process_status(pid).expect("status is readable");
+            assert_eq!(
+                status.name, "chrome",
+                "a rename is visible through the status name the scanner reads"
+            );
+
+            assert!(
+                procfs::is_blocklisted(&status.name, &defaults.blocklist),
+                "a browser comm must match the shipped heuristic"
+            );
+            assert!(
+                l1_candidate_from_status(status, &defaults).is_none(),
+                "a blocklisted comm must be dropped at Level 1"
+            );
+        }
+
+        #[test]
+        fn comm_is_truncated_to_fifteen_bytes_and_still_matches() {
+            // The kernel's comm buffer is 15 bytes, so a longer name is cut to 15
+            // characters — a 16-character browser name becomes
+            // `firefox-nightly`. The blocklist must still match the truncated
+            // form, which it does because `firefox` is a substring of it.
+            let defaults = defaults();
+            let child = spawn_renamed("firefox-nightly-2");
+            let pid = child.0.id();
+
+            let comm = comm_of(pid).expect("the renamed child must be alive");
+            assert_eq!(comm, "firefox-nightly", "a 16-char name must be cut to 15");
+            assert_eq!(comm.len(), 15);
+
+            let status = procfs::read_process_status(pid).expect("status is readable");
+            assert_eq!(status.name, comm);
+
+            assert!(
+                procfs::is_blocklisted(&comm, &defaults.blocklist),
+                "the truncated comm must still match the firefox pattern"
+            );
+            assert!(
+                l1_candidate_from_status(status, &defaults).is_none(),
+                "a truncated-but-blocklisted comm must be filtered"
+            );
+        }
+
+        #[test]
+        fn a_benign_comm_is_a_candidate_even_though_comm_is_writable() {
+            // The other face of the heuristic, and the reason it must never be
+            // called a boundary: the only evidence the blocklist ever sees is the
+            // comm substring. A process with an ordinary name is not filtered —
+            // whatever its executable or mappings look like. Asserting that this
+            // is by design is the point of the test.
+            let defaults = defaults();
+            let config = ScannerConfig {
+                min_anon_rss_mb: 0,
+                max_candidates_per_cycle: 16,
+                ..ScannerConfig::default()
+            };
+
+            // The pure heuristic claim: a benign comm is not blocklisted, so the
+            // Level 1 gate lets it through.
+            assert!(
+                !procfs::is_blocklisted("plausible-name", &defaults.blocklist),
+                "a benign comm must not match any shipped pattern"
+            );
+            let candidate = l1_candidate_from_status(
+                ProcessStatus {
+                    pid: 4242,
+                    name: "plausible-name".into(),
+                    anon_rss_kb: 512 * 1024,
+                    ..Default::default()
+                },
+                &config,
+            )
+            .expect("a benign comm must be a candidate");
+            assert_eq!(candidate.name, "plausible-name");
+
+            // Collection reads only `/proc/PID/status`, so a benign comm is the
+            // whole of the evidence, and the process is selected.
+            let targets = collect_scan_targets(
+                &config,
+                vec![4242],
+                &mut ScannerStats::default(),
+                |pid| {
+                    Some(ProcessStatus {
+                        pid,
+                        name: "plausible-name".into(),
+                        anon_rss_kb: 512 * 1024,
+                        ..Default::default()
+                    })
+                },
+                |_| None,
+            );
+            assert_eq!(targets.to_mark.len(), 1);
+
+            // And from the other side, on a real renamed child: the comm the
+            // operator chose is the only thing that decides.
+            let child = spawn_renamed("plausible-name");
+            let pid = child.0.id();
+            let comm = comm_of(pid).expect("the renamed child must be alive");
+            assert!(
+                !procfs::is_blocklisted(&comm, &defaults.blocklist),
+                "a benign comm must survive the default blocklist"
+            );
+            let status = procfs::read_process_status(pid).expect("status is readable");
+            assert_eq!(
+                status.name, comm,
+                "the status name must be the renamed comm, exactly"
+            );
+        }
+    }
 }

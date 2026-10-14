@@ -296,4 +296,196 @@ mod tests {
             "run_metrics_loop must break out on the shutdown signal"
         );
     }
+
+    // ── Fault injection: the KSM boundary FAILS ────────────────────────
+
+    /// The metrics layer reports whatever `KsmController::read_stats` hands
+    /// back; there is no n/a rendering in the `info!` line and no fallback
+    /// either. So the whole robustness contract of this file is: an
+    /// unreadable KSM directory must return cleanly from `report_metrics`
+    /// (no panic, no report) and must not touch the shared state — a report
+    /// published off stale zeros would look like real pressure telemetry.
+    #[tokio::test]
+    async fn test_report_metrics_on_unreadable_ksm_dir_leaves_shared_state_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        // No stat files at all, so every read_stats field fails.
+        let ksm = KsmController::new(dir.path().to_str().unwrap()).unwrap();
+        let state = new_shared_state();
+
+        assert!(
+            ksm.read_stats().is_err(),
+            "an empty KSM directory must fail the stats read or this test proves nothing"
+        );
+
+        {
+            let mut s = state.write().await;
+            s.ksm_level = 3;
+            s.pages_sharing = 777;
+            s.general_profit = -999;
+            s.last_adjustment = std::time::Instant::now() - Duration::from_secs(10);
+        }
+        let before = state.read().await.last_adjustment;
+
+        report_metrics(&ksm, &state).await;
+
+        let s = state.read().await;
+        assert_eq!(s.ksm_level, 3, "a failed read must not publish telemetry");
+        assert_eq!(s.pages_sharing, 777);
+        assert_eq!(s.general_profit, -999);
+        assert_eq!(
+            s.last_adjustment, before,
+            "report_metrics writes no shared state, so nothing may move"
+        );
+    }
+
+    /// The interval arm with a failing read must neither hang nor die: drive
+    /// the loop over a directory with no stat files for two intervals and
+    /// require it to (i) still be running and (ii) honour the shutdown signal
+    /// within a bounded time. The captured-report count is asserted empty,
+    /// which is what makes the "loop survived" claim falsifiable — if the arm
+    /// panicked or blocked, the shutdown would never arrive.
+    #[test]
+    fn test_metrics_loop_survives_failing_ksm_reads_and_still_exits_on_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let ksm = KsmController::new(dir.path().to_str().unwrap()).unwrap();
+        let state = new_shared_state();
+
+        let capture = std::sync::Arc::new(parking_lot::Mutex::new(MetricCapture::default()));
+        let subscriber = MetricSubscriber {
+            inner: std::sync::Arc::clone(&capture),
+        };
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let signaller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2500));
+            let _ = shutdown_tx.send(true);
+        });
+
+        let exited = tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let loop_task = std::pin::pin!(run_metrics_loop(&ksm, state, 1, shutdown_rx));
+                    tokio::time::timeout(Duration::from_secs(10), loop_task)
+                        .await
+                        .is_ok()
+                })
+        });
+
+        signaller
+            .join()
+            .expect("the shutdown signaller must return");
+
+        assert!(
+            exited,
+            "the loop must return on shutdown even while every read fails"
+        );
+        let reports = capture.lock().pages_sharing.clone();
+        assert!(
+            reports.is_empty(),
+            "a failing read must emit no report; got {reports:?}"
+        );
+    }
+
+    /// The 0-vs-n/a boundary in this file lives in `read_stats`, not in the
+    /// metrics layer: the metrics layer has no way to render "absent", it
+    /// prints the u64 the controller returned. `ksm_zero_pages`,
+    /// `stable_node_chains` and `stable_node_dups` are the optional trio —
+    /// `unwrap_or(0)` by design, because older kernels simply do not expose
+    /// them. The other eight counters are required and a missing one is a
+    /// hard `Err` (the subsystem is dead or the path is wrong), which the
+    /// caller above turns into "report nothing".
+    #[test]
+    fn test_read_stats_optional_trio_is_zero_required_missing_is_err() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_ksm_stats(dir.path());
+        let ksm = KsmController::new(dir.path().to_str().unwrap()).unwrap();
+
+        // Positive control first: the required octet is present, so the read
+        // must succeed — otherwise every "absent → 0" claim below would be
+        // vacuous.
+        let stats = ksm
+            .read_stats()
+            .expect("the required eight counters must read");
+        assert_eq!(
+            stats.pages_sharing, 20,
+            "required counters must be read, not defaulted"
+        );
+
+        // The optional trio is absent from this directory by construction.
+        assert!(
+            !dir.path().join("ksm_zero_pages").exists(),
+            "this dir must not contain the optional counters"
+        );
+        assert_eq!(
+            stats.ksm_zero_pages, 0,
+            "an absent optional counter must read as 0 by design"
+        );
+        assert_eq!(stats.stable_node_chains, 0);
+        assert_eq!(stats.stable_node_dups, 0);
+
+        // Now make one of the *required* counters disappear. The read must
+        // fail rather than silently reporting a zeroed counter.
+        std::fs::remove_file(dir.path().join("pages_scanned")).unwrap();
+        assert!(
+            ksm.read_stats().is_err(),
+            "a missing REQUIRED counter must fail the read, not default to 0"
+        );
+
+        // And a directory with nothing at all is the same class of failure.
+        let empty = tempfile::tempdir().unwrap();
+        let dead = KsmController::new(empty.path().to_str().unwrap()).unwrap();
+        assert!(dead.read_stats().is_err());
+    }
+
+    /// End-to-end proof that the loop keeps reporting when only the optional
+    /// trio is missing: same setup as the seeded test minus
+    /// `ksm_zero_pages`/`stable_node_*`, driven through `run_metrics_loop`
+    /// with a real capture. If the loop treated an absent optional counter as
+    /// a fatal read error it would emit nothing here.
+    #[test]
+    fn test_metrics_loop_reports_with_optional_ksm_counters_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_ksm_stats(dir.path());
+        let ksm = KsmController::new(dir.path().to_str().unwrap()).unwrap();
+        let state = new_shared_state();
+
+        let capture = std::sync::Arc::new(parking_lot::Mutex::new(MetricCapture::default()));
+        let subscriber = MetricSubscriber {
+            inner: std::sync::Arc::clone(&capture),
+        };
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let signaller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(2500));
+            let _ = shutdown_tx.send(true);
+        });
+
+        tracing::subscriber::with_default(subscriber, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let loop_task = std::pin::pin!(run_metrics_loop(&ksm, state, 1, shutdown_rx));
+                let _ = tokio::time::timeout(Duration::from_secs(10), loop_task).await;
+            });
+        });
+
+        signaller
+            .join()
+            .expect("the shutdown signaller must return");
+
+        let reports = capture.lock().pages_sharing.clone();
+        assert!(
+            !reports.is_empty(),
+            "the loop must report when only the optional counters are absent"
+        );
+        assert!(
+            reports.iter().all(|&v| v == 20),
+            "every report must carry the seeded pages_sharing; got {reports:?}"
+        );
+    }
 }

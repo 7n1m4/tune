@@ -573,4 +573,315 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("Bad file descriptor") || message.contains("os error"));
     }
+
+    // ------------------------------------------------------------------
+    // Fault injection: the `/proc/pressure/memory` boundary failing
+    //
+    // Every case below is a way the kernel can hand the daemon something it
+    // cannot use: the file disappears, the inode is not a readable file, the
+    // contents are truncated, or a number is not a number. They are driven
+    // through the `read_from` seam so the test never has to touch the live
+    // `/proc/pressure/memory`.
+    // ------------------------------------------------------------------
+
+    /// The PSI file that exists is not guaranteed to be readable. A path whose
+    /// `stat` fails — here a directory, which is `EISDIR` for every uid
+    /// including root — must produce an error carrying the path, not a
+    /// zeroed `PsiStats` that would read as "memory pressure is fine".
+    #[test]
+    fn test_read_from_a_directory_reports_the_path_not_zero_pressure() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = PsiStats::read_from(dir.path()).expect_err("a directory is not PSI data");
+        let message = err.to_string();
+        assert!(
+            message.contains(dir.path().to_str().unwrap()),
+            "the error must name the path it could not read, got: {message}"
+        );
+        assert!(
+            message.contains("Is a directory") || message.contains("os error"),
+            "the error must carry the kernel reason, got: {message}"
+        );
+    }
+
+    /// A file that cannot be opened at all — here a symlink cycle, which fails
+    /// with `ELOOP` for an unprivileged user *and* for root, so this is the one
+    /// unreadable-file shape that is not uid-dependent — must also be an error
+    /// and not a silent zero.
+    #[test]
+    fn test_read_from_a_symlink_cycle_reports_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.pressure");
+        std::os::unix::fs::symlink(&path, &path).unwrap();
+
+        let err = PsiStats::read_from(&path).expect_err("a symlink cycle has no content");
+        assert!(
+            err.to_string().contains("memory.pressure"),
+            "the error must name the path it could not read, got: {err}"
+        );
+    }
+
+    /// A file the daemon is allowed to open but whose mode denies reading.
+    /// Under uid 0 the read succeeds, so the assertion branches on what the
+    /// host actually does rather than pretending the fault happened.
+    #[test]
+    fn test_read_from_a_mode_000_file_reports_permission_or_succeeds_as_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.pressure");
+        std::fs::write(&path, "some avg10=1.0 total=1\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        match PsiStats::read_from(&path) {
+            Err(e) => {
+                // Unprivileged: the refusal must be attributed to this file.
+                assert!(
+                    e.to_string().contains("memory.pressure"),
+                    "the refusal must name the file, got: {e}"
+                );
+            }
+            // Root ignores the mode bits, so the read succeeds and the parse
+            // must be correct rather than zeroed.
+            Ok(stats) => {
+                assert!(
+                    (stats.some.avg10 - 1.0).abs() < 0.001,
+                    "root read the file, so the contents must be parsed, got {}",
+                    stats.some.avg10
+                );
+                assert_eq!(stats.some.total, 1);
+            }
+        }
+    }
+
+    /// Cross-field leakage within one line. A failed `avg10` parse must not
+    /// adopt `avg60`'s value: the parser writes each key into its own slot, so
+    /// a leak here would make a truncated `avg10=` report the pressure of a
+    /// *different* average. Two differing values are what makes this
+    /// observable — with `avg10` and `avg60` equal the leak is invisible.
+    #[test]
+    fn test_a_failed_avg10_does_not_adopt_avg60() {
+        let stats = PsiStats::parse("some avg10= avg60=7.25 avg300=0.0 total=0\n").unwrap();
+        assert_eq!(
+            stats.some.avg10, 0.0,
+            "an unparseable avg10 must be 0.0, never avg60's 7.25"
+        );
+        assert!(
+            (stats.some.avg60 - 7.25).abs() < 0.001,
+            "avg60 on the same line must survive, got {}",
+            stats.some.avg60
+        );
+    }
+
+    /// Cross-line leakage: a line the parser does not recognise must not be
+    /// written into `full`. The kernel can ship a third line (a future stall
+    /// metric), and if that landed in `full` the governor would read a
+    /// `some`-scale number as a full stall and jump a pressure tier.
+    #[test]
+    fn test_an_unrecognised_line_does_not_reach_full() {
+        let stats = PsiStats::parse(
+            "some avg10=1.0 avg60=0.0 avg300=0.0 total=10\n\
+             full avg10=0.25 avg60=0.0 avg300=0.0 total=2\n\
+             future avg10=99.0 avg60=0.0 avg300=0.0 total=0\n",
+        )
+        .unwrap();
+        assert!(
+            (stats.full.avg10 - 0.25).abs() < 0.001,
+            "an unrecognised line must not overwrite full, got {}",
+            stats.full.avg10
+        );
+        assert_eq!(stats.full.total, 2);
+    }
+
+    /// Cross-CALL leakage: the parser builds a fresh `PsiStats` every call, so
+    /// a reading parsed after a heavy one must not inherit its numbers. Two
+    /// calls with different inputs is the only way to observe a mutation that
+    /// persists state across calls.
+    #[test]
+    fn test_two_parses_do_not_share_state() {
+        // The first parse sets every field, including ones the second parse
+        // will not mention at all. Those omissions are the whole point: a
+        // carry that seeds `PsiStats::default()` from the previous result can
+        // only be observed through a field the second input leaves absent.
+        let heavy = PsiStats::parse(
+            "some avg10=42.0 avg60=41.0 avg300=40.0 total=999\n\
+             full avg10=38.0 avg60=37.0 avg300=36.0 total=998\n",
+        )
+        .unwrap();
+        assert!(
+            (heavy.some.avg10 - 42.0).abs() < 0.001,
+            "the heavy reading must parse, got {}",
+            heavy.some.avg10
+        );
+        assert!((heavy.full.avg10 - 38.0).abs() < 0.001);
+
+        // A bare `some` line: no `full` line at all, and no `total` on either.
+        // Every field the first call set and this one does not must return to
+        // its own default, not to the first call's value.
+        let light = PsiStats::parse("some avg10=0.1\n").unwrap();
+        assert!(
+            (light.some.avg10 - 0.1).abs() < 0.001,
+            "the light reading's avg10 must parse, got {}",
+            light.some.avg10
+        );
+        assert_eq!(
+            light.some.avg60, 0.0,
+            "avg60 is absent from the second input, so it must be 0.0, not the \
+             first call's 41.0"
+        );
+        assert_eq!(light.some.avg300, 0.0, "nor the first call's 40.0");
+        assert_eq!(
+            light.some.total, 0,
+            "total is absent too, so it must be 0, not the first call's 999"
+        );
+        assert_eq!(
+            light.full.avg10, 0.0,
+            "the second input has no full line at all, so full must be the \
+             default 0.0, not the first call's 38.0"
+        );
+        assert_eq!(light.full.total, 0);
+
+        // And an empty document between the two must reset everything, so a
+        // carry cannot be hidden by the intervening call.
+        let cleared = PsiStats::parse("").unwrap();
+        assert_eq!(cleared.some.total, 0);
+        assert_eq!(cleared.full.total, 0);
+        assert_eq!(cleared.some.avg60, 0.0);
+        assert_eq!(cleared.full.avg60, 0.0);
+    }
+
+    /// A PSI line cut off mid-record must parse to zeros — the kernel can ship
+    /// a short read, and a partial `avg10=` with no value is not a reading of
+    /// "no pressure". The important half is that it does not inherit the
+    /// previous line's value.
+    #[test]
+    fn test_parse_of_a_truncated_line_yields_zeros_not_the_previous_line() {
+        // First a full reading, then a truncated one: `parse` builds a fresh
+        // `PsiLine`, so state cannot leak from one call into the next.
+        let full = PsiStats::parse("some avg10=42.0 avg60=41.0 avg300=40.0 total=99\n").unwrap();
+        assert!((full.some.avg10 - 42.0).abs() < 0.001);
+
+        let truncated = PsiStats::parse("some avg10=\n").unwrap();
+        assert_eq!(
+            truncated.some.avg10, 0.0,
+            "a truncated avg10 must read as 0.0, never as the previous value"
+        );
+        assert_eq!(truncated.some.avg60, 0.0);
+        assert_eq!(truncated.some.avg300, 0.0);
+        assert_eq!(truncated.some.total, 0);
+    }
+
+    /// The parser is deliberately lenient: an unparseable number becomes 0
+    /// rather than an error, because a PSI read that errors would abort the
+    /// governor tick and stop tuning. Assert that is what actually happens, and
+    /// that the surviving values are still parsed — so a parser that dropped
+    /// the whole line would fail here.
+    #[test]
+    fn test_parse_of_non_numeric_values_degrades_to_zeros_without_erroring() {
+        let stats =
+            PsiStats::parse("some avg10=abc avg60=1.5 total=-7\nfull avg10=? total=1e400\n")
+                .expect("unparseable PSI numbers are not a read failure");
+
+        assert_eq!(stats.some.avg10, 0.0, "a non-numeric avg10 must become 0.0");
+        assert!(
+            (stats.some.avg60 - 1.5).abs() < 0.001,
+            "the parseable field on the same line must survive, got {}",
+            stats.some.avg60
+        );
+        assert_eq!(stats.some.total, 0, "a negative total must parse as 0");
+        assert!(
+            stats.full.avg10.is_finite(),
+            "an overflowing total must not produce a non-finite average, got {}",
+            stats.full.avg10
+        );
+        assert_eq!(stats.full.total, 0);
+    }
+
+    /// A file that carries only a `some` line leaves `full` at zero. That is
+    /// the shape a partial kernel change would produce, and the zero is the
+    /// documented default rather than a fabricated reading.
+    #[test]
+    fn test_a_some_only_file_leaves_full_at_exactly_zero() {
+        let stats = PsiStats::parse("some avg10=3.0 total=10\n").unwrap();
+        assert!(
+            (stats.some.avg10 - 3.0).abs() < 0.001,
+            "the present line must be parsed, got {}",
+            stats.some.avg10
+        );
+        assert_eq!(
+            stats.full.avg10, 0.0,
+            "an absent full line must be exactly 0.0, never NaN or a stale value"
+        );
+        assert_eq!(stats.full.total, 0);
+    }
+
+    /// A trigger registered on a file the daemon cannot open — here a
+    /// directory, `EISDIR` for root as well — must fail with the path attached.
+    /// The alternative, a trigger left pointing at a closed or overlapping fd,
+    /// is what makes a monitoring loop stop noticing pressure.
+    #[test]
+    fn test_psi_trigger_new_from_path_on_a_directory_fails_naming_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = match PsiTrigger::new_from_path(dir.path(), PsiTriggerKind::Some, 1000, 500_000) {
+            Err(e @ TunedError::Sysfs { .. }) => e,
+            Err(other) => panic!("expected a Sysfs error, got: {other:?}"),
+            Ok(_) => panic!("a directory cannot hold a PSI trigger, but one was created"),
+        };
+        assert!(
+            err.to_string().contains(dir.path().to_str().unwrap()),
+            "the failed registration must name the path, got: {err}"
+        );
+    }
+
+    /// A trigger on a path that vanishes before the open — the resurrection
+    /// case, where the daemon recreates its monitoring file while another
+    /// process removes it — must be an error rather than a dangling fd.
+    #[test]
+    fn test_psi_trigger_new_from_path_on_a_missing_file_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone").join("memory.pressure");
+
+        let err = match PsiTrigger::new_from_path(&missing, PsiTriggerKind::Full, 1000, 500_000) {
+            Err(e @ TunedError::Sysfs { .. }) => e,
+            Err(other) => panic!("expected a Sysfs error, got: {other:?}"),
+            Ok(_) => panic!("a missing PSI file cannot be monitored, but a trigger was created"),
+        };
+        assert!(
+            err.to_string().contains("memory.pressure"),
+            "the error must name the path, got: {err}"
+        );
+    }
+
+    /// The live `/proc/pressure/memory` read is the one seam with no test
+    /// double: on a host with PSI enabled it must return a *finite* average, on
+    /// a host without it the error must name the real path. Both arms are
+    /// strict — a fabricated `Ok` with NaN would fail the finite check, and a
+    /// swallowed `?` would produce an empty message.
+    #[test]
+    fn test_read_memory_is_finite_or_named() {
+        match PsiStats::read_memory() {
+            Ok(stats) => {
+                assert!(
+                    stats.some.avg10.is_finite() && stats.full.avg10.is_finite(),
+                    "a real PSI read must be finite, got some={} full={}",
+                    stats.some.avg10,
+                    stats.full.avg10
+                );
+                assert!(
+                    stats.some.avg10 >= 0.0 && stats.full.avg10 >= 0.0,
+                    "a real PSI average cannot be negative, got some={} full={}",
+                    stats.some.avg10,
+                    stats.full.avg10
+                );
+            }
+            Err(e) => {
+                let message = e.to_string();
+                assert!(
+                    message.contains(PSI_MEMORY_PATH),
+                    "the failure must name {PSI_MEMORY_PATH}, got: {message}"
+                );
+            }
+        }
+    }
 }

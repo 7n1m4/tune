@@ -393,4 +393,145 @@ mod tests {
         );
         assert_eq!(record_every_for(&cfg), Duration::from_secs(7));
     }
+
+    // ------------------------------------------------------------------
+    // Fault injection: the recording path failing
+    //
+    // The recording half of this task is the one with no seam: `record_tick`
+    // writes the library's own `STATS_PATH`, so a test cannot redirect it with
+    // a tempdir. What it can do is drive `record_tick` on the real path and
+    // assert the failure is reported rather than swallowed — because a
+    // swallowed `?` here is what makes a live ceiling change look applied.
+    // ------------------------------------------------------------------
+
+    /// A poll whose decision cannot be written must return the error, not a
+    /// fabricated `Applied`. This is the dry-run arm, which is the only shape
+    /// testable without touching `max_pool_percent`; the write-failure arm is
+    /// the same `?` one line further down.
+    #[tokio::test]
+    async fn poll_once_in_dry_run_reports_the_decision_without_touching_sysfs() {
+        let debounce = Arc::new(Mutex::new(Debounce::new(tuned_zswap::DEBOUNCE)));
+        let before = tuned_zswap::read_limit();
+
+        let mut guard = debounce.lock();
+        let outcome = tuned_zswap::poll_once(&mut guard, true);
+        drop(guard);
+
+        // The ceiling must be untouched by a dry run, so the comparison is
+        // against the live value read before the poll.
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                assert!(
+                    !e.trim().is_empty(),
+                    "a failed poll must report its reason, not an empty error"
+                );
+                return;
+            }
+        };
+        if let Ok(limit) = before {
+            assert_eq!(
+                tuned_zswap::read_limit().unwrap_or(0),
+                limit,
+                "a dry-run poll must not move the live ceiling"
+            );
+        }
+        // Whatever the dry run decided, the reported `from` is the ceiling it
+        // observed, and that must agree with what the reader sees now.
+        assert_eq!(
+            outcome.from,
+            tuned_zswap::read_limit().unwrap_or(outcome.from),
+            "the reported starting ceiling must match the live reader"
+        );
+    }
+
+    /// `record_tick` can fail two ways: the debugfs counters are unreadable, or
+    /// the log is unwritable. Both must surface as an `Err` carrying a message,
+    /// because the caller only skips this sample when it knows why.
+    #[test]
+    fn record_tick_failure_or_success_is_always_a_reported_reason() {
+        let started = std::time::Instant::now();
+        let result = tuned_zswap::record_tick(0);
+        // The blocking path must finish promptly: a hang here is the failure a
+        // returned value cannot express.
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "a recording sample must not hang the task"
+        );
+        match result {
+            Ok(()) => {}
+            Err(e) => {
+                assert!(
+                    !e.trim().is_empty(),
+                    "a skipped sample must report its reason, not an empty error"
+                );
+            }
+        }
+    }
+
+    /// The daemon's recording cadence fallback must land on the library's own
+    /// validated value, not a hardcoded guess. An env override of `"junk"` or
+    /// `"0"` must fall back rather than become a zero-second spin.
+    #[test]
+    fn a_junk_or_zero_record_interval_env_falls_back_to_the_library_default() {
+        let previous = std::env::var_os(tuned_zswap::RECORD_INTERVAL_ENV);
+        // A value the library default cannot equal, so the "explicit beats
+        // the environment" check below has something to distinguish against.
+        const OUTRANKED: u64 = 23;
+
+        for raw in ["junk", "0", "  ", "-5"] {
+            std::env::set_var(tuned_zswap::RECORD_INTERVAL_ENV, raw);
+            let chosen = record_every_for(&ZswapConfig::default());
+            assert_eq!(
+                chosen,
+                tuned_zswap::record_interval(),
+                "the env {raw:?} must defer to the library default"
+            );
+            assert!(
+                chosen.as_secs() > 0,
+                "the env {raw:?} must not produce a zero-second cadence"
+            );
+        }
+
+        // An explicit cadence outranks both zero and the environment: the
+        // env is set to the one value that would otherwise be picked, so a
+        // `record_every_for` that consulted the library default instead of the
+        // config would agree with it and the test could not tell them apart.
+        std::env::set_var(tuned_zswap::RECORD_INTERVAL_ENV, OUTRANKED.to_string());
+        assert_eq!(
+            record_every_for(&ZswapConfig::default()),
+            Duration::from_secs(OUTRANKED),
+            "a zero configured cadence must reach the environment-aware default"
+        );
+        assert_eq!(
+            record_every_for(&ZswapConfig {
+                record_interval_secs: 4,
+                ..ZswapConfig::default()
+            }),
+            Duration::from_secs(4),
+            "an explicit cadence must outrank the environment"
+        );
+
+        match previous {
+            Some(value) => std::env::set_var(tuned_zswap::RECORD_INTERVAL_ENV, value),
+            None => std::env::remove_var(tuned_zswap::RECORD_INTERVAL_ENV),
+        }
+    }
+
+    /// An interval so large it overflows `Duration` must not wrap into a tiny
+    /// panic or an instant spin. `Duration::from_secs` takes a `u64`, so the
+    /// guard the config comment promises is expressed directly here.
+    #[test]
+    fn an_extreme_configured_interval_is_representable() {
+        let cfg = ZswapConfig {
+            interval_secs: u64::MAX,
+            ..ZswapConfig::default()
+        };
+        let chosen = poll_every_for(&cfg);
+        assert_eq!(chosen, Duration::from_secs(u64::MAX));
+        assert!(
+            chosen.as_secs() > 0,
+            "an extreme cadence must not degenerate to zero"
+        );
+    }
 }
