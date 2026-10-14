@@ -128,6 +128,13 @@ Two consequences an agent must respect:
    flagged processes kept running normally for 38 min). SIGILL is
    unrecoverable, so a trap shortly after a stop is a process that already
    took the fault, not evidence of a self-sustaining loop.
+3. **Blocklist matching is by `/proc/PID/comm` substring, which is 15 chars and
+   user-writable.** Chromium happens to set it to `chrome`, but a process can
+   rename itself via `prctl(PR_SET_NAME)` to something that does not match any
+   entry, and the daemon will mark it. The blocklist is a strong heuristic, not
+   a security boundary — do not write anything that treats it as one, and do not
+   "tighten" it by adding more names; the executable-VMA guard is what actually
+   protects an unlisted process.
 
 ### No secrets
 
