@@ -81,6 +81,16 @@ $ cargo run -p tuned-daemon -- run --config config/tuned.toml --dry-run
 - Filesystem: use `tempfile` scoped to test
 - **Before PR**: `make test` + `make coverage`
 - **Known flake**: `TestFetchSubscriptionTimeout` (timing-sensitive)
+- **Never assume a spawned child's `MMF_VM_MERGE_ANY` state.** The flag lives on
+  `mm_struct`, is inherited across *both* `fork` and `execve`, and has no
+  userspace clear call — verified live: a child spawned from a flagged shell
+  still reads `ksm_merge_any: yes` through `setsid`, `exec`, `env`, `nice` and
+  `timeout` alike. So a test that asserts a child lands in `to_mark` is correct
+  on an unflagged host and **wrong on any host the daemon has marked**, which
+  includes this one. Tests that care must read the child's own
+  `/proc/<pid>/ksm_stat` and assert the outcome that state implies, on both
+  branches (see `child_merge_any` / `wait_for_merge_any_field` in
+  `crates/tuned/src/scanner.rs`).
 
 ### Rust gotchas
 
@@ -106,7 +116,56 @@ Never widen the write surface beyond the KSM sysfs directory.
 ### Browser blocklist (settled decision, do not revert)
 
 Browsers are **blocklisted by default**, not by configuration:
-`chrome, chromium, firefox, msedge, brave, opera, vivaldi, electron`.
+`chrome, chromium, firefox, msedge, brave, opera, vivaldi, electron`, plus the
+shell-scoped role comms those engines give their child processes —
+`Isolated Web Co`, `Web Content`, `WebExtensions`, `Socket Process`,
+`RDD Process`, `Privileged Cont`, `Utility Process`, `Crash Reporter`.
+
+The role comms are not padding. Matching is a **substring** test over
+`/proc/PID/comm` (see below), and the browser-name entry matches only the
+process that still carries that name. Firefox renames every content process
+with `PR_SET_NAME`: the parent runs as `firefox` and its renderers as
+**`Isolated Web Co` or `Web Content`** — two distinct, coexisting comms for the
+same `-contentproc -isForBrowser` role, 5 and 3 processes respectively on
+2026-10-15 with byte-identical cmdlines — plus `WebExtensions`, `RDD Process`,
+`Socket Process`, `Privileged Cont`, `Utility Process` and `Crash Reporter`.
+
+The two content comms are **not** two spellings of one name, and neither
+substitutes for the other:
+
+- `Isolated Web Content` is the libxul string; the kernel truncates it to 15
+  bytes as `Isolated Web Co`. There is no literal `Isolated Web Co` in the
+  binary, so an entry sourced only from `strings libxul.so` would have missed
+  it.
+- `Web Content` is a separate, shorter libxul string that Firefox sets verbatim,
+  so it is not a truncation of anything. It is 11 bytes and needs its own entry.
+- Both are stable per process: watching a pid for a minute never observed a
+  switch between them. Adding `Web Content` on 2026-10-15 was prompted by a live
+  audit that found the form uncovered while `Isolated Web Co` was not.
+
+A 2026-10-15 live run (2m23s) marked **six
+Firefox processes** and the exec-VMA guard covered **zero** of their
+executable VMAs (per-process `protected=0
+unprotected=90/116/34/98/154/109`). Nothing crashed only because ksmd never
+completed a scan — the same collision that killed Chromium, deferred rather
+than prevented. Chromium is not affected by this gap (its child comm is
+`chrome`), which is why a `firefox`-only check looked sufficient.
+
+**When adding an entry, confirm the spelling rather than assuming it.** Read it
+from a live process (`cat /proc/PID/comm`) or from the engine binary
+(`strings -a libxul.so | grep -aE 'WebExtensions|RDD Process'`). Two traps:
+
+1. **The kernel truncates `comm` to 15 bytes.** `Isolated Web Content` is
+   observed as `Isolated Web Co`, so an entry written from the full source
+   name never matches anything. An entry longer than 15 bytes is *inert*, not
+   merely redundant — `crashpad_handler` is 16 bytes and was deliberately left
+   out on 2026-10-15 for exactly that reason. The converse trap is a comm that
+   is *not* a truncation at all: `Web Content` is set verbatim by Firefox and is
+   shorter than the limit, so it still needs its own entry even though a
+   truncation entry for the same role exists.
+2. **An unconfirmed entry is worse than a missing one.** `GMPLauncher` was
+   left out on 2026-10-15 because no such process was alive to read and the
+   string is not in libxul.so.
 
 Verified cause (2026-10-14): `PR_SET_MEMORY_MERGE` marks executable VMAs
 mergeable, and the kernel's `ksm_compatible()` does **not** exclude `VM_EXEC`,
@@ -135,6 +194,12 @@ Two consequences an agent must respect:
    a security boundary — do not write anything that treats it as one, and do not
    "tighten" it by adding more names; the executable-VMA guard is what actually
    protects an unlisted process.
+
+   Note the tension that item 3 now carries honestly: the role comms above are
+   an exception to "do not add more names", added because the alternative was a
+   measured live marking of browser renderers. The reason they are safe is that
+   they are **confirmed**, not guessed. Do not generalise from them to a habit
+   of adding names on suspicion.
 
 ### No secrets
 

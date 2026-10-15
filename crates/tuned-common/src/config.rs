@@ -194,6 +194,27 @@ impl Default for ScannerConfig {
                 // kernel comm is `chrome` (PR_SET_NAME truncates to 15 chars);
                 // the names below cover Chromium builds under other comms and
                 // the Firefox family.
+                //
+                // The shell-scoped entries are the point of the list's size.
+                // `comm` holds whatever the process last set via PR_SET_NAME,
+                // and both engine families rename their children away from the
+                // browser name to a role name — Firefox's content process runs
+                // as `Isolated Web Co` or `Web Content`, neither of which is
+                // `firefox`, so a `firefox` entry alone catches only the parent
+                // process and every renderer it forks. A 2026-10-15 live run
+                // proved the gap: 6 Firefox processes were marked and left with
+                // 90–154 executable VMAs unprotected, and the only reason
+                // nothing crashed is that ksmd never completed a scan in 2m23s.
+                // Chromium sets its child comm to `chrome`, so its entries are
+                // belt-and-braces, not a fix.
+                //
+                // Confirm the spellings before adding one: read them off a live
+                // process (`cat /proc/PID/comm`), or out of the engine binary
+                // (`strings libxul.so | grep -a WebExtensions`). Both are
+                // truncated to 15 bytes by the kernel, so `Privileged Cont` is
+                // the real value for the process whose full name is
+                // `Privileged Content`, and an entry written from the full name
+                // would never match.
                 "chrome".to_string(),
                 "chromium".to_string(),
                 "firefox".to_string(),
@@ -202,6 +223,53 @@ impl Default for ScannerConfig {
                 "opera".to_string(),
                 "vivaldi".to_string(),
                 "electron".to_string(),
+                // Firefox's per-process shell-scoped comms. Observed live on
+                // 7.3.0-rc6 on 2026-10-15 alongside `firefox` (pids counted off
+                // `/proc/PID/comm` with `readlink /proc/PID/exe` confirming
+                // `/usr/lib/firefox/firefox`); the strings are present in
+                // libxul.so, so they are not build-local.
+                //
+                // `Isolated Web Co` and `Web Content` are BOTH real, live,
+                // coexisting comms for the *same* `-contentproc -isForBrowser`
+                // role — 5 processes run as one and 3 as the other right now,
+                // with byte-identical cmdlines. Neither implies the other, so
+                // both entries are required:
+                //   * `Isolated Web Content` is the libxul string; the kernel
+                //     truncates it to 15 bytes as `Isolated Web Co`. There is
+                //     no literal `Isolated Web Co` string in the binary — it is
+                //     produced by `PR_SET_NAME` + truncation, which is why an
+                //     entry spelled from libxul alone would have missed it.
+                //   * `Web Content` is a separate, shorter libxul string that is
+                //     set verbatim, so it is NOT a truncation of anything.
+                // They are stable per process: watching a pid over a minute
+                // never observed a switch between the two.
+                "Isolated Web Co".to_string(),
+                "Web Content".to_string(),
+                "WebExtensions".to_string(),
+                "Socket Process".to_string(),
+                "RDD Process".to_string(),
+                "Privileged Cont".to_string(),
+                "Utility Process".to_string(),
+                // The Firefox crash handler's comm, confirmed as a string in
+                // libxul.so. `Utility Process` and this one are the
+                // generic-sounding entries, and that is deliberate — they are
+                // real, and a name that reads as generic has killed a browser
+                // already.
+                "Crash Reporter".to_string(),
+                // Deliberately NOT `crashpad_handler`: that is Chromium's bare
+                // handler binary, but it is 16 bytes, so the kernel truncates
+                // the comm to `crashpad_handl` and the full string can never
+                // match anything. Chromium's real handler is
+                // `chrome_crashpad_handler`, truncated to `chrome_crashpad`,
+                // which the `chrome` entry above already covers — live on this
+                // host right now. An inert entry is worse than a missing one:
+                // it reads as a fix and stops anyone looking.
+                //
+                // Do NOT add `GMPLauncher` either: no such process was alive to
+                // read and the string is not in libxul.so, so it is
+                // unconfirmed. Confirm against `<firefox>/libxul.so`
+                // (`strings -a libxul.so | grep GMPLauncher`) or a live
+                // process before adding it.
             ],
             target_cgroups: vec![],
             max_candidates_per_cycle: 5,

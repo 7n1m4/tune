@@ -1590,6 +1590,48 @@ mod tests {
         }
     }
 
+    /// Whether `pid` carries `MMF_VM_MERGE_ANY` (`ksm_merge_any: yes`).
+    ///
+    /// Read from the target's own `/proc/PID/ksm_stat`, which is the same source
+    /// the scanner's Level 2 filter consults, so this is the flag as production
+    /// sees it rather than a modelled value.
+    ///
+    /// `None` means "unknown" — either the process is gone or `/proc/PID/ksm_stat`
+    /// is not readable (it needs a matching uid for a non-child, and reads as
+    /// root). Tests treat unknown exactly as the collector does: no evidence of
+    /// the flag, so the process stays a marking candidate.
+    fn child_merge_any(pid: u32) -> Option<bool> {
+        let raw = std::fs::read_to_string(format!("/proc/{pid}/ksm_stat")).ok()?;
+        // `ksm_stat` mixes separators: the first four fields are
+        // space-separated (`ksm_rmap_items 0`), the last two colon-separated
+        // (`ksm_merge_any: yes`). Trim the colon from the key rather than
+        // requiring one shape, so a kernel change in either direction still
+        // reads the flag.
+        for line in raw.lines() {
+            let mut parts = line.split_whitespace();
+            if parts.next().map(|k| k.trim_end_matches(':')) == Some("ksm_merge_any") {
+                return Some(matches!(parts.next(), Some("yes")));
+            }
+        }
+        Some(false)
+    }
+
+    /// Wait until the target's own `ksm_stat` reports a `ksm_merge_any` value.
+    ///
+    /// The field is per-`mm` and is inherited across `fork` and `execve`, so a
+    /// child spawned from a shell the daemon marked carries `yes` while one from
+    /// an unflagged shell carries `no`. Both states are legitimate, and neither
+    /// can be produced on demand — there is no userspace call that clears
+    /// `MMF_VM_MERGE_ANY`, and every wrapper (`setsid`, `exec`, `env`) still
+    /// inherits it because the flag lives on the `mm_struct` that survives
+    /// `execve`. So the callers cannot know the state before they look, only
+    /// after, and they must be correct either way.
+    fn wait_for_merge_any_field(pid: u32) -> bool {
+        wait_until("child ksm_stat reports ksm_merge_any", || {
+            child_merge_any(pid).is_some()
+        })
+    }
+
     /// Yama `ptrace_scope`, or `u8::MAX` when the file is absent (kernels built
     /// without Yama, where any descendant is attachable anyway).
     fn ptrace_scope() -> u8 {
@@ -1724,6 +1766,23 @@ mod tests {
         };
         let mut stats = ScannerStats::default();
 
+        // `MMF_VM_MERGE_ANY` is inherited across `fork` and `execve`, so whether
+        // this child is a marking target or an already-flagged one depends on
+        // whether the test runner was marked. That is not knowable in advance
+        // and cannot be forced from userspace, so read it and assert the
+        // outcome that state implies — strictly, in both directions.
+        let flagged = wait_for_merge_any_field(live_pid).then_some(child_merge_any(live_pid));
+        let flagged = match flagged {
+            Some(Some(v)) => v,
+            _ => {
+                // `ksm_stat` unreadable: Level 2 sees no evidence and the
+                // process stays a marking candidate, which is the same branch
+                // the collector takes with `merge_any = false`.
+                eprintln!("child ksm_stat unreadable; treating as unflagged");
+                false
+            }
+        };
+
         let targets = collect_scan_targets(
             &config,
             vec![dead_pid, live_pid],
@@ -1737,15 +1796,47 @@ mod tests {
             !collected.contains(&dead_pid),
             "a reaped child must be skipped, not injected: {collected:?}"
         );
-        assert!(
-            collected.contains(&live_pid),
-            "a vanished PID must not stop the surviving processes from being \
-         collected: {collected:?}"
-        );
         assert_eq!(
             stats.processes_filtered_l1, 1,
             "only the readable status may be counted at Level 1"
         );
+
+        // The surviving child must be routed somewhere in both directions — a
+        // collector that dropped it entirely would also produce an empty
+        // `to_mark` and would pass the `!dead_pid` assertion above vacuously.
+        let routed: Vec<u32> = if flagged {
+            targets.already_flagged.iter().map(|c| c.pid).collect()
+        } else {
+            collected.clone()
+        };
+        assert_eq!(
+            routed,
+            vec![live_pid],
+            "the surviving child must be routed to {}, not dropped: \
+             to_mark={collected:?} already_flagged={:?} (merge_any={flagged})",
+            if flagged {
+                "already_flagged"
+            } else {
+                "to_mark"
+            },
+            targets
+                .already_flagged
+                .iter()
+                .map(|c| c.pid)
+                .collect::<Vec<_>>(),
+        );
+        if flagged {
+            assert!(
+                !collected.contains(&live_pid),
+                "an already-flagged child is not a marking target: {collected:?}"
+            );
+        } else {
+            assert!(
+                collected.contains(&live_pid),
+                "an unflagged child must still be a marking target even when a \
+                 vanished PID is present: {collected:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2048,6 +2139,20 @@ mod tests {
             .spawn()
             .expect("spawn a discovery target");
         let child_pid = child.id();
+
+        // "Discovered" is a runtime outcome, so it does not depend on the flag:
+        // Level 1 discovery is what this half pins. `MMF_VM_MERGE_ANY` is
+        // inherited across `fork`/`execve`, so whether the child then lands in
+        // `to_mark` or `already_flagged` depends on whether the test runner was
+        // marked — unknowable in advance and unforceable from userspace. Read
+        // it and assert the outcome that state implies, strictly in both
+        // directions.
+        let flagged = if wait_for_merge_any_field(child_pid) {
+            child_merge_any(child_pid).unwrap_or(false)
+        } else {
+            false
+        };
+
         let mut stats = ScannerStats::default();
         let targets = collect_scan_targets(
             &config,
@@ -2062,12 +2167,31 @@ mod tests {
             stats.processes_filtered_l1, 1,
             "a live process must still be discovered as a candidate"
         );
-        assert_eq!(
-            targets.to_mark.len(),
-            1,
-            "a non-injectable target must still be discovered"
-        );
-        assert_eq!(targets.to_mark[0].pid, child_pid);
+
+        // Discovery is the property under test: the target must be routed
+        // somewhere, whichever branch the flag puts it on. A collector that
+        // dropped it would fail both.
+        if flagged {
+            assert_eq!(
+                targets.already_flagged.len(),
+                1,
+                "a non-injectable target must still be discovered even when it \
+                 already holds the flag: to_mark={} already_flagged={:?}",
+                targets.to_mark.len(),
+                targets.already_flagged.first().map(|c| c.pid),
+            );
+            assert_eq!(
+                targets.already_flagged[0].pid, child_pid,
+                "the discovered target must be the child that was spawned"
+            );
+        } else {
+            assert_eq!(
+                targets.to_mark.len(),
+                1,
+                "a non-injectable target must still be discovered"
+            );
+            assert_eq!(targets.to_mark[0].pid, child_pid);
+        }
     }
 
     /// A blocklist match is a **heuristic, never a security boundary** (see the

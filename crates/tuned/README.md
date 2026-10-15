@@ -146,8 +146,18 @@ next 30 s pass; and ptrace injection into a sandboxed renderer may be refused.
 Rather than keep guessing, browsers are in the default blocklist. Their
 anonymous memory is JIT-heavy and fork-heavy by construction, which is precisely
 the profile where a userspace guard cannot keep up. The blocked set is
-`chrome`, `chromium`, `firefox`, `msedge`, `brave`, `opera`, `vivaldi` and
-`electron`.
+`chrome`, `chromium`, `firefox`, `msedge`, `brave`, `opera`, `vivaldi`,
+`electron`, plus the shell-scoped role comms those engines give their child
+processes: `Isolated Web Co`, `WebExtensions`, `Socket Process`, `RDD Process`,
+`Privileged Cont`, `Utility Process`, `Crash Reporter`.
+
+Those role comms are the load-bearing part. A `firefox` entry matches only the
+process still named `firefox` — the parent — while every renderer runs as
+`Isolated Web Co`, the 15-byte truncation of `Isolated Web Content`. A live
+2026-10-15 run of the shorter list marked six Firefox processes and covered zero
+of their executable VMAs. Nothing crashed only because ksmd never finished a
+scan in 2m23s. Do not shorten the list, and never add an entry over 15 bytes:
+comm is truncated, so such an entry is inert rather than merely redundant.
 
 The guard remains — it protects ordinary processes, where the exec surface is
 static at startup — but it is not claimed as browser-safe. Removing an entry
@@ -256,9 +266,13 @@ stats_path = "/var/log/tuned-zswap/stats.jsonl"  # the JSONL recording history
 >
 > **That replacement has teeth.** The default `blocklist` contains the browsers
 > (`chrome`, `chromium`, `firefox`, `msedge`, `brave`, `opera`, `vivaldi`,
-> `electron`). Writing your own `blocklist` — even the four lines shown above —
-> silently drops all of them and re-opens the SIGILL crash. Copy the full list
-> from `config/tuned.toml` into your config.
+> `electron`) and the shell-scoped role comms their child processes take
+> (`Isolated Web Co`, `WebExtensions`, `Socket Process`, `RDD Process`,
+> `Privileged Cont`, `Utility Process`, `Crash Reporter`). Writing your own
+> `blocklist` — even the four lines shown above — silently drops all of them and
+> re-opens the SIGILL crash; a 2026-10-15 run with a browser-name-only list
+> marked six Firefox processes. Copy the full list from `config/tuned.toml` into
+> your config, and keep every entry at 15 bytes or fewer.
 
 ### Run
 ```bash

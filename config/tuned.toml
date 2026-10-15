@@ -32,7 +32,21 @@ max_candidates_per_cycle = 5    # top K by RSS per cycle (bounds the ptrace burs
 # unguarded, and once with the executable-VMA guard demonstrably firing
 # (exec_vmas_protected=403, exec_vmas_reprotected=96). Kernel comm is at most 15
 # chars and Chromium sets it to `chrome`; the others cover the same class.
-blocklist = ["tuned", "ksmd", "systemd", "sshd", "chrome", "chromium", "firefox", "msedge", "brave", "opera", "vivaldi", "electron"]
+#
+# The role comms at the end are load-bearing, not padding. Matching is a
+# substring test over the 15-byte comm, so a browser-name entry matches only the
+# process that still carries it — Firefox's *content* processes run as
+# `Isolated Web Co` or `Web Content`, never `firefox`. Both forms are real and
+# live at the same time (5 and 3 processes on 2026-10-15) with identical
+# `-contentproc -isForBrowser` cmdlines, so neither substitutes for the other.
+# `Isolated Web Co` is the 15-byte truncation of the libxul string
+# `Isolated Web Content`; `Web Content` is a separate string set verbatim. A live
+# 2026-10-15 run with the shorter list marked six Firefox processes and left
+# 90-154 executable VMAs per process unprotected. Do not shorten this list; if
+# you must replace it, copy it whole. Never write an entry longer than 15 bytes:
+# comm is truncated, so such an entry can never match anything. See AGENTS.md
+# "Browser blocklist".
+blocklist = ["tuned", "ksmd", "systemd", "sshd", "chrome", "chromium", "firefox", "msedge", "brave", "opera", "vivaldi", "electron", "Isolated Web Co", "Web Content", "WebExtensions", "Socket Process", "RDD Process", "Privileged Cont", "Utility Process", "Crash Reporter"]
 target_cgroups = []             # empty = scan all user processes
 
 # The zswap tuner. Note what is *not* here: the 15 s poll, the 10 pp step, the

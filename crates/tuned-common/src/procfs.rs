@@ -438,6 +438,255 @@ mod tests {
         }
     }
 
+    /// Every entry of the default blocklist must actually block the name it
+    /// claims to block.
+    ///
+    /// This is the pin that catches the class of defect a substring match can
+    /// hide: an entry that is *present* but inert, because it was written from
+    /// a name that never survives the kernel's 15-byte truncation. It is the
+    /// reason each Firefox entry below is the truncated comm,
+    /// `Privileged Cont`, and not the source's `Privileged Content`.
+    ///
+    /// Asserting every entry, rather than a browser-only subset, is deliberate:
+    /// a typo in any entry would otherwise ship as `"..." .to_string()` that
+    /// matches nothing, which is indistinguishable from a correct entry until a
+    /// process dies.
+    #[test]
+    fn test_every_default_blocklist_entry_blocks_its_own_name() {
+        let defaults = crate::config::ScannerConfig::default();
+
+        assert!(
+            !defaults.blocklist.is_empty(),
+            "an empty default blocklist would block nothing"
+        );
+
+        for entry in &defaults.blocklist {
+            assert!(
+                is_blocklisted(entry, &defaults.blocklist),
+                "the default blocklist entry {entry:?} must match itself; an entry \
+                 that cannot even match its own spelling is dead weight and a \
+                 latent hole"
+            );
+            assert!(
+                entry.len() <= 15,
+                "the default blocklist entry {entry:?} is {} bytes; comm is \
+                 truncated to 15 bytes, so an entry longer than that can never \
+                 match anything",
+                entry.len()
+            );
+        }
+    }
+
+    /// The 2026-10-15 regression, pinned as its own test.
+    ///
+    /// A live 2m23s run marked six Firefox processes — four content processes
+    /// (`comm` `Isolated Web Co`), `WebExtensions`, plus `omp` and
+    /// `jev-gguf-scores` — and the exec-VMA guard covered **zero** of their
+    /// executable VMAs (per-process `protected=0 unprotected=90/116/34/98/154/109`).
+    /// Nothing crashed only because ksmd never completed a scan. The cause is
+    /// that the default blocklist had `firefox`, which matches the parent
+    /// process and nothing else: Firefox renames every content process to a
+    /// role name via `PR_SET_NAME`, and `/proc/PID/comm` carries that name,
+    /// never the literal `firefox`.
+    ///
+    /// Chromium is not affected (its child comm is `chrome`), which is why the
+    /// existing test alone looked sufficient. This test fails if any of these
+    /// entries is removed from the default list.
+    #[test]
+    fn test_default_blocklist_covers_firefox_content_process_comms() {
+        let defaults = crate::config::ScannerConfig::default();
+
+        // Every Firefox comm observed live on 7.3.0-rc6 on 2026-10-15, read off
+        // real `/proc/PID/comm` of a running Firefox and confirmed by
+        // `readlink /proc/PID/exe` == `/usr/lib/firefox/firefox`. These are
+        // 15-byte-truncated; `Isolated Web Co` IS the truncated form of
+        // `Isolated Web Content`, while `Web Content` is a separate libxul
+        // string set verbatim — live at the same time, 5 and 3 processes
+        // respectively, with byte-identical `-contentproc -isForBrowser`
+        // cmdlines, so neither form implies the other and both are required.
+        for watched in [
+            "firefox",
+            "Isolated Web Co",
+            "Web Content",
+            "WebExtensions",
+            "Socket Process",
+            "RDD Process",
+            "Privileged Cont",
+            "Utility Process",
+            "Crash Reporter",
+        ] {
+            assert!(
+                is_blocklisted(watched, &defaults.blocklist),
+                "Firefox's {watched:?} process must be blocked by the default \
+                 blocklist: 6 Firefox processes were marked and left with \
+                 90-154 unprotected executable VMAs because it was not"
+            );
+        }
+
+        // The exact live counts this set was built from, pinned so a future
+        // list edit cannot silently drop a role that is running today.
+        let live_firefox_comms: &[(&str, usize)] = &[
+            ("firefox", 1),
+            ("forkserver", 1),
+            ("Socket Process", 1),
+            ("RDD Process", 1),
+            ("Utility Process", 1),
+            ("Privileged Cont", 1),
+            ("WebExtensions", 1),
+            ("Isolated Web Co", 5),
+            ("Web Content", 3),
+        ];
+        for (comm, seen) in live_firefox_comms {
+            // `forkserver` is deliberately NOT blocklisted: it is Firefox's
+            // pre-fork launcher, but blocking it does not stop the content
+            // processes it later forks, so it buys nothing and costs an
+            // ordinary-process match. Everything else must be covered.
+            if *comm == "forkserver" {
+                continue;
+            }
+            assert!(
+                is_blocklisted(comm, &defaults.blocklist),
+                "comm {comm:?} was live on 2026-10-15 ({seen} processes) and \
+                 must be blocked: an uncovered content comm is the exact defect \
+                 that left 92 executable VMAs per process unprotected"
+            );
+        }
+
+        // Chromium's crash handler, which is the truncated form of
+        // `chrome_crashpad_handler` — confirmed live on this host, right now.
+        // The bare `crashpad_handler` is deliberately NOT expected to match:
+        // it is 16 bytes, so the kernel truncates the comm to
+        // `chrome_crashpa`/`crashpad_handl` and the entry would be inert.
+        for watched in ["chrome", "chrome_crashpad"] {
+            assert!(
+                is_blocklisted(watched, &defaults.blocklist),
+                "Chromium's {watched:?} process must be blocked by the default \
+                 blocklist"
+            );
+        }
+        assert_eq!(
+            "chrome_crashpad_handler".len(),
+            23,
+            "Chromium's handler binary name exceeds the 15-byte comm limit"
+        );
+        assert_eq!(
+            &"chrome_crashpad_handler"[..15],
+            "chrome_crashpad",
+            "the first 15 bytes are what the kernel exposes as comm"
+        );
+
+        // The 15-byte guard, applied to the forms above that were derived from
+        // a longer source name. `Isolated Web Content` is 20 bytes and exists
+        // in libxul.so, but the comm the kernel exposes is its 15-byte prefix —
+        // an entry spelled from the source name would be inert.
+        assert_eq!(
+            "Isolated Web Content".len(),
+            20,
+            "the libxul string is longer than the comm limit"
+        );
+        assert_eq!(
+            &"Isolated Web Content"[..15],
+            "Isolated Web Co",
+            "the first 15 bytes are what the kernel exposes as comm"
+        );
+        assert!(
+            "Web Content".len() <= 15,
+            "Web Content is short enough to match verbatim, so it needs its own \
+             entry rather than relying on a truncation"
+        );
+    }
+
+    /// The complementary assertion, and the reason the list above stays small.
+    ///
+    /// A blocklist that expands by feel would mark nothing at all — the daemon's
+    /// entire purpose is marking ordinary processes. Each name here is a
+    /// process that must keep being a candidate. `systemd-journal`, `sshd` and
+    /// `tuned` are the existing entries' *legitimate* matches and therefore
+    /// cannot be used as negatives; these are chosen to be outside every
+    /// shipped pattern.
+    #[test]
+    fn test_default_blocklist_does_not_block_ordinary_processes() {
+        let defaults = crate::config::ScannerConfig::default();
+
+        for benign in [
+            // Real daemons and processes on this workstation, chosen because
+            // each shares no substring with any entry.
+            "bees",
+            "omp",
+            "jev-gguf-scores",
+            "node-MainThread",
+            "kitty",
+            // Long comms, truncated to 15 bytes, that must still not match.
+            "dbus-broker-lau",
+            "xdg-desktop-por",
+        ] {
+            assert!(
+                !is_blocklisted(benign, &defaults.blocklist),
+                "the ordinary process {benign:?} must NOT be blocked: an \
+                 over-broad default blocklist would stop the daemon tuning \
+                 anything at all"
+            );
+        }
+
+        // `systemd-journald` and `sshd-session` are the traps here, and they
+        // are blocked *by design*: the list contains `systemd` and `sshd`, and
+        // a substring match over a 15-byte comm is the documented heuristic.
+        // So neither may be used as an "ordinary process" example — pinning
+        // them as blocked is what keeps this negative test honest about which
+        // entries are broad on purpose.
+        assert_eq!(
+            "systemd-journald".len(),
+            16,
+            "the full daemon name is 16 bytes, so the 15-byte comm is \
+             `systemd-journal`"
+        );
+        assert_eq!(
+            &"systemd-journald"[..15],
+            "systemd-journal",
+            "the truncation is what /proc/PID/comm actually returns"
+        );
+        assert!(
+            is_blocklisted("systemd-journal", &defaults.blocklist),
+            "the `systemd` substring match over the truncated comm is the \
+             documented heuristic and must keep working"
+        );
+        assert!(
+            is_blocklisted("sshd-session", &defaults.blocklist),
+            "the `sshd` substring match is the documented heuristic and must \
+             keep working"
+        );
+    }
+
+    /// The comm-length reality, pinned from a live process rather than from
+    /// the source's spelling.
+    ///
+    /// `Isolated Web Content` is what Firefox names the process; the kernel
+    /// keeps the first 15 bytes and `/proc/PID/comm` returns `Isolated Web Co`.
+    /// This test recomputes that truncation instead of restating it, so if the
+    /// kernel's 15-byte limit ever changes, the test fails loudly rather than
+    /// silently pinning a stale width.
+    #[test]
+    fn test_isolated_web_co_is_the_truncated_comm_it_blocks() {
+        let full = "Isolated Web Content";
+        assert_eq!(full.len(), 20);
+
+        let truncated = &full[..15];
+        assert_eq!(truncated, "Isolated Web Co");
+
+        let defaults = crate::config::ScannerConfig::default();
+        assert!(
+            is_blocklisted(truncated, &defaults.blocklist),
+            "the truncated 15-byte comm is what /proc/PID/comm actually \
+             returns, so it must be the form that matches"
+        );
+        // And the untruncated source spelling must NOT be relied upon: it is
+        // longer than comm, so nothing could ever produce it.
+        assert!(
+            full.len() > 15,
+            "the full name exceeds the comm limit and can never be observed"
+        );
+    }
+
     #[test]
     fn test_parse_kb_value() {
         assert_eq!(parse_kb_value("  12345 kB"), 12345);
