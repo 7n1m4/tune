@@ -66,7 +66,7 @@ $ cargo run -p tuned-daemon -- run --config config/tuned.toml --dry-run
   `/proc`, `/sys/kernel/debug/zswap` — dry-run only in local dev
 - **Systemd**: `systemd/tuned.service` — document new capabilities
 - **Config**: `config/tuned.toml` — keep defaults conservative
-- **The zswap poll is blocking inside an async task.** `zswap_tune::poll_once`
+- **The zswap poll is blocking inside an async task.** `tuned_zswap::poll_once`
   is synchronous std code doing file I/O, so `crates/tuned/src/zswap.rs` runs it
   through `tokio::task::block_in_place`. Do not call it directly from the async
   loop, and do not make the zswap library async to "fix" this.

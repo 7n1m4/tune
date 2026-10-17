@@ -1,35 +1,20 @@
-<div align=center>
+# tuned (crate `tuned-daemon`)
 
-# [A](https://github.com/animaios/anima)KSMD
+The KSM half of the [`tune` workspace](../../README.md): a PSI-aware governor,
+a ptrace-based process scanner that marks other processes' anonymous memory
+KSM-eligible, and a driver loop around the `tuned_zswap` library.
 
-<img width="256" height="384" alt="AnimAIOS mascot" src="https://github.com/user-attachments/assets/8d548058-3363-481b-90d6-09f4620f70f7" />
-
-
-### The spiritual successor to uksmd — a modern, Rust-based userspace KSM daemon with PTrace-powered process-wide KSM eligibility
-
-<!--
-[![Crates.io](https://img.shields.io/crates/v/tuned-daemon.svg)](https://crates.io/crates.io/crates/tuned-daemon)
-[![Documentation](https://docs.rs/tuned-daemon/badge.svg)](https://docs.rs/tuned-daemon)
-[![Build Status](https://github.com/animaios/tuned/workflows/CI/badge.svg)](https://github.com/animaios/tuned/actions)
--->
-
-[![DeepSource](https://app.deepsource.com/gh/animaios/aksmd.svg/?label=code+coverage&show_trend=true&token=iBvsQ1aAT0R9zi6jTngKW_VR)](https://app.deepsource.com/gh/animaios/aksmd/)
-[![DeepSource](https://app.deepsource.com/gh/animaios/aksmd.svg/?label=active+issues&show_trend=true&token=iBvsQ1aAT0R9zi6jTngKW_VR)](https://app.deepsource.com/gh/animaios/aksmd/)
-[![DeepSource](https://app.deepsource.com/gh/animaios/aksmd.svg/?label=resolved+issues&show_trend=true&token=iBvsQ1aAT0R9zi6jTngKW_VR)](https://app.deepsource.com/gh/animaios/aksmd/)
-
----
-
-## Why AKSMD?
+## Why
 
 I used to run **uksmd** (the userspace KSM daemon from the CachyOS project) on my desktop. It was brilliant — a userspace daemon that proactively scanned processes and made their anonymous memory KSM-eligible so the kernel's KSM (Kernel Samepage Merging) could deduplicate identical pages. It traded a little CPU for massive RAM savings.
 
 Then uksmd went unmaintained. The repo was archived. Worse, the kernel half of its trick never made it upstream: `MMF_VM_MERGE_ANY` and the `process_ksm_enable()` syscall lived only in the pf-kernel branch, so a userspace daemon could not reach another process's memory the way uksmd did. What mainline *did* gain — `process_madvise()` with `MADV_COLLAPSE` and `MADV_COLD` — pointed the other way: it never accepted `MADV_MERGEABLE`.
 
-The kernel has since caught up. **`PR_SET_MEMORY_MERGE` (prctl 67) is the mainline equivalent of what uksmd was reaching for** — a process-wide KSM eligibility flag, no per-region marking, no kernel patch. AKSMD is built on that, and on `ptrace(2)` to set it on processes the daemon does not own.
+The kernel has since caught up. **`PR_SET_MEMORY_MERGE` (prctl 67) is the mainline equivalent of what uksmd was reaching for** — a process-wide KSM eligibility flag, no per-region marking, no kernel patch. tuned is built on that, and on `ptrace(2)` to set it on processes the daemon does not own.
 
 I missed uksmd. I wanted it back — but modernized, safer, and with features the original never had.
 
-**AKSMD is that revival.**
+**tuned is that revival.**
 
 ---
 
@@ -57,7 +42,7 @@ from its pf-kernel `process_ksm_enable()` syscall, now available in mainline
 with no patch required.
 
 `prctl` can only ever act on the *calling* process, so there is no userspace
-call that reaches another process's `mm`. AKSMD therefore injects the syscall
+call that reaches another process's `mm`. tuned therefore injects the syscall
 directly:
 
 ```
@@ -95,7 +80,7 @@ error:0 in chrome[6d9d0c0,559b2d01c000+e32d000]
 The faulting address resolves to offset `0x6d9e0c0` of the chrome binary
 (V8/Blink `.text`), the same in all four renderer crashes.
 
-So AKSMD injects `madvise(MADV_UNMERGEABLE)` on every `r-xp` mapping right after
+So tuned injects `madvise(MADV_UNMERGEABLE)` on every `r-xp` mapping right after
 setting the flag. That has to be injected too: `process_madvise(2)` refuses KSM
 advices on a remote `mm` — `process_madvise_remote_valid()` allows only COLD,
 PAGEOUT, WILLNEED and COLLAPSE. `ScannerStats::exec_vmas_protected` reports the
@@ -179,7 +164,7 @@ used to enumerate the merge population.
 yay -S tuned-git
 
 # Or build from source
-cargo install --locked tuned-daemon --git https://github.com/animaios/tuned
+cargo install --locked tuned-daemon --git https://github.com/7n1m4/tuned
 ```
 
 ### Install (Other Distros)
@@ -360,7 +345,7 @@ sticky and inherited.
 ```bash
 $ tuned stats
 ======================================================
-AKSMD with KSM statistics support
+tuned with KSM statistics support
 ======================================================
 Full scans:                 175864
 Interval:                   100 ms
@@ -384,7 +369,7 @@ General profit:             0.4 MiB
 
 ## Observability
 
-AKSMD does not expose an HTTP endpoint. Every 60 seconds it logs the live KSM
+tuned does not expose an HTTP endpoint. Every 60 seconds it logs the live KSM
 counters and governor state as structured records, which journald (or your JSON
 collector) can pick up directly:
 
@@ -418,7 +403,7 @@ actually earning its CPU.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      AKSMD Daemon                       │
+│                      tuned Daemon                       │
 ├─────────────────────────────────────────────────────────────┤
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
 │  │ PSI Monitor  │  │   Governor   │  │    Scanner       │  │
@@ -454,7 +439,7 @@ actually earning its CPU.
 
 ## Comparison
 
-| Feature | uksmd (original) | AKSMD |
+| Feature | uksmd (original) | tuned |
 |---------|------------------|-----------|
 | Language | C | **Rust** (memory safe) |
 | Process-wide eligibility | `process_ksm_enable()` (pf-kernel only) | **`PR_SET_MEMORY_MERGE` via ptrace — mainline, no patch** |
@@ -470,13 +455,13 @@ actually earning its CPU.
 ## FAQ
 
 ### Why not just use `ksmtuned`?
-`ksmtuned` is deprecated and only adjusts KSM parameters reactively. AKSMD **proactively hunts processes** and **enables process-wide KSM eligibility** via ptrace — something `ksmtuned` never did.
+`ksmtuned` is deprecated and only adjusts KSM parameters reactively. tuned **proactively hunts processes** and **enables process-wide KSM eligibility** via ptrace — something `ksmtuned` never did.
 
 ### Does it work with containers (Docker/Podman)?
-Yes! The scanner finds processes by PID namespace. For container workloads, run AKSMD on the host — it sees all container processes and can enable KSM eligibility in them.
+Yes! The scanner finds processes by PID namespace. For container workloads, run tuned on the host — it sees all container processes and can enable KSM eligibility in them.
 
 ### Is it safe to run on production?
-Yes. AKSMD:
+Yes. tuned:
 - Runs with minimal capabilities (CAP_SYS_PTRACE, CAP_DAC_READ_SEARCH)
 - Uses `ProtectSystem=strict`, `NoNewPrivileges=yes`
 - Snapshots KSM state on startup, restores on shutdown
@@ -499,7 +484,10 @@ cargo clippy --workspace -- -D warnings
 cargo build --release --workspace
 ```
 
-PRs welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+PRs welcome. `unsafe` is confined to `madvise.rs` (the ptrace/prctl injection)
+and `psi.rs` (the PSI trigger fd); keep it that way — see [AGENTS.md](../../AGENTS.md)
+for the constraints a change has to respect, including the browser blocklist,
+which is a settled decision rather than a default.
 
 ---
 
@@ -527,11 +515,11 @@ workspace-root `LICENSE`.
 
 ## Links
 
-- **Repository**: https://github.com/animaios/tuned
-- **Issues**: https://github.com/animaios/aksmd/issues
+- **Repository**: https://github.com/7n1m4/tuned
+- **Issues**: https://github.com/7n1m4/tuned/issues
 
 <!--
-- **Discussions**: https://github.com/animaios/aksmd/discussions
+- **Discussions**: https://github.com/7n1m4/tuned/discussions
 - **Matrix Chat**: https://matrix.to/#/#tuned:matrix.org
 - **Crates.io**: https://crates.io/crates/tuned-daemon
 - **Documentation**: https://docs.rs/tuned-daemon
@@ -539,4 +527,4 @@ workspace-root `LICENSE`.
 
 ---
 
-*Made with ❤️ by the AKSMD team. Reviving uksmd, one page at a time.*
+*Made with ❤️ by the tune contributors. Reviving uksmd, one page at a time.*

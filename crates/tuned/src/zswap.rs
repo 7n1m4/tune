@@ -142,7 +142,7 @@ fn poll_every_for(config: &ZswapConfig) -> Duration {
     }
 }
 
-/// The recording cadence. Both zero and the `ZSWAP_TUNE_RECORD_INTERVAL`
+/// The recording cadence. Both zero and the `TUNED_ZSWAP_RECORD_INTERVAL`
 /// environment variable resolve to the same library default.
 fn record_every_for(config: &ZswapConfig) -> Duration {
     if config.record_interval_secs == 0 {
